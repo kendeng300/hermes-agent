@@ -125,8 +125,9 @@ def _fixed_temperature_for_model(
 
     Returns:
         ``OMIT_TEMPERATURE`` — caller must remove the ``temperature`` key so the
-            provider chooses its own default.  Used for all Kimi / Moonshot
-            models whose gateway selects temperature server-side.
+            provider chooses its own default.  Used for Kimi / Moonshot models
+            whose gateway selects temperature server-side, and for ChatGPT
+            Codex endpoints which reject ``temperature`` outright.
         ``float`` — a specific value the caller must use (reserved for future
             models with fixed-temperature contracts).
         ``None`` — no override; caller should use its own default.
@@ -134,6 +135,17 @@ def _fixed_temperature_for_model(
     if _is_kimi_model(model):
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
         return OMIT_TEMPERATURE
+
+    # ChatGPT-backed Codex / Responses endpoints reject sampling params such as
+    # `temperature` with HTTP 400 "Unsupported parameter: temperature".  This
+    # matters for auxiliary memory flushes because they historically request
+    # temperature=0.3 even when the main provider is openai-codex.
+    model_l = (model or "").strip().lower()
+    base_l = (base_url or "").strip().lower()
+    if "codex" in model_l or "chatgpt.com/backend-api/codex" in base_l:
+        logger.debug("Omitting temperature for Codex model/base_url (%r, %r)", model, base_url)
+        return OMIT_TEMPERATURE
+
     return None
 
 # Default auxiliary models for direct API-key providers (cheap/fast for side tasks)
@@ -375,6 +387,21 @@ class _CodexCompletionsAdapter:
             if role == "system":
                 instructions = content if isinstance(content, str) else str(content)
             else:
+                # The Chat Completions format uses role=tool for prior tool
+                # results, but the ChatGPT/Codex Responses endpoint rejects
+                # that role in `input` with HTTP 400: supported roles are
+                # assistant/system/developer/user.  Auxiliary memory flushes
+                # often include past tool results in the transcript, so fold
+                # those results into a plain user message while preserving the
+                # useful context.  Unknown roles are similarly normalized.
+                if role == "tool":
+                    tool_name = msg.get("name") or msg.get("tool_name") or "tool"
+                    tool_id = msg.get("tool_call_id")
+                    prefix = f"[Tool result: {tool_name}" + (f" id={tool_id}" if tool_id else "") + "]\n"
+                    content = prefix + (content if isinstance(content, str) else str(content))
+                    role = "user"
+                elif role not in {"user", "assistant", "developer", "system"}:
+                    role = "user"
                 input_msgs.append({
                     "role": role,
                     "content": _convert_content_for_responses(content),

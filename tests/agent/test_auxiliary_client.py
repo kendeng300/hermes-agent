@@ -22,6 +22,8 @@ from agent.auxiliary_client import (
     _normalize_aux_provider,
     _try_payment_fallback,
     _resolve_auto,
+    _build_call_kwargs,
+    _CodexCompletionsAdapter,
 )
 
 
@@ -64,6 +66,74 @@ class TestNormalizeAuxProvider:
     def test_maps_github_copilot_acp_aliases(self):
         assert _normalize_aux_provider("github-copilot-acp") == "copilot-acp"
         assert _normalize_aux_provider("copilot-acp-agent") == "copilot-acp"
+
+
+class TestCodexAuxiliaryTemperatureHandling:
+    def test_codex_base_url_omits_temperature_for_memory_flush_regression(self):
+        messages = [{"role": "user", "content": "flush memories"}]
+
+        kwargs = _build_call_kwargs(
+            provider="auto",
+            model="gpt-5.5",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=200,
+            base_url="https://chatgpt.com/backend-api/codex/",
+        )
+
+        assert "temperature" not in kwargs
+
+    def test_codex_model_name_omits_temperature_even_without_base_url(self):
+        messages = [{"role": "user", "content": "flush memories"}]
+
+        kwargs = _build_call_kwargs(
+            provider="openai-codex",
+            model="gpt-5.2-codex",
+            messages=messages,
+            temperature=0.3,
+            max_tokens=200,
+        )
+
+        assert "temperature" not in kwargs
+
+
+class TestCodexAuxiliaryMessageRoles:
+    def test_tool_messages_are_folded_into_user_input_for_responses_api(self):
+        captured = {}
+
+        class FakeStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                return MagicMock(output=[])
+
+        class FakeResponses:
+            def stream(self, **kwargs):
+                captured.update(kwargs)
+                return FakeStream()
+
+        fake_client = MagicMock()
+        fake_client.responses = FakeResponses()
+        adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.2-codex")
+
+        adapter.create(messages=[
+            {"role": "user", "content": "please remember durable facts"},
+            {"role": "tool", "tool_call_id": "call_123", "name": "terminal", "content": "command output"},
+            {"role": "assistant", "content": "done"},
+        ])
+
+        roles = [m["role"] for m in captured["input"]]
+        assert "tool" not in roles
+        assert roles == ["user", "user", "assistant"]
+        assert captured["input"][1]["content"].startswith("[Tool result: terminal id=call_123]")
+        assert "command output" in captured["input"][1]["content"]
 
 
 class TestReadCodexAccessToken:

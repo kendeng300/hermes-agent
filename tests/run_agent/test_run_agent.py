@@ -3086,6 +3086,92 @@ class TestRetryExhaustion:
 class TestFlushSentinelNotLeaked:
     """_flush_sentinel must be stripped before sending messages to the API."""
 
+    def test_flush_memories_zero_config_disables_even_precompression_flush(self, agent_with_memory_tool):
+        """memory.flush_min_turns=0 is a hard off switch for costly flush calls."""
+        agent = agent_with_memory_tool
+        agent._memory_store = MagicMock()
+        agent._memory_flush_min_turns = 0
+        agent._user_turn_count = 10
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "remember this"},
+        ]
+
+        with patch("agent.auxiliary_client.call_llm") as call_llm:
+            agent.flush_memories(messages, min_turns=0)
+
+        call_llm.assert_not_called()
+        assert len(messages) == 3
+
+    def test_flush_memories_routes_auxiliary_to_live_openai_runtime(self, agent_with_memory_tool):
+        """Auxiliary memory flush must not use stale DeepSeek config after switching to OpenAI/Codex."""
+        agent = agent_with_memory_tool
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.5"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent.api_key = "codex-token"
+        agent.api_mode = "codex_responses"
+        agent._memory_store = MagicMock()
+        agent._memory_flush_min_turns = 1
+        agent._user_turn_count = 10
+        agent._cached_system_prompt = "system"
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "deepseek-native-thinking-state",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+            {"role": "user", "content": "remember this"},
+        ]
+        mock_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="OK", tool_calls=None))])
+
+        with patch("agent.auxiliary_client.call_llm", return_value=mock_response) as call_llm:
+            agent.flush_memories(messages, min_turns=0)
+
+        runtime = call_llm.call_args.kwargs.get("main_runtime")
+        assert runtime is not None
+        assert runtime["provider"] == "openai-codex"
+        assert runtime["model"] == "gpt-5.5"
+        assert runtime["base_url"] == "https://chatgpt.com/backend-api/codex"
+        sent_messages = call_llm.call_args.kwargs["messages"]
+        assistant_messages = [m for m in sent_messages if m.get("role") == "assistant"]
+        assert assistant_messages, "test setup should include replayed assistant history"
+        assert all("reasoning_content" not in m for m in assistant_messages)
+
+    def test_flush_memories_routes_auxiliary_to_live_claude_runtime(self, agent_with_memory_tool):
+        """Auxiliary memory flush must not use stale DeepSeek config after switching to Claude."""
+        agent = agent_with_memory_tool
+        agent.provider = "anthropic"
+        agent.model = "claude-opus-4-7-20260401"
+        agent.base_url = "https://api.anthropic.com"
+        agent.api_key = "anthropic-token"
+        agent.api_mode = "anthropic_messages"
+        agent._memory_store = MagicMock()
+        agent._memory_flush_min_turns = 1
+        agent._user_turn_count = 10
+        agent._cached_system_prompt = "system"
+
+        messages = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user", "content": "remember this"},
+        ]
+        mock_response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="OK", tool_calls=None))])
+
+        with patch("agent.auxiliary_client.call_llm", return_value=mock_response) as call_llm:
+            agent.flush_memories(messages, min_turns=0)
+
+        runtime = call_llm.call_args.kwargs.get("main_runtime")
+        assert runtime is not None
+        assert runtime["provider"] == "anthropic"
+        assert runtime["model"] == "claude-opus-4-7-20260401"
+        assert runtime["base_url"] == "https://api.anthropic.com"
+
     def test_flush_sentinel_stripped_from_api_messages(self, agent_with_memory_tool):
         """Verify _flush_sentinel is not sent to the API provider."""
         agent = agent_with_memory_tool

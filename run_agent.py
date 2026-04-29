@@ -7625,12 +7625,6 @@ class AIAgent:
             raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
             if raw_reasoning_content is not None:
                 msg["reasoning_content"] = _sanitize_surrogates(raw_reasoning_content)
-            elif msg.get("tool_calls") and self._needs_deepseek_tool_reasoning():
-                # DeepSeek thinking mode requires reasoning_content on every
-                # assistant tool-call message. Without it, replaying the
-                # persisted message causes HTTP 400. Include empty string
-                # as a defensive compatibility fallback (refs #15250).
-                msg["reasoning_content"] = ""
 
         if hasattr(assistant_message, 'reasoning_details') and assistant_message.reasoning_details:
             # Pass reasoning_details back unmodified so providers (OpenRouter,
@@ -7704,6 +7698,16 @@ class AIAgent:
                 tool_calls.append(tc_dict)
             msg["tool_calls"] = tool_calls
 
+            # DeepSeek/Kimi thinking modes require reasoning_content on every
+            # assistant tool-call message. This must run *after* tool_calls are
+            # attached; doing it earlier leaves the creation path poisoned even
+            # though API replay has a defensive injector.
+            if "reasoning_content" not in msg and (
+                self._needs_deepseek_tool_reasoning()
+                or self._needs_kimi_tool_reasoning()
+            ):
+                msg["reasoning_content"] = ""
+
         return msg
 
     def _needs_kimi_tool_reasoning(self) -> bool:
@@ -7734,6 +7738,10 @@ class AIAgent:
             or "deepseek" in model
             or base_url_host_matches(self.base_url, "api.deepseek.com")
         )
+
+    def _should_keep_reasoning_content_for_api(self) -> bool:
+        """Whether the active API endpoint expects provider-native reasoning_content."""
+        return self._needs_deepseek_tool_reasoning() or self._needs_kimi_tool_reasoning()
 
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
         """Copy provider-facing reasoning fields onto an API replay message."""
@@ -7922,9 +7930,14 @@ class AIAgent:
                       self._session_messages (last run_conversation state).
             min_turns: Minimum user turns required to trigger the flush.
                        None = use config value (flush_min_turns).
-                       0 = always flush (used for compression).
+                       0 = request immediate flush, unless the config value
+                           flush_min_turns is also 0, which is a hard off switch.
         """
-        if self._memory_flush_min_turns == 0 and min_turns is None:
+        if self._memory_flush_min_turns == 0:
+            # Hard off switch.  Pre-compression flushes pass min_turns=0, but
+            # those calls replay the full session to an auxiliary model and can
+            # become the largest avoidable token sink when compression is already
+            # under pressure.
             return
         if "memory" not in self.valid_tool_names or not self._memory_store:
             return
@@ -7953,6 +7966,12 @@ class AIAgent:
             for msg in messages:
                 api_msg = msg.copy()
                 self._copy_reasoning_content_for_api(msg, api_msg)
+                if not self._should_keep_reasoning_content_for_api():
+                    # Auxiliary memory flush follows the *current* model. If
+                    # the user switched away from DeepSeek/Kimi, stale
+                    # provider-native reasoning_content from prior history must
+                    # not leak into the OpenAI/Claude/etc. flush request.
+                    api_msg.pop("reasoning_content", None)
                 api_msg.pop("reasoning", None)
                 api_msg.pop("finish_reason", None)
                 api_msg.pop("_flush_sentinel", None)
@@ -7998,6 +8017,7 @@ class AIAgent:
             try:
                 response = _call_llm(
                     task="flush_memories",
+                    main_runtime=self._current_main_runtime(),
                     messages=api_messages,
                     tools=[memory_tool_def],
                     temperature=_flush_temperature,
@@ -11124,6 +11144,30 @@ class AIAgent:
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
                                 continue
+
+                    # Account-level quota windows (e.g. Codex/ChatGPT Plus
+                    # `usage_limit_reached` with resets_at/resets_in_seconds)
+                    # will not recover inside this retry loop.  If there is no
+                    # credential-pool or model fallback path, fail fast instead
+                    # of spending the same full prompt 3x.
+                    if (
+                        is_rate_limited
+                        and not recovered_with_pool
+                        and self._fallback_index >= len(self._fallback_chain)
+                        and not _pool_may_recover_from_rate_limit(self._credential_pool)
+                        and any(
+                            _p in error_msg
+                            for _p in (
+                                "usage_limit_reached",
+                                "usage limit has been reached",
+                                "resets_at",
+                                "resets_in_seconds",
+                                "resets in seconds",
+                            )
+                        )
+                    ):
+                        retry_count = max_retries
+                        continue
 
                     # ── Nous Portal: record rate limit & skip retries ─────
                     # When Nous returns a 429, record the reset time to a

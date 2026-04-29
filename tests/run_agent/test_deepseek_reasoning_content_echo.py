@@ -24,6 +24,7 @@ Refs #15250 / #15353.
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from run_agent import AIAgent
 
@@ -177,6 +178,23 @@ class TestCopyReasoningContentForApi:
         agent._copy_reasoning_content_for_api(source, api_msg)
         assert api_msg.get("reasoning_content") == ""
 
+    def test_deepseek_v4_pro_exact_model_replay_has_reasoning_content(self) -> None:
+        """Exact DeepSeek V4 Pro setup must echo reasoning_content on replay.
+
+        This guards the production HTTP 400:
+        'The reasoning_content in the thinking mode must be passed back to the API.'
+        """
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro", base_url="https://api.deepseek.com/v1")
+        source = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_abc", "function": {"name": "terminal"}}],
+        }
+        api_msg = source.copy()
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert "reasoning_content" in api_msg
+        assert api_msg["reasoning_content"] == ""
+
     def test_non_assistant_role_ignored(self) -> None:
         """User/tool messages are left alone."""
         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
@@ -184,6 +202,36 @@ class TestCopyReasoningContentForApi:
         api_msg: dict = {}
         agent._copy_reasoning_content_for_api(source, api_msg)
         assert "reasoning_content" not in api_msg
+
+
+class TestBuildAssistantMessage:
+    """Creation-path regression coverage for newly persisted tool-call turns."""
+
+    def test_deepseek_tool_call_message_gets_reasoning_content_after_tool_calls(self) -> None:
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-pro", base_url="https://api.deepseek.com/v1")
+        agent.verbose_logging = False
+        agent.reasoning_callback = None
+        agent.stream_delta_callback = None
+        agent._stream_callback = None
+
+        tool_call = SimpleNamespace(
+            id="call_1",
+            call_id=None,
+            response_item_id=None,
+            type="function",
+            function=SimpleNamespace(name="terminal", arguments='{"command":"pwd"}'),
+        )
+        assistant_message = SimpleNamespace(
+            content="",
+            reasoning_content=None,
+            reasoning_details=None,
+            tool_calls=[tool_call],
+        )
+
+        msg = agent._build_assistant_message(assistant_message, "tool_calls")
+
+        assert msg["tool_calls"]
+        assert msg.get("reasoning_content") == ""
 
 
 class TestNeedsKimiToolReasoning:
