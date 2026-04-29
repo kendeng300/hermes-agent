@@ -10971,6 +10971,24 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
+        # Check if the PID file is stale (process no longer running).
+        # A stale PID can persist after a systemd kill-cgroup or unclean
+        # shutdown.  Clean it up so the new gateway can start without
+        # --replace and without the "already running" refusal.
+        try:
+            os.kill(existing_pid, 0)
+        except (ProcessLookupError, PermissionError):
+            logger.info(
+                "Stale PID file found (PID %d no longer running), cleaning up.",
+                existing_pid,
+            )
+            remove_pid_file()
+            try:
+                (get_hermes_home() / "gateway.pid").unlink(missing_ok=True)
+            except Exception:
+                pass
+            existing_pid = None
+    if existing_pid is not None and existing_pid != os.getpid():
         if replace:
             existing_start_time = get_process_start_time(existing_pid)
             logger.info(
@@ -11004,15 +11022,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 except Exception:
                     pass
                 return False
-            # Wait up to 10 seconds for the old process to exit
-            for _ in range(20):
+            # Wait up to 60 seconds for the old process to exit
+            for _ in range(120):
                 try:
                     os.kill(existing_pid, 0)
                     time.sleep(0.5)
                 except (ProcessLookupError, PermissionError):
                     break  # Process is gone
             else:
-                # Still alive after 10s — force kill
+                # Still alive after 60s — force kill
                 logger.warning(
                     "Old gateway (PID %d) did not exit after SIGTERM, sending SIGKILL.",
                     existing_pid,
