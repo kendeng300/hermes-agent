@@ -368,7 +368,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not thread_ts:
             return  # Can only set status in a thread context
 
-        self._active_status_threads[chat_id] = thread_ts
+        self._active_status_threads[(chat_id, thread_ts)] = thread_ts
         try:
             await self._get_client(chat_id).assistant_threads_setStatus(
                 channel_id=chat_id,
@@ -380,11 +380,21 @@ class SlackAdapter(BasePlatformAdapter):
             # in an assistant-enabled context. Falls back to reactions.
             logger.debug("[Slack] assistant.threads.setStatus failed: %s", e)
 
-    async def stop_typing(self, chat_id: str) -> None:
+    async def stop_typing(self, chat_id: str, metadata: dict = None) -> None:
         """Clear the assistant thread status indicator."""
         if not self._app:
             return
-        thread_ts = self._active_status_threads.pop(chat_id, None)
+        thread_ts = None
+        if metadata:
+            thread_ts = metadata.get("thread_id") or metadata.get("thread_ts")
+        if not thread_ts:
+            # No metadata provided — pop any active thread for this channel as fallback
+            for key in list(self._active_status_threads):
+                if key[0] == chat_id:
+                    thread_ts = self._active_status_threads.pop(key, None)
+                    break
+        else:
+            thread_ts = self._active_status_threads.pop((chat_id, thread_ts), None)
         if not thread_ts:
             return
         try:

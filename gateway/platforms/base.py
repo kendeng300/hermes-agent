@@ -1581,7 +1581,7 @@ class BasePlatformAdapter(ABC):
             # Cancelling _keep_typing alone won't clean that up.
             if hasattr(self, "stop_typing"):
                 try:
-                    await self.stop_typing(chat_id)
+                    await self.stop_typing(chat_id, metadata=metadata)
                 except Exception:
                     pass
             self._typing_paused.discard(chat_id)
