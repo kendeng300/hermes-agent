@@ -335,6 +335,9 @@ class SlackAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             formatted = self.format_message(content)
+            if len(formatted) > self.MAX_MESSAGE_LENGTH:
+                notice = "\n\n... [truncated — edited message exceeds Slack limit]"
+                formatted = formatted[:self.MAX_MESSAGE_LENGTH - len(notice)] + notice
             await self._get_client(chat_id).chat_update(
                 channel=chat_id,
                 ts=message_id,
