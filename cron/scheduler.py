@@ -789,10 +789,28 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # don't clobber each other's targets (os.environ is process-global).
     from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
 
+    # Resolve the delivery target FIRST so session context matches where
+    # output will actually be delivered, not where the job was created.
+    # Fixes origin pollution where all jobs had session context = C0B0VRV5YJ1
+    # regardless of their deliver field.
+    delivery_target = _resolve_delivery_target(job)
+    if delivery_target:
+        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
+        _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
+        if delivery_target.get("thread_id") is not None:
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
+                str(delivery_target["thread_id"])
+            )
+
+    # Seed session vars from delivery target (fall back to origin for
+    # jobs with deliver=origin or deliver=local).
+    _session_platform = (delivery_target or origin or {}).get("platform", "")
+    _session_chat_id = str((delivery_target or origin or {}).get("chat_id", ""))
+    _session_chat_name = (origin or {}).get("chat_name", "")
     _ctx_tokens = set_session_vars(
-        platform=origin["platform"] if origin else "",
-        chat_id=str(origin["chat_id"]) if origin else "",
-        chat_name=origin.get("chat_name", "") if origin else "",
+        platform=_session_platform,
+        chat_id=_session_chat_id,
+        chat_name=_session_chat_name,
     )
 
     # Per-job working directory.  When set (and validated at create/update
@@ -827,13 +845,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
         except UnicodeDecodeError:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
-
-        delivery_target = _resolve_delivery_target(job)
-        if delivery_target:
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
-            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
-            if delivery_target.get("thread_id") is not None:
-                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(str(delivery_target["thread_id"]))
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
