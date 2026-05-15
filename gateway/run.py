@@ -8602,10 +8602,42 @@ class GatewayRunner:
                     or (notify_mode == "error" and session.exit_code not in (0, None))
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                    # Only deliver text notifications when we have a thread to
+                    # post in.  Channel-level posts create unwanted top-level
+                    # threads — the agent_notify path (above) already handles
+                    # in-thread delivery for agent-triggered processes.
+                    if thread_id:
+                        new_output = session.output_buffer[-1000:] if session.output_buffer else ""
+                        message_text = (
+                            f"[Background process {session_id} finished with exit code {session.exit_code}~ "
+                            f"Here's the final output:\n{new_output}]"
+                        )
+                        adapter = None
+                        for p, a in self.adapters.items():
+                            if p.value == platform_name:
+                                adapter = a
+                                break
+                        if adapter and chat_id:
+                            try:
+                                send_meta = {"thread_id": thread_id}
+                                await adapter.send(chat_id, message_text, metadata=send_meta)
+                            except Exception as e:
+                                logger.error("Watcher delivery error: %s", e)
+                    else:
+                        logger.debug(
+                            "Skipping text notification for %s — no thread_id (notify_mode=%s)",
+                            session_id, notify_mode,
+                        )
+                break
+
+            elif has_new_output and notify_mode == "all" and not agent_notify:
+                # New output available -- deliver status update (only in "all" mode)
+                # Skip periodic updates for agent_notify watchers (they only care about completion)
+                if thread_id:
+                    new_output = session.output_buffer[-500:] if session.output_buffer else ""
                     message_text = (
-                        f"[Background process {session_id} finished with exit code {session.exit_code}~ "
-                        f"Here's the final output:\n{new_output}]"
+                        f"[Background process {session_id} is still running~ "
+                        f"New output:\n{new_output}]"
                     )
                     adapter = None
                     for p, a in self.adapters.items():
@@ -8614,31 +8646,10 @@ class GatewayRunner:
                             break
                     if adapter and chat_id:
                         try:
-                            send_meta = {"thread_id": thread_id} if thread_id else None
+                            send_meta = {"thread_id": thread_id}
                             await adapter.send(chat_id, message_text, metadata=send_meta)
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
-                break
-
-            elif has_new_output and notify_mode == "all" and not agent_notify:
-                # New output available -- deliver status update (only in "all" mode)
-                # Skip periodic updates for agent_notify watchers (they only care about completion)
-                new_output = session.output_buffer[-500:] if session.output_buffer else ""
-                message_text = (
-                    f"[Background process {session_id} is still running~ "
-                    f"New output:\n{new_output}]"
-                )
-                adapter = None
-                for p, a in self.adapters.items():
-                    if p.value == platform_name:
-                        adapter = a
-                        break
-                if adapter and chat_id:
-                    try:
-                        send_meta = {"thread_id": thread_id} if thread_id else None
-                        await adapter.send(chat_id, message_text, metadata=send_meta)
-                    except Exception as e:
-                        logger.error("Watcher delivery error: %s", e)
 
         logger.debug("Process watcher ended: %s", session_id)
 
