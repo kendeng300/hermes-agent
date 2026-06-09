@@ -404,6 +404,32 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
+def _validate_deliver_for_schedule(deliver: str, parsed_schedule: dict, job_name: str):
+    """Block deliver:origin on recurring (cron/interval) schedules.
+
+    Recurring jobs fire on timer ticks — there is no originating message
+    or channel. 'origin' resolves to the creation channel, which is NEVER
+    the correct delivery target for scheduled output. The result is a
+    silent delivery failure (last_delivery_error = null, last_status = ok).
+
+    Raises ValueError on violation. Layer 2 of the deliver:origin
+    defense-in-depth (creation-time gate).
+    """
+    schedule_kind = parsed_schedule.get("kind", "")
+    if schedule_kind not in ("cron", "interval"):
+        return  # one-shot or unknown — allow
+
+    deliver_parts = [p.strip() for p in str(deliver).split(",")]
+    if "origin" in deliver_parts:
+        raise ValueError(
+            f"Cannot create/update recurring cron job with deliver containing "
+            f"'origin' — '{job_name}' has a recurring schedule but deliver "
+            f"includes 'origin'. Recurring jobs fire on timer ticks and have "
+            f"no originating message context. Use deliver='slack:C0B...' "
+            f"(explicit channel ID) or 'local'."
+        )
+
+
 def create_job(
     prompt: str,
     schedule: str,
@@ -464,6 +490,9 @@ def create_job(
     # Default delivery to origin if available, otherwise local
     if deliver is None:
         deliver = "origin" if origin else "local"
+
+    # ── Block deliver:origin on recurring jobs (Layer 2: creation-time gate) ──
+    _validate_deliver_for_schedule(deliver, parsed_schedule, name or "cron job")
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
@@ -577,6 +606,23 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             )
             if updated.get("state") != "paused":
                 updated["next_run_at"] = compute_next_run(updated_schedule)
+
+            # Re-validate deliver when schedule changes (GAP 2: update_job bypass)
+            current_deliver = updated.get("deliver", "")
+            _validate_deliver_for_schedule(
+                current_deliver, updated_schedule,
+                updated.get("name", job_id),
+            )
+
+        # Also validate when deliver itself changes (regardless of schedule change)
+        if "deliver" in updates and not schedule_changed:
+            current_schedule = updated.get("schedule", {})
+            if not isinstance(current_schedule, dict):
+                current_schedule = {}
+            _validate_deliver_for_schedule(
+                str(updates["deliver"]), current_schedule,
+                updated.get("name", job_id),
+            )
 
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
             updated["next_run_at"] = compute_next_run(updated["schedule"])

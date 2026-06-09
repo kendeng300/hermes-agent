@@ -147,6 +147,91 @@ def _get_home_target_chat_id(platform_name: str) -> str:
     return value
 
 
+def _resolve_safe_deliver_target(job: dict) -> tuple[Optional[dict], Optional[str], Optional[list]]:
+    """Validate and resolve delivery target with origin-safety for recurring jobs.
+
+    For schedule-triggered recurring jobs, 'origin' in the deliver field is
+    semantically wrong — there is no originating message/channel for a timer
+    tick. Instead of silently resolving to the creation channel, we strip
+    'origin' and deliver ONLY to the remaining explicit targets. If origin
+    is the ONLY target, we block with a loud error.
+
+    Returns:
+        (target, error, filtered_targets) where:
+        - (dict, None, None): single target resolved, safe to deliver
+        - (None, str, None): delivery blocked with this error
+        - (None, None, list): comma-separated targets after stripping origin
+        - (None, None, None): deliver is 'local' — no delivery, not an error
+    """
+    deliver = job.get("deliver", "local")
+
+    # Normalize deliver to string (guard against list-typed values)
+    if isinstance(deliver, list):
+        deliver = ", ".join(str(d) for d in deliver)
+    deliver_str = str(deliver)
+
+    # Detect recurring schedules: cron (e.g. "5 20 * * 1-5") or interval
+    schedule_raw = job.get("schedule")
+    if isinstance(schedule_raw, dict):
+        schedule_kind = schedule_raw.get("kind", "")
+    else:
+        schedule_kind = ""
+
+    is_recurring = schedule_kind in ("cron", "interval")
+
+    # ── Block/strip deliver:origin on recurring jobs ──────────────────
+    if is_recurring and deliver_str:
+        deliver_parts = [p.strip() for p in deliver_str.split(",")]
+        if "origin" in deliver_parts:
+            job_name = job.get("name", job.get("id", "?"))
+            origin_cid = (
+                (job.get("origin") or {}).get("chat_id") or "unknown"
+            )
+            non_origin_parts = [p for p in deliver_parts if p != "origin"]
+
+            if non_origin_parts:
+                # Strip origin, deliver only to remaining explicit targets
+                stripped_deliver = ", ".join(non_origin_parts)
+                logger.warning(
+                    "Job '%s': stripped 'origin' from deliver on recurring job. "
+                    "Origin resolves to creation channel (%s), not intended for "
+                    "scheduled output. Delivering only to: %s",
+                    job.get("id"), origin_cid, stripped_deliver,
+                )
+                # Resolve remaining targets
+                targets = []
+                for part in non_origin_parts:
+                    t = _resolve_single_delivery_target(job, part)
+                    if t:
+                        targets.append(t)
+                if targets:
+                    return None, None, targets  # filtered targets for delivery
+                # Fall through: non-origin targets couldn't be resolved
+                return None, (
+                    f"RECURRING CRON JOB: stripped 'origin' but remaining "
+                    f"targets '{stripped_deliver}' could not be resolved."
+                ), None
+
+            # Origin is the ONLY target — block
+            msg = (
+                f"RECURRING CRON JOB WITH deliver='origin': "
+                f"'{job_name}' has a recurring schedule but deliver is "
+                f"'origin'. Origin resolves to the creation channel "
+                f"({origin_cid}), NOT the intended delivery target for "
+                f"scheduled output. Set deliver to an explicit channel "
+                f"(e.g., 'slack:C0B...') or 'local'. "
+                f"Job output was saved to disk but not delivered."
+            )
+            logger.error("Job '%s': %s", job.get("id"), msg)
+            return None, msg, None
+
+    # ── Non-recurring job or deliver doesn't contain origin ──────────
+    # Delegate to normal resolution — do NOT attempt to resolve here.
+    # The caller (_deliver_result) will use _resolve_delivery_targets()
+    # which correctly handles comma-separated multi-target deliver.
+    return None, None, None
+
+
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
 
@@ -308,13 +393,26 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     Returns None on success, or an error string on failure.
     """
-    targets = _resolve_delivery_targets(job)
-    if not targets:
-        if job.get("deliver", "local") != "local":
-            msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
-            logger.warning("Job '%s': %s", job["id"], msg)
-            return msg
-        return None  # local-only jobs don't deliver — not a failure
+    # ── Validate: reject deliver:origin on recurring jobs (Layer 1) ──
+    # Must run BEFORE _resolve_delivery_targets() — otherwise unresolvable
+    # origin produces a generic "no target" error instead of the actionable
+    # "origin on recurring job" error.  Fixed ordering: CR-1 finding #2.
+    safe_target, resolve_error, filtered_targets = _resolve_safe_deliver_target(job)
+    if resolve_error:
+        logger.error("Job '%s': DELIVERY BLOCKED — %s", job["id"], resolve_error)
+        return resolve_error
+
+    if filtered_targets is not None:
+        # Comma-separated deliver had origin stripped — use filtered targets
+        targets = filtered_targets
+    else:
+        targets = _resolve_delivery_targets(job)
+        if not targets:
+            if job.get("deliver", "local") != "local":
+                msg = f"no delivery target resolved for deliver={job.get('deliver', 'local')}"
+                logger.error("Job '%s': %s", job["id"], msg)  # upgraded from warning → error
+                return msg
+            return None  # local-only jobs don't deliver — not a failure
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -784,6 +882,13 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # This env var is process-wide and persists for the lifetime of the
     # scheduler process — every job this process runs is a cron job.
     os.environ["HERMES_CRON_SESSION"] = "1"
+    # Per-job name for context telemetry attribution; set before agent runs
+    # so record_context_call() can tag records with the correct cron job.
+    # Set BOTH os.environ (fallback) and ContextVar (thread-safe for parallel jobs).
+    os.environ["HERMES_CRON_JOB_NAME"] = job_name
+    from gateway.session_context import _VAR_MAP
+    if "HERMES_CRON_JOB_NAME" in _VAR_MAP:
+        _VAR_MAP["HERMES_CRON_JOB_NAME"].set(job_name)
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
@@ -847,6 +952,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+
+        # ── Re-resolve delivery target AFTER .env loading ────────────
+        # _resolve_delivery_target() above runs BEFORE .env is loaded,
+        # so it can't see home-channel IDs set in .env (e.g. TELEGRAM_HOME_CHANNEL).
+        # Re-resolving here ensures session context has the correct platform/chat_id.
+        _delivery_after_env = _resolve_delivery_target(job)
+        if _delivery_after_env:
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(_delivery_after_env["platform"])
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(_delivery_after_env["chat_id"]))
+            if _delivery_after_env.get("thread_id") is not None:
+                _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
+                    str(_delivery_after_env["thread_id"])
+                )
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
