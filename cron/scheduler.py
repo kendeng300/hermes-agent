@@ -771,17 +771,36 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     # Always prepend cron execution guidance so the agent knows how
     # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[SYSTEM: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    deliver_mode = job.get("deliver_mode", "auto")
+    if isinstance(deliver_mode, str):
+        deliver_mode = deliver_mode.strip().lower()
+    if deliver_mode not in ("auto", "agent_controlled"):
+        deliver_mode = "auto"
+    if deliver_mode == "agent_controlled":
+        cron_hint = (
+            "[SYSTEM: You are running as a scheduled cron job. "
+            "DELIVERY: You control ALL message delivery. Your final response "
+            "will NOT be auto-delivered — you MUST use send_message to post "
+            "ALL content to the delivery target. Use send_message for root "
+            "messages and threaded replies. End with [SILENT] as your final "
+            "response to prevent double-delivery. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
+    else:
+        cron_hint = (
+            "[SYSTEM: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
@@ -899,7 +918,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # Fixes origin pollution where all jobs had session context = C0B0VRV5YJ1
     # regardless of their deliver field.
     delivery_target = _resolve_delivery_target(job)
-    if delivery_target:
+    # deliver_mode="agent_controlled" — agent handles all posting via send_message.
+    # Skip setting auto-deliver ContextVars so de-dupe is a no-op in send_message_tool.
+    _dm = job.get("deliver_mode", "auto")
+    if isinstance(_dm, str):
+        _dm = _dm.strip().lower()
+    if _dm not in ("auto", "agent_controlled"):
+        _dm = "auto"
+    if delivery_target and _dm != "agent_controlled":
         _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
         _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
         if delivery_target.get("thread_id") is not None:
@@ -958,7 +984,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # so it can't see home-channel IDs set in .env (e.g. TELEGRAM_HOME_CHANNEL).
         # Re-resolving here ensures session context has the correct platform/chat_id.
         _delivery_after_env = _resolve_delivery_target(job)
-        if _delivery_after_env:
+        if _delivery_after_env and _dm != "agent_controlled":
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(_delivery_after_env["platform"])
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(_delivery_after_env["chat_id"]))
             if _delivery_after_env.get("thread_id") is not None:
@@ -1346,8 +1372,16 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 # output is already saved above).  Failed jobs always deliver.
                 deliver_content = final_response if success else f"⚠️ Cron job '{job.get('name', job['id'])}' failed:\n{error}"
                 should_deliver = bool(deliver_content)
-                if should_deliver and success and SILENT_MARKER in deliver_content.strip().upper():
+                if should_deliver and success and deliver_content.strip().upper() == SILENT_MARKER:
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+                    should_deliver = False
+
+                # agent_controlled jobs handle delivery via send_message — don't auto-deliver
+                _dm = job.get("deliver_mode", "auto")
+                if isinstance(_dm, str):
+                    _dm = _dm.strip().lower()
+                if should_deliver and success and _dm == "agent_controlled":
+                    logger.info("Job '%s': agent_controlled mode — skipping auto-delivery", job["id"])
                     should_deliver = False
 
                 delivery_error = None

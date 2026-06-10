@@ -285,19 +285,27 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
+            auto_thread_ts = None
             for i, chunk in enumerate(chunks):
                 kwargs = {
                     "channel": chat_id,
                     "text": chunk,
                     "mrkdwn": True,
                 }
-                if thread_ts:
-                    kwargs["thread_ts"] = thread_ts
+                chunk_thread_ts = auto_thread_ts or thread_ts
+                if chunk_thread_ts:
+                    kwargs["thread_ts"] = chunk_thread_ts
                     # Only broadcast the first chunk of the first reply
                     if broadcast and i == 0:
                         kwargs["reply_broadcast"] = True
 
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+
+                # Auto-thread subsequent chunks under the first chunk
+                if i == 0 and not thread_ts and len(chunks) > 1:
+                    sent_ts = last_result.get("ts")
+                    if sent_ts:
+                        auto_thread_ts = sent_ts
 
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
@@ -307,6 +315,8 @@ class SlackAdapter(BasePlatformAdapter):
                 # Also register the thread root so replies-to-my-replies work
                 if thread_ts:
                     self._bot_message_ts.add(thread_ts)
+                elif auto_thread_ts:
+                    self._bot_message_ts.add(auto_thread_ts)
                 if len(self._bot_message_ts) > self._BOT_TS_MAX:
                     excess = len(self._bot_message_ts) - self._BOT_TS_MAX // 2
                     for old_ts in list(self._bot_message_ts)[:excess]:
