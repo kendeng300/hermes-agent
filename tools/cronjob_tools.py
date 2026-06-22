@@ -189,6 +189,82 @@ def _validate_cron_script_path(script: Optional[str]) -> Optional[str]:
     return None
 
 
+def _validate_cron_script_integrity(script: str) -> Optional[str]:
+    """Full integrity check for cron script paths — existence, syntax, tests, git.
+
+    Called by cron create/update to ensure the referenced script is actually
+    operable BEFORE the cron job is persisted.
+
+    Checks:
+      1. Path safety (delegates to _validate_cron_script_path)
+      2. File existence on disk
+      3. Python syntax validity (ast.parse)
+      4. Corresponding test file existence (heuristic: test_<basename>.py)
+      5. Git tracking
+
+    Returns error string if any check fails, None if all pass.
+    """
+    from hermes_constants import get_hermes_home
+    import ast
+    import subprocess as sp
+
+    # 1. Path safety (existing validation)
+    safety_error = _validate_cron_script_path(script)
+    if safety_error:
+        return safety_error
+
+    # 2. File existence
+    scripts_dir = get_hermes_home() / "scripts"
+    resolved = (scripts_dir / script.strip()).resolve()
+    if not resolved.exists():
+        return (
+            f"SCRIPT_NOT_FOUND: {resolved} does not exist. "
+            f"Create the script at ~/.hermes/scripts/{script.strip()} before "
+            f"creating or updating a cron job that references it."
+        )
+    if not resolved.is_file():
+        return f"NOT_A_FILE: {resolved} is not a regular file."
+
+    # 3. Python syntax
+    try:
+        ast.parse(resolved.read_text())
+    except SyntaxError as e:
+        return f"SYNTAX_ERROR in {script}: {e}"
+
+    # 4. Test file existence (heuristic)
+    stem = resolved.stem
+    test_candidate = scripts_dir / "tests" / f"test_{stem}.py"
+    mw_test_candidate = Path("/home/linux/MarketWatch/tests") / f"test_{stem}.py"
+    if not test_candidate.exists() and not mw_test_candidate.exists():
+        return (
+            f"NO_TEST_FILE: {script} has no corresponding test file. "
+            f"Expected at either {test_candidate} or {mw_test_candidate}. "
+            f"Write tests before activating a cron that references this script."
+        )
+
+    # 5. Git tracking (at least one of the repos must track it)
+    tracked = False
+    for repo_root in [scripts_dir, Path("/home/linux/MarketWatch")]:
+        try:
+            r = sp.run(
+                ["git", "ls-files", "--error-unmatch", str(resolved)],
+                cwd=str(repo_root), capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                tracked = True
+                break
+        except (OSError, sp.TimeoutExpired):
+            continue
+    if not tracked:
+        return (
+            f"NOT_TRACKED: {script} is not tracked by git in either "
+            f"~/.hermes/scripts/ or MarketWatch repo. "
+            f"Commit the script to git before activating a cron."
+        )
+
+    return None
+
+
 def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     prompt = job.get("prompt", "")
     skills = _canonical_skills(job.get("skill"), job.get("skills"))
@@ -259,9 +335,9 @@ def cronjob(
                 if scan_error:
                     return tool_error(scan_error, success=False)
 
-            # Validate script path before storing
+            # Validate script integrity before storing
             if script:
-                script_error = _validate_cron_script_path(script)
+                script_error = _validate_cron_script_integrity(script)
                 if script_error:
                     return tool_error(script_error, success=False)
 
@@ -277,7 +353,7 @@ def cronjob(
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
-                enabled_toolsets=enabled_toolsets or None,
+                enabled_toolsets=enabled_toolsets if enabled_toolsets is not None else ["terminal", "file", "web"],
                 workdir=_normalize_optional_job_value(workdir),
             )
             return json.dumps(
@@ -364,7 +440,7 @@ def cronjob(
             if script is not None:
                 # Pass empty string to clear an existing script
                 if script:
-                    script_error = _validate_cron_script_path(script)
+                    script_error = _validate_cron_script_integrity(script)
                     if script_error:
                         return tool_error(script_error, success=False)
                 updates["script"] = _normalize_optional_job_value(script) if script else None
