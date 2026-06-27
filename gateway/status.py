@@ -387,6 +387,17 @@ def write_pid_file() -> None:
         except OSError:
             pass
         raise
+    # STRATS-129: Kill Chain C fix — systemd GuessMainPID race on cgroup v1
+# Write companion plain-PID file for systemd PIDFile= directive.
+    # systemd requires a file containing exactly the PID (integer), not JSON.
+    # On cgroup v1, PIDFile= prevents systemd's GuessMainPID=yes from
+    # misidentifying the main PID during terminal() subprocess churn
+    # (Kill Chain C root cause).
+    _pid_path = path.with_suffix(".pid.txt")
+    try:
+        _pid_path.write_text(str(os.getpid()))
+    except OSError:
+        pass
 
 
 def write_runtime_status(
@@ -457,6 +468,9 @@ def remove_pid_file() -> None:
                 # PID file belongs to a different process — leave it alone.
                 return
         path.unlink(missing_ok=True)
+        # Clean up companion plain-PID file
+        _pid_path = path.with_suffix(".pid.txt")
+        _pid_path.unlink(missing_ok=True)
     except Exception:
         pass
 

@@ -1570,12 +1570,16 @@ Environment="HERMES_HOME={hermes_home}"
 Restart=on-failure
 RestartSec=30
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
-# STRATS-126: Prevent OOMPolicy=stop from killing gateway when test suites
-# run in the cgroup. continue = leave OOM to kernel; MemoryMax=8G as safety net.
+# STRATS-126: Delegate=yes — architectural fix for Kill Chain C.
+# Prevents systemd cgroup v1 accelerated SIGKILL when child processes
+# (test suites, calibration) consume resources in gateway's cgroup.
+Delegate=yes
 OOMPolicy=continue
 MemoryMax=8G
 KillMode=mixed
 KillSignal=SIGTERM
+PIDFile=%h/.hermes/gateway.pid.txt
+SendSIGKILL=no
 ExecReload=/bin/kill -USR1 $MAINPID
 TimeoutStopSec={restart_timeout}
 StandardOutput=journal
@@ -1606,12 +1610,16 @@ Environment="HERMES_HOME={hermes_home}"
 Restart=on-failure
 RestartSec=30
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
-# STRATS-126: Prevent OOMPolicy=stop from killing gateway when test suites
-# run in the cgroup. continue = leave OOM to kernel; MemoryMax=8G as safety net.
+# STRATS-126: Delegate=yes — architectural fix for Kill Chain C.
+# Prevents systemd cgroup v1 accelerated SIGKILL when child processes
+# (test suites, calibration) consume resources in gateway's cgroup.
+Delegate=yes
 OOMPolicy=continue
 MemoryMax=8G
 KillMode=mixed
 KillSignal=SIGTERM
+PIDFile=%h/.hermes/gateway.pid.txt
+SendSIGKILL=no
 ExecReload=/bin/kill -USR1 $MAINPID
 TimeoutStopSec={restart_timeout}
 StandardOutput=journal
