@@ -1567,9 +1567,13 @@ Environment="LOGNAME={username}"
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+Restart=on-failure
 RestartSec=30
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+# STRATS-126: Prevent OOMPolicy=stop from killing gateway when test suites
+# run in the cgroup. continue = leave OOM to kernel; MemoryMax=8G as safety net.
+OOMPolicy=continue
+MemoryMax=8G
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
@@ -1599,9 +1603,13 @@ WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"
 Environment="HERMES_HOME={hermes_home}"
-Restart=always
+Restart=on-failure
 RestartSec=30
 RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
+# STRATS-126: Prevent OOMPolicy=stop from killing gateway when test suites
+# run in the cgroup. continue = leave OOM to kernel; MemoryMax=8G as safety net.
+OOMPolicy=continue
+MemoryMax=8G
 KillMode=mixed
 KillSignal=SIGTERM
 ExecReload=/bin/kill -USR1 $MAINPID
