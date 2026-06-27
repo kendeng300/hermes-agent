@@ -6035,6 +6035,25 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # Auto-restart ALL gateways after update.
         # The code update (git pull) is shared across all profiles, so every
         # running gateway needs restarting to pick up the new code.
+        # STRATS-123: respect gateway.auto_restart_after_update config flag.
+        # When disabled, prints a reminder and returns early (skips legacy-unit
+        # check and post-update tip — acceptable regression for this use case).
+        _auto_restart = True
+        try:
+            from hermes_cli.config import load_config as _load_cfg_restart
+            _gw_cfg = (_load_cfg_restart().get("gateway") or {})
+            _auto_restart = _gw_cfg.get("auto_restart_after_update", True)
+        except Exception:
+            pass
+        if not _auto_restart:
+            print()
+            print("════════════════════════════════════════════════════════════")
+            print("  ⚠️  Gateway restart required to pick up code changes.")
+            print("  Run: hermes gateway restart")
+            print("  (Auto-restart disabled: gateway.auto_restart_after_update = false)")
+            print("════════════════════════════════════════════════════════════")
+            print()
+            return
         try:
             from hermes_cli.gateway import (
                 is_macos,
