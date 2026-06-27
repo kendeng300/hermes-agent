@@ -1576,11 +1576,15 @@ RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 Delegate=yes
 OOMPolicy=continue
 MemoryMax=8G
-KillMode=mixed
+KillMode=process
 KillSignal=SIGTERM
 PIDFile=%h/.hermes/gateway.pid.txt
-SendSIGKILL=no
 ExecReload=/bin/kill -USR1 $MAINPID
+# STRATS-130: Layer ③ — cleanup orphaned child processes from cgroup
+# after stop to prevent restart deadlock with Delegate=yes.
+# On cgroup v1, Delegate=yes prevents systemd from cleaning up orphans;
+# this ensures the cgroup is empty before any restart attempt.
+ExecStopPost=/bin/sh -c 'sleep 2; cg=$(systemctl --user show hermes-gateway -p ControlGroup --value 2>/dev/null); [ -n "$cg" ] && [ -f "/sys/fs/cgroup/systemd$cg/cgroup.procs" ] && for pid in $(cat "/sys/fs/cgroup/systemd$cg/cgroup.procs" 2>/dev/null); do [ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null; done; true'
 TimeoutStopSec={restart_timeout}
 StandardOutput=journal
 StandardError=journal
@@ -1616,11 +1620,15 @@ RestartForceExitStatus={GATEWAY_SERVICE_RESTART_EXIT_CODE}
 Delegate=yes
 OOMPolicy=continue
 MemoryMax=8G
-KillMode=mixed
+KillMode=process
 KillSignal=SIGTERM
 PIDFile=%h/.hermes/gateway.pid.txt
-SendSIGKILL=no
 ExecReload=/bin/kill -USR1 $MAINPID
+# STRATS-130: Layer ③ — cleanup orphaned child processes from cgroup
+# after stop to prevent restart deadlock with Delegate=yes.
+# On cgroup v1, Delegate=yes prevents systemd from cleaning up orphans;
+# this ensures the cgroup is empty before any restart attempt.
+ExecStopPost=/bin/sh -c 'sleep 2; cg=$(systemctl --user show hermes-gateway -p ControlGroup --value 2>/dev/null); [ -n "$cg" ] && [ -f "/sys/fs/cgroup/systemd$cg/cgroup.procs" ] && for pid in $(cat "/sys/fs/cgroup/systemd$cg/cgroup.procs" 2>/dev/null); do [ "$pid" != "$$" ] && kill -9 "$pid" 2>/dev/null; done; true'
 TimeoutStopSec={restart_timeout}
 StandardOutput=journal
 StandardError=journal
