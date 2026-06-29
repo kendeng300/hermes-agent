@@ -665,13 +665,29 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     script_timeout = _get_script_timeout()
 
+    # STRATS-108: Optionally pull latest code before running the script so
+    # committed-and-pushed changes are visible to cron execution. Best-effort
+    # only: network failures or dirty repos don't block the job.
+    _git_pull_enabled = os.environ.get("HERMES_CRON_GIT_PULL", "").strip().lower()
+    if _git_pull_enabled in ("1", "true", "yes"):
+        try:
+            _repo_root = str(scripts_dir_resolved)
+            subprocess.run(
+                ["git", "pull", "--ff-only"],
+                capture_output=True, text=True,
+                timeout=30, cwd=_repo_root,
+            )
+        except Exception:
+            pass  # best-effort — don't block the script
+
     try:
         result = subprocess.run(
             [sys.executable, str(path)],
             capture_output=True,
             text=True,
             timeout=script_timeout,
-            cwd=str(path.parent),
+            cwd=str(scripts_dir_resolved),
+            env={**os.environ, "PYTHONPATH": str(scripts_dir_resolved)},
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()

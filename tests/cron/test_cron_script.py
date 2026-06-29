@@ -174,6 +174,112 @@ class TestRunJobScript:
         parsed = json.loads(output)
         assert parsed["new_prs"][0]["number"] == 42
 
+    # ── STRATS-114 / STRATS-108 TDD tests ──────────────────────────────────
+
+    def test_script_cwd_is_scripts_dir_not_parent(self, cron_env, monkeypatch):
+        """STRATS-114: cwd must be scripts_dir_resolved, not script's parent dir."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "subdir" / "cwd_test.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("import os; print(os.getcwd())\n")
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        scripts_dir = str(cron_env / "scripts")
+        assert output.strip() == scripts_dir, (
+            f"Expected cwd={scripts_dir}, got {output.strip()}"
+        )
+
+    def test_script_pythonpath_includes_scripts_dir(self, cron_env):
+        """STRATS-114: PYTHONPATH must include scripts_dir so cross-package
+        imports (e.g., `from utilities.xyz import ...`) resolve correctly."""
+        from cron.scheduler import _run_job_script
+
+        utils_dir = cron_env / "scripts" / "utilities"
+        utils_dir.mkdir(parents=True, exist_ok=True)
+        (utils_dir / "__init__.py").write_text("")
+        (utils_dir / "test_util.py").write_text("MAGIC_TOKEN = 'strats114'\n")
+
+        script = cron_env / "scripts" / "import_test.py"
+        script.write_text("from utilities.test_util import MAGIC_TOKEN; print(MAGIC_TOKEN)\n")
+
+        success, output = _run_job_script(str(script))
+        assert success is True, f"Import failed: {output}"
+        assert output.strip() == "strats114"
+
+    def test_git_pull_not_called_by_default(self, cron_env, monkeypatch):
+        """STRATS-108: git pull must NOT run unless HERMES_CRON_GIT_PULL is set."""
+        import subprocess as sp
+        from cron.scheduler import _run_job_script
+
+        orig_run = sp.run
+        git_called = []
+        def _fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "git":
+                git_called.append((cmd, kwargs))
+            return orig_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr("cron.scheduler.subprocess.run", _fake_run)
+        monkeypatch.delenv("HERMES_CRON_GIT_PULL", raising=False)
+
+        script = cron_env / "scripts" / "simple.py"
+        script.write_text("print('ok')\n")
+
+        success, _ = _run_job_script(str(script))
+        assert success is True
+        assert not git_called, "git pull must NOT run by default"
+
+    def test_git_pull_called_when_enabled(self, cron_env, monkeypatch):
+        """STRATS-108: git pull runs when HERMES_CRON_GIT_PULL=true."""
+        import subprocess as sp
+        from cron.scheduler import _run_job_script
+
+        orig_run = sp.run
+        git_called = []
+        def _fake_run(cmd, *args, **kwargs):
+            if isinstance(cmd, list) and cmd and cmd[0] == "git":
+                git_called.append((cmd, kwargs))
+            return orig_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr("cron.scheduler.subprocess.run", _fake_run)
+        monkeypatch.setenv("HERMES_CRON_GIT_PULL", "true")
+
+        script = cron_env / "scripts" / "simple2.py"
+        script.write_text("print('ok')\n")
+
+        success, _ = _run_job_script(str(script))
+        assert success is True
+        assert len(git_called) == 1, "git pull must run when HERMES_CRON_GIT_PULL=true"
+        cmd, kwargs = git_called[0]
+        assert cmd == ["git", "pull", "--ff-only"]
+
+    def test_git_pull_failure_is_nonfatal(self, cron_env, monkeypatch):
+        """STRATS-108: git pull failure must not block script execution."""
+        import subprocess as sp
+        from cron.scheduler import _run_job_script
+
+        orig_run = sp.run
+        call_count = [0]
+        def _fake_run(cmd, *args, **kwargs):
+            call_count[0] += 1
+            if isinstance(cmd, list) and cmd and cmd[0] == "git":
+                raise Exception("network down")
+            return orig_run(cmd, *args, **kwargs)
+
+        monkeypatch.setattr("cron.scheduler.subprocess.run", _fake_run)
+        monkeypatch.setenv("HERMES_CRON_GIT_PULL", "true")
+
+        script = cron_env / "scripts" / "simple3.py"
+        script.write_text("print('survived')\n")
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        assert output.strip() == "survived", (
+            f"Script must run even when git pull fails. Got: {output}"
+        )
+        assert call_count[0] >= 2
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""
