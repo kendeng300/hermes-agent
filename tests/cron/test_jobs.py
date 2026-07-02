@@ -185,6 +185,9 @@ def tmp_cron_dir(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    # SYS-2131: Prevent load_jobs() from falling through to the real
+    # cron_state.json, which leaks 45 production entries into test runs.
+    monkeypatch.setattr("cron.jobs._CRON_STATE_PATH", tmp_path / "cron" / "_cron_state_test.json")
     return tmp_path
 
 
@@ -564,6 +567,119 @@ class TestGetDueJobs:
 
         assert get_due_jobs() == []
         assert get_job("oneshot-stale")["next_run_at"] is None
+
+
+    def test_cron_job_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        """SYS-2131: Cron jobs restored from cron_state.json have schedule but no next_run_at.
+        They should be recovered by computing next_run from the cron expression, not silently skipped."""
+        now = datetime(2026, 7, 2, 13, 45, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        # Simulate a cron job restored from cron_state.json: has schedule, but no next_run_at
+        save_jobs(
+            [{
+                "id": "cron-recover",
+                "name": "Daily report",
+                "prompt": "Generate report",
+                "schedule": {"kind": "cron", "expr": "0 14 * * *", "display": "0 14 * * *"},
+                "schedule_display": "0 14 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-07-02T12:00:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        # Job should have next_run_at populated (recovered from cron schedule)
+        # It may or may not be due depending on timing
+        recovered = get_job("cron-recover")
+        assert recovered["next_run_at"] is not None, "next_run_at should be populated"
+        assert recovered["next_run_at"] == "2026-07-02T14:00:00+00:00",             f"Expected next_run_at=14:00 UTC, got {recovered['next_run_at']}"
+
+    def test_interval_job_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        """Interval jobs with no next_run_at should also be recovered."""
+        now = datetime(2026, 7, 2, 13, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "interval-recover",
+                "name": "Hourly check",
+                "prompt": "Check health",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "schedule_display": "every 60m",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-07-02T12:00:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+
+        # Job should have next_run_at populated (recovered from interval schedule)
+        recovered = get_job("interval-recover")
+        assert recovered["next_run_at"] is not None, "next_run_at should be populated"
+        # For interval=60min with last_run=None, next_run should be ~60min from now
+        from cron.jobs import _ensure_aware
+        next_dt = _ensure_aware(datetime.fromisoformat(recovered["next_run_at"]))
+        expected = datetime(2026, 7, 2, 14, 0, 0, tzinfo=timezone.utc)
+        assert next_dt == expected, f"Expected {expected}, got {next_dt}"
+
+    def test_empty_schedule_job_logs_warning_and_skips(self, tmp_cron_dir, monkeypatch, caplog):
+        """Jobs with empty schedule {} should be logged and skipped, not silently dropped."""
+        import logging
+        caplog.set_level(logging.WARNING)
+
+        now = datetime(2026, 7, 2, 13, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "empty-sched",
+                "name": "Broken job",
+                "prompt": "This should never fire",
+                "schedule": {},
+                "schedule_display": "",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-07-02T12:00:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        due = get_due_jobs()
+        assert len(due) == 0
+
+        # Should have logged a WARNING
+        assert any("unrecoverable" in rec.message.lower() or "no schedule" in rec.message.lower() or "cannot compute" in rec.message.lower()
+                   for rec in caplog.records), "Should log warning for unrecoverable job"
 
 
 class TestEnabledToolsets:

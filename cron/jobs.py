@@ -870,26 +870,76 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
         next_run = job.get("next_run_at")
         if not next_run:
+            schedule = job.get("schedule", {})
             recovered_next = _recoverable_oneshot_run_at(
-                job.get("schedule", {}),
+                schedule,
                 now,
                 last_run_at=job.get("last_run_at"),
             )
-            if not recovered_next:
+            if recovered_next:
+                job["next_run_at"] = recovered_next
+                next_run = recovered_next
+                logger.info(
+                    "Job '%s' had no next_run_at; recovering one-shot run at %s",
+                    job.get("name", job["id"]),
+                    recovered_next,
+                )
+                for rj in raw_jobs:
+                    if rj.get("id") == job.get("id"):
+                        rj["next_run_at"] = recovered_next
+                        needs_save = True
+                        break
+            elif schedule and schedule.get("kind") in ("cron", "interval"):
+                # SYS-2131: Recover recurring jobs with missing next_run_at
+                # by computing from the schedule. This handles the case where
+                # cron_state.json restoration loses next_run_at but preserves
+                # the schedule structure.
+                try:
+                    recovered_next = compute_next_run(schedule, None)
+                except Exception:
+                    logger.exception(
+                        "Job '%s' (id=%s) has %s schedule but "
+                        "compute_next_run raised. Skipping.",
+                        job.get("name", job.get("id", "?")),
+                        job.get("id", "?"),
+                        schedule.get("kind"),
+                    )
+                    continue
+                if recovered_next:
+                    job["next_run_at"] = recovered_next
+                    next_run = recovered_next
+                    logger.warning(
+                        "Job '%s' (id=%s) had no next_run_at; recovered from %s "
+                        "schedule: %s",
+                        job.get("name", job.get("id", "?")),
+                        job.get("id", "?"),
+                        schedule.get("kind"),
+                        recovered_next,
+                    )
+                    for rj in raw_jobs:
+                        if rj.get("id") == job.get("id"):
+                            rj["next_run_at"] = recovered_next
+                            needs_save = True
+                            break
+                else:
+                    logger.warning(
+                        "Job '%s' (id=%s) has %s schedule but "
+                        "compute_next_run returned None. Skipping.",
+                        job.get("name", job.get("id", "?")),
+                        job.get("id", "?"),
+                        schedule.get("kind"),
+                    )
+                    continue
+            else:
+                # SYS-2131: Log warning for truly unrecoverable jobs
+                logger.warning(
+                    "Job '%s' (id=%s) has no next_run_at and schedule is "
+                    "unrecoverable (kind=%s). Silently skipped before SYS-2131.",
+                    job.get("name", job.get("id", "?")),
+                    job.get("id", "?"),
+                    schedule.get("kind") if schedule else "no schedule",
+                )
                 continue
-
-            job["next_run_at"] = recovered_next
-            next_run = recovered_next
-            logger.info(
-                "Job '%s' had no next_run_at; recovering one-shot run at %s",
-                job.get("name", job["id"]),
-                recovered_next,
-            )
-            for rj in raw_jobs:
-                if rj["id"] == job["id"]:
-                    rj["next_run_at"] = recovered_next
-                    needs_save = True
-                    break
 
         next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
         if next_run_dt <= now:
@@ -908,14 +958,14 @@ def get_due_jobs() -> List[Dict[str, Any]]:
                     logger.info(
                         "Job '%s' missed its scheduled time (%s, grace=%ds). "
                         "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
+                        job.get("name", job.get("id", "?")),
                         next_run,
                         grace,
                         new_next,
                     )
                     # Update the job in storage
                     for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
+                        if rj.get("id") == job.get("id"):
                             rj["next_run_at"] = new_next
                             needs_save = True
                             break
