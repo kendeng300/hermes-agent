@@ -323,16 +323,76 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
 # Job CRUD Operations
 # =============================================================================
 
+# SYS-2125: Path to canonical cron state backup
+_CRON_STATE_PATH = HERMES_DIR / "data" / "cron_state.json"
+
+
+def _restore_from_cron_state() -> List[Dict[str, Any]]:
+    """Attempt to restore cron jobs from cron_state.json backup.
+
+    This is the SYS-2125 recovery path: when jobs.json is missing, empty,
+    or corrupted, we restore from the filesystem backup.  The backup is
+    written by cron health checks that snapshot the full job list.
+
+    Returns the restored job list, or [] if recovery fails.
+    Saves the restored jobs back to jobs.json so subsequent loads are clean.
+    """
+    if not _CRON_STATE_PATH.exists():
+        logger.error("SYS-2125: cron_state.json also missing — cannot recover")
+        return []
+    try:
+        with open(_CRON_STATE_PATH, 'r', encoding='utf-8') as f:
+            state_data = json.load(f)
+    except Exception as e:
+        logger.error("SYS-2125: Failed to read cron_state.json: %s", e)
+        return []
+
+    # cron_state.json can be a list of job dicts or {"jobs": [...]}
+    if isinstance(state_data, list):
+        jobs = state_data
+    elif isinstance(state_data, dict):
+        jobs = state_data.get("jobs", state_data.get("entries", []))
+    else:
+        logger.error("SYS-2125: cron_state.json has unexpected format (type=%s)", type(state_data).__name__)
+        return []
+
+    if not jobs:
+        logger.warning("SYS-2125: cron_state.json exists but has zero entries")
+        return []
+
+    # Persist the recovered jobs back to jobs.json
+    try:
+        save_jobs(jobs)
+        logger.info(
+            "SYS-2125: RESTORED %d cron jobs from cron_state.json → jobs.json",
+            len(jobs),
+        )
+    except Exception as e:
+        logger.error("SYS-2125: Restored %d jobs but failed to save to jobs.json: %s", len(jobs), e)
+
+    return jobs
+
+
 def load_jobs() -> List[Dict[str, Any]]:
-    """Load all jobs from storage."""
+    """Load all jobs from storage.
+
+    SYS-2125: If jobs.json is empty or has zero jobs, attempts automatic
+    recovery from ~/.hermes/data/cron_state.json (the canonical backup
+    maintained by the cron health system).  This prevents silent cron
+    loss from state.db corruption, file truncation, or manual deletion.
+    """
     ensure_dirs()
     if not JOBS_FILE.exists():
+        logger.warning("SYS-2125: jobs.json missing — attempting recovery from cron_state.json")
+        restored = _restore_from_cron_state()
+        if restored:
+            return restored
         return []
-    
+
     try:
         with open(JOBS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return data.get("jobs", [])
+            jobs = data.get("jobs", [])
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         try:
@@ -346,10 +406,27 @@ def load_jobs() -> List[Dict[str, Any]]:
                 return jobs
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
+            # SYS-2125: Attempt recovery from cron_state.json before raising
+            restored = _restore_from_cron_state()
+            if restored:
+                return restored
             raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
+        # SYS-2125: Attempt recovery from cron_state.json before raising
+        restored = _restore_from_cron_state()
+        if restored:
+            return restored
         raise RuntimeError(f"Failed to read cron database: {e}") from e
+
+    # SYS-2125: Zero-job list → auto-restore from cron_state.json
+    if not jobs:
+        logger.warning("SYS-2125: jobs.json has zero jobs — attempting recovery from cron_state.json")
+        restored = _restore_from_cron_state()
+        if restored:
+            return restored
+
+    return jobs
 
 
 def save_jobs(jobs: List[Dict[str, Any]]):
