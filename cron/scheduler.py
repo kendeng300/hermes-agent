@@ -1301,6 +1301,143 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
 
+# ── SEV-1 Slack Alert Helpers ─────────────────────────────────────────────────
+
+# Severity heuristic: pipeline jobs (those with a workdir) → CRITICAL,
+# support jobs (no workdir) → HIGH.
+def _resolve_job_severity(job: dict) -> str:
+    """Return 'CRITICAL' for pipeline jobs (workdir set), 'HIGH' for support jobs."""
+    if (job.get("workdir") or "").strip():
+        return "CRITICAL"
+    return "HIGH"
+
+
+def _send_sev1_slack_alert(job: dict, error: Optional[str], output_file) -> None:
+    """Send a SEV-1 alert to the SEV-1 Slack channel on cron job failure.
+
+    Non-blocking: if Slack delivery fails, the error is logged but the
+    scheduler continues without interruption.
+    """
+    try:
+        job_id = job.get("id", "?")
+        job_name = job.get("name", job_id)
+        severity = _resolve_job_severity(job)
+        timestamp = _hermes_now().strftime("%Y-%m-%d %H:%M:%S UTC")
+        error_text = error or "Unknown error"
+
+        # ── CRON_JOB_FAILURE log at ERROR level (also hits errors.log) ──
+        logger.error(
+            "CRON_JOB_FAILURE job=%s name=%s severity=%s error=%s output=%s",
+            job_id, job_name, severity, error_text[:200], output_file,
+        )
+
+        # ── Build Slack message payload ──────────────────────────────────
+        payload = {
+            "channel": "C0B15FWBYTG",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": f"🚨 SEV-1: Cron Job Failure — {severity}",
+                        "emoji": True,
+                    },
+                },
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Job:*\n{job_name}"},
+                        {"type": "mrkdwn", "text": f"*Job ID:*\n`{job_id}`"},
+                        {"type": "mrkdwn", "text": f"*Severity:*\n`{severity}`"},
+                        {"type": "mrkdwn", "text": f"*Timestamp:*\n{timestamp}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Error:*\n```{error_text[:1500]}```",
+                    },
+                },
+                {
+                    "type": "context",
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"📄 Output: `{output_file}`",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        # ── Post to Slack ────────────────────────────────────────────────
+        _slack_post(payload)
+
+    except Exception as e:
+        logger.error(
+            "Failed to send SEV-1 Slack alert for job %s: %s",
+            job.get("id", "?"), e,
+        )
+
+
+def _slack_post(payload: dict) -> None:
+    """Post a JSON payload to Slack.
+
+    Tries SLACK_WEBHOOK_URL first (simpler), then falls back to
+    SLACK_BOT_TOKEN via chat.postMessage API.
+    """
+    import urllib.request
+    import urllib.error
+
+    payload_json = json.dumps(payload).encode("utf-8")
+
+    # Strategy 1: Incoming webhook (SLACK_WEBHOOK_URL)
+    webhook_url = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+    if webhook_url:
+        req = urllib.request.Request(
+            webhook_url,
+            data=payload_json,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            logger.debug("SEV-1 alert sent via webhook for job %s", payload.get("blocks", [{}])[0])
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Webhook delivery failed: {e}")
+        return
+
+    # Strategy 2: Bot token (SLACK_BOT_TOKEN) via chat.postMessage
+    bot_token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+    if not bot_token:
+        raise RuntimeError(
+            "Neither SLACK_WEBHOOK_URL nor SLACK_BOT_TOKEN is set — "
+            "cannot send SEV-1 alert"
+        )
+
+    req = urllib.request.Request(
+        "https://slack.com/api/chat.postMessage",
+        data=payload_json,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {bot_token}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+            result = json.loads(body)
+            if not result.get("ok"):
+                raise RuntimeError(
+                    f"Slack API error: {result.get('error', 'unknown')}"
+                )
+        logger.debug("SEV-1 alert sent via bot token for job %s", payload.get("channel", "?"))
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"chat.postMessage failed: {e}")
+
+
 def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     """
     Check and run all due jobs.
@@ -1382,6 +1519,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
+
+                # ── SEV-1 Slack alert on failure ──────────────────────────────────
+                if not success or error:
+                    _send_sev1_slack_alert(job, error, output_file)
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but

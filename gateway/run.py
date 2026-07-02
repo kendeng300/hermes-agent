@@ -10922,11 +10922,24 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     tick_count = 0
     while not stop_event.is_set():
         try:
-            cron_tick(verbose=False, adapters=adapters, loop=loop)
+            cron_tick(verbose=True, adapters=adapters, loop=loop)
         except Exception as e:
             logger.debug("Cron tick error: %s", e)
 
         tick_count += 1
+
+        # ── Dead-man switch heartbeat ──────────────────────────────────
+        # Touch heartbeat file so the OS-level dead_mans_switch.sh knows
+        # the gateway is alive. Runs every tick regardless of cron success.
+        try:
+            # Use get_hermes_home() so the heartbeat path matches the dead-man
+            # switch script which reads HERMES_HOME (defaulting to ~/.hermes).
+            from hermes_constants import get_hermes_home
+            heartbeat_path = get_hermes_home() / "data" / "gateway_heartbeat"
+            heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            heartbeat_path.touch()
+        except Exception:
+            pass  # Non-fatal — dead-man switch will catch the miss
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:

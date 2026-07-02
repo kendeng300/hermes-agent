@@ -440,12 +440,53 @@ def save_jobs(jobs: List[Dict[str, Any]]):
             os.fsync(f.fileno())
         os.replace(tmp_path, JOBS_FILE)
         _secure_file(JOBS_FILE)
+        # SYS-2076: Sync the canonical backup so recovery produces full jobs
+        _sync_cron_state(jobs)
     except BaseException:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
         raise
+
+
+def _sync_cron_state(jobs: List[Dict[str, Any]]):
+    """Sync the canonical cron_state.json backup with full job schema.
+
+    SYS-2076: cron_state.json previously stored only {name, script, enabled}.
+    Now includes id and schedule so recovery can produce fully-functional jobs
+    instead of silently-skipped shells.  Written atomically via tempfile+rename.
+    """
+    try:
+        minimal = []
+        for j in jobs:
+            entry = {
+                "id": j.get("id"),
+                "name": j.get("name", ""),
+                "script": j.get("script", ""),
+                "schedule": j.get("schedule", {}),
+                "enabled": j.get("enabled", True),
+            }
+            minimal.append(entry)
+
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(_CRON_STATE_PATH.parent), suffix='.tmp', prefix='.cron_state_'
+        )
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(minimal, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, _CRON_STATE_PATH)
+            _secure_file(_CRON_STATE_PATH)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        logger.warning("SYS-2076: Failed to sync cron_state.json: %s", e)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -850,6 +891,70 @@ def advance_next_run(job_id: str) -> bool:
         return False
 
 
+def _alert_job_unrecoverable(job: dict, kind: str):
+    """SYS-2076: Post SEV-1 Slack alert when a job is permanently unrecoverable.
+
+    Called when get_due_jobs() encounters a job with no next_run_at and no
+    recoverable schedule. Must not crash the scheduler if Slack is unreachable.
+    """
+    try:
+        import urllib.request
+
+        job_name = job.get("name", job.get("id", "?"))
+        job_id = job.get("id", "?")
+        now_iso = _hermes_now().isoformat()
+
+        payload = {
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "SEV-1: Cron Job Permanently Unrecoverable"},
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Job:*\n{job_name}"},
+                        {"type": "mrkdwn", "text": f"*ID:*\n`{job_id}`"},
+                        {"type": "mrkdwn", "text": f"*Schedule Kind:*\n{kind or 'NONE'}"},
+                        {"type": "mrkdwn", "text": f"*Time:*\n{now_iso}"},
+                    ],
+                },
+            ],
+        }
+
+        webhook_url = os.getenv("SLACK_WEBHOOK_URL", "").strip()
+        bot_token = os.getenv("SLACK_BOT_TOKEN", "").strip()
+
+        if webhook_url:
+            req = urllib.request.Request(
+                webhook_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+            return
+
+        if bot_token:
+            api_payload = {
+                "channel": "C0B15FWBYTG",
+                "text": f"SEV-1: Job '{job_name}' is permanently unrecoverable",
+                "blocks": payload["blocks"],
+            }
+            api_req = urllib.request.Request(
+                "https://slack.com/api/chat.postMessage",
+                data=json.dumps(api_payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {bot_token}",
+                },
+            )
+            with urllib.request.urlopen(api_req, timeout=10):
+                pass
+    except Exception:
+        pass
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -931,14 +1036,13 @@ def get_due_jobs() -> List[Dict[str, Any]]:
                     )
                     continue
             else:
-                # SYS-2131: Log warning for truly unrecoverable jobs
-                logger.warning(
-                    "Job '%s' (id=%s) has no next_run_at and schedule is "
-                    "unrecoverable (kind=%s). Silently skipped before SYS-2131.",
+                # SYS-2076: SEV-1 alert for permanently unrecoverable jobs
+                logger.error(
+                    "SEV-1: Job '%s' (id=%s) is PERMANENTLY UNRECOVERABLE",
                     job.get("name", job.get("id", "?")),
                     job.get("id", "?"),
-                    schedule.get("kind") if schedule else "no schedule",
                 )
+                _alert_job_unrecoverable(job, schedule.get("kind") if schedule else "no schedule")
                 continue
 
         next_run_dt = _ensure_aware(datetime.fromisoformat(next_run))
