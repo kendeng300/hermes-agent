@@ -2360,7 +2360,17 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
                  hasn't fully exited yet.
     """
     sys.path.insert(0, str(PROJECT_ROOT))
-    
+
+    # SYS-2120: Make gateway immune to OOM killer
+    # A process can lower its own oom_score_adj without root.
+    # -1000 = completely immune to OOM kill. Gateway is critical
+    # infrastructure — no valid recovery path if it's silently killed.
+    try:
+        with open("/proc/self/oom_score_adj", "w") as f:
+            f.write("-1000")
+    except OSError:
+        pass
+
     from gateway.run import start_gateway
     
     print("┌─────────────────────────────────────────────────────────┐")
