@@ -10899,6 +10899,22 @@ class GatewayRunner:
         return response
 
 
+def _start_heartbeat_pulse(stop_event: threading.Event, heartbeat_path, pulse_interval: int = 30):
+    """
+    Independent heartbeat thread — touches the heartbeat file at a fixed interval
+    regardless of how long cron_tick() takes. This prevents false SEV-1 alerts
+    when cron_tick() is slow but the gateway process is healthy.
+
+    Runs as a daemon thread so it exits automatically when the gateway stops.
+    """
+    while not stop_event.wait(timeout=pulse_interval):
+        try:
+            heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            heartbeat_path.touch()
+        except Exception:
+            pass  # Non-fatal — dead-man switch will catch the miss
+
+
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
@@ -10918,6 +10934,28 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
 
+    # ── Independent heartbeat thread ──────────────────────────────────
+    # Runs separately from the cron tick loop so a slow/hung cron_tick()
+    # doesn't block the heartbeat pulse. Without this, if cron_tick() takes
+    # 95s in a 60s loop, the heartbeat gap can exceed the 120s dead-man
+    # threshold even though the gateway process itself is healthy.
+    # See: SYS-14 (gateway heartbeat SEV-1 recurrence, July 2026)
+    try:
+        from hermes_constants import get_hermes_home
+        heartbeat_path = get_hermes_home() / "data" / "gateway_heartbeat"
+    except Exception:
+        heartbeat_path = None
+
+    if heartbeat_path:
+        heartbeat_thread = threading.Thread(
+            target=_start_heartbeat_pulse,
+            args=(stop_event, heartbeat_path),
+            daemon=True,
+            name="gateway-heartbeat-pulse"
+        )
+        heartbeat_thread.start()
+        logger.info("Heartbeat pulse thread started (interval=30s)")
+
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
     while not stop_event.is_set():
@@ -10927,19 +10965,6 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
             logger.debug("Cron tick error: %s", e)
 
         tick_count += 1
-
-        # ── Dead-man switch heartbeat ──────────────────────────────────
-        # Touch heartbeat file so the OS-level dead_mans_switch.sh knows
-        # the gateway is alive. Runs every tick regardless of cron success.
-        try:
-            # Use get_hermes_home() so the heartbeat path matches the dead-man
-            # switch script which reads HERMES_HOME (defaulting to ~/.hermes).
-            from hermes_constants import get_hermes_home
-            heartbeat_path = get_hermes_home() / "data" / "gateway_heartbeat"
-            heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
-            heartbeat_path.touch()
-        except Exception:
-            pass  # Non-fatal — dead-man switch will catch the miss
 
         if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
             try:
