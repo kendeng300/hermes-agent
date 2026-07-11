@@ -99,6 +99,7 @@ from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.context_telemetry import ContextBreakdown, record_context_call
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
@@ -1573,6 +1574,9 @@ class AIAgent:
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
 
+        # Context telemetry — populated by _build_system_prompt(), recorded at API call
+        self._system_prompt_breakdown = None
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -2161,6 +2165,7 @@ class AIAgent:
 
         # ── Invalidate cached system prompt so it rebuilds next turn ──
         self._cached_system_prompt = None
+        self._system_prompt_breakdown = None
 
         # ── Update _primary_runtime so the change persists across turns ──
         _cc = self.context_compressor if hasattr(self, "context_compressor") and self.context_compressor else None
@@ -4361,15 +4366,22 @@ class AIAgent:
         Called once per session (cached on self._cached_system_prompt) and only
         rebuilt after context compression events. This ensures the system prompt
         is stable across all turns in a session, maximizing prefix cache hits.
+        
+        Also populates self._system_prompt_breakdown with per-layer char counts
+        for context telemetry.
         """
-        # Layers (in order):
-        #   1. Agent identity — SOUL.md when available, else DEFAULT_AGENT_IDENTITY
-        #   2. User / gateway system prompt (if provided)
-        #   3. Persistent memory (frozen snapshot)
-        #   4. Skills guidance (if skills tools are loaded)
-        #   5. Context files (AGENTS.md, .cursorrules — SOUL.md excluded here when used as identity)
-        #   6. Current date & time (frozen at build time)
-        #   7. Platform-specific formatting hint
+        # Layer size accumulators for telemetry
+        _soul_chars = 0
+        _tool_guidance_chars = 0
+        _sys_msg_chars = 0
+        _mem_chars = 0
+        _user_chars = 0
+        _ext_mem_chars = 0
+        _skills_chars = 0
+        _ctx_files_chars = 0
+        _ts_model_chars = 0
+        _env_hints_chars = 0
+        _platform_chars = 0
 
         # Try SOUL.md as primary identity (unless context files are skipped)
         _soul_loaded = False
@@ -4378,10 +4390,12 @@ class AIAgent:
             if _soul_content:
                 prompt_parts = [_soul_content]
                 _soul_loaded = True
+                _soul_chars = len(_soul_content)
 
         if not _soul_loaded:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+            _soul_chars = len(DEFAULT_AGENT_IDENTITY)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []
@@ -4392,18 +4406,15 @@ class AIAgent:
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
         if tool_guidance:
-            prompt_parts.append(" ".join(tool_guidance))
+            _tg = " ".join(tool_guidance)
+            prompt_parts.append(_tg)
+            _tool_guidance_chars += len(_tg)
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
             prompt_parts.append(nous_subscription_prompt)
-        # Tool-use enforcement: tells the model to actually call tools instead
-        # of describing intended actions.  Controlled by config.yaml
-        # agent.tool_use_enforcement:
-        #   "auto" (default) — matches TOOL_USE_ENFORCEMENT_MODELS
-        #   true  — always inject (all models)
-        #   false — never inject
-        #   list  — custom model-name substrings to match
+            _tool_guidance_chars += len(nous_subscription_prompt)
+        # Tool-use enforcement
         if self.valid_tool_names:
             _enforce = self._tool_use_enforcement
             _inject = False
@@ -4415,38 +4426,36 @@ class AIAgent:
                 model_lower = (self.model or "").lower()
                 _inject = any(p.lower() in model_lower for p in _enforce if isinstance(p, str))
             else:
-                # "auto" or any unrecognised value — use hardcoded defaults
                 model_lower = (self.model or "").lower()
                 _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
             if _inject:
                 prompt_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+                _tool_guidance_chars += len(TOOL_USE_ENFORCEMENT_GUIDANCE)
                 _model_lower = (self.model or "").lower()
-                # Google model operational guidance (conciseness, absolute
-                # paths, parallel tool calls, verify-before-edit, etc.)
                 if "gemini" in _model_lower or "gemma" in _model_lower:
                     prompt_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-                # OpenAI GPT/Codex execution discipline (tool persistence,
-                # prerequisite checks, verification, anti-hallucination).
+                    _tool_guidance_chars += len(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
                 if "gpt" in _model_lower or "codex" in _model_lower:
                     prompt_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
-
-        # so it can refer the user to them rather than reinventing answers.
+                    _tool_guidance_chars += len(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
         # Note: ephemeral_system_prompt is NOT included here. It's injected at
         # API-call time only so it stays out of the cached/stored system prompt.
         if system_message is not None:
             prompt_parts.append(system_message)
+            _sys_msg_chars = len(system_message)
 
         if self._memory_store:
             if self._memory_enabled:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
-            # USER.md is always included when enabled.
+                    _mem_chars = len(mem_block)
             if self._user_profile_enabled:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+                    _user_chars = len(user_block)
 
         # External memory provider system prompt block (additive to built-in)
         if self._memory_manager:
@@ -4454,6 +4463,7 @@ class AIAgent:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
                     prompt_parts.append(_ext_mem_block)
+                    _ext_mem_chars = len(_ext_mem_block)
             except Exception:
                 pass
 
@@ -4474,17 +4484,15 @@ class AIAgent:
             skills_prompt = ""
         if skills_prompt:
             prompt_parts.append(skills_prompt)
+            _skills_chars = len(skills_prompt)
 
         if not self.skip_context_files:
-            # Use TERMINAL_CWD for context file discovery when set (gateway
-            # mode).  The gateway process runs from the hermes-agent install
-            # dir, so os.getcwd() would pick up the repo's AGENTS.md and
-            # other dev files — inflating token usage by ~10k for no benefit.
             _context_cwd = os.getenv("TERMINAL_CWD") or None
             context_files_prompt = build_context_files_prompt(
                 cwd=_context_cwd, skip_soul=_soul_loaded)
             if context_files_prompt:
                 prompt_parts.append(context_files_prompt)
+                _ctx_files_chars = len(context_files_prompt)
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
@@ -4496,30 +4504,51 @@ class AIAgent:
         if self.provider:
             timestamp_line += f"\nProvider: {self.provider}"
         prompt_parts.append(timestamp_line)
+        _ts_model_chars = len(timestamp_line)
 
-        # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
-        # of the requested model. Inject explicit model identity into the system prompt
-        # so the agent can correctly report which model it is (workaround for API bug).
         if self.provider == "alibaba":
             _model_short = self.model.split("/")[-1] if "/" in self.model else self.model
-            prompt_parts.append(
+            _alibaba_line = (
                 f"You are powered by the model named {_model_short}. "
                 f"The exact model ID is {self.model}. "
                 f"When asked what model you are, always answer based on this information, "
                 f"not on any model name returned by the API."
             )
+            prompt_parts.append(_alibaba_line)
+            _ts_model_chars += len(_alibaba_line)
 
-        # Environment hints (WSL, Termux, etc.) — tell the agent about the
-        # execution environment so it can translate paths and adapt behavior.
+        # Environment hints (WSL, Termux, etc.)
         _env_hints = build_environment_hints()
         if _env_hints:
             prompt_parts.append(_env_hints)
+            _env_hints_chars = len(_env_hints)
 
         platform_key = (self.platform or "").lower().strip()
         if platform_key in PLATFORM_HINTS:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
+            _platform_chars = len(PLATFORM_HINTS[platform_key])
 
-        return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+        # Assemble final prompt
+        _final = "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+        _total_system = len(_final)
+
+        # Store breakdown for context telemetry
+        self._system_prompt_breakdown = ContextBreakdown(
+            soul_md_chars=_soul_chars,
+            tool_guidance_chars=_tool_guidance_chars,
+            system_message_chars=_sys_msg_chars,
+            memory_chars=_mem_chars,
+            user_profile_chars=_user_chars,
+            external_memory_chars=_ext_mem_chars,
+            skills_chars=_skills_chars,
+            context_files_chars=_ctx_files_chars,
+            timestamp_model_chars=_ts_model_chars,
+            environment_hints_chars=_env_hints_chars,
+            platform_hints_chars=_platform_chars,
+            total_system_prompt_chars=_total_system,
+        )
+
+        return _final
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -4733,6 +4762,7 @@ class AIAgent:
         so the rebuilt prompt captures any writes from this session.
         """
         self._cached_system_prompt = None
+        self._system_prompt_breakdown = None
         if self._memory_store:
             self._memory_store.load_from_disk()
 
@@ -9922,6 +9952,28 @@ class AIAgent:
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
             approx_tokens = estimate_messages_tokens_rough(api_messages)
+            
+            # ── Context telemetry: record per-call breakdown ──────────
+            _breakdown = getattr(self, "_system_prompt_breakdown", None)
+            if _breakdown is not None:
+                try:
+                    from gateway.session_context import get_session_env
+                    _cron_name = get_session_env("HERMES_CRON_JOB_NAME", "")
+                except Exception:
+                    _cron_name = os.environ.get("HERMES_CRON_JOB_NAME", "")
+                record_context_call(
+                    session_id=self.session_id or "unknown",
+                    cron_job_name=_cron_name,
+                    user_session=not bool(_cron_name),
+                    platform=self.platform or "",
+                    provider=self.provider or "",
+                    model=self.model or "",
+                    total_chars=total_chars,
+                    total_approx_tokens=approx_tokens,
+                    message_count=len(api_messages),
+                    system_breakdown=_breakdown,
+                )
+            # ── End context telemetry ─────────────────────────────────
             
             # Thinking spinner for quiet mode (animated during API call)
             thinking_spinner = None

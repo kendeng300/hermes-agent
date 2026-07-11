@@ -2687,7 +2687,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 # Public API
 # ---------------------------------------------------------------------------
 
-def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
+def register_mcp_servers(servers: Dict[str, dict], timeout: float = 120) -> List[str]:
     """Connect to explicit MCP servers and register their tools.
 
     Idempotent for already-connected server names. Servers with
@@ -2695,6 +2695,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     Args:
         servers: Mapping of ``{server_name: server_config}``.
+        timeout: Maximum seconds to wait for server connections.
 
     Returns:
         List of all currently registered MCP tool names.
@@ -2744,8 +2745,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 )
 
     # Per-server timeouts are handled inside _discover_and_register_server.
-    # The outer timeout is generous: 120s total for parallel discovery.
-    _run_on_mcp_loop(_discover_all(), timeout=120)
+    # The outer timeout is passed through from the caller.
+    _run_on_mcp_loop(_discover_all(), timeout=timeout)
 
     # Log a summary so ACP callers get visibility into what was registered.
     with _lock:
@@ -2764,7 +2765,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     return _existing_tool_names()
 
 
-def discover_mcp_tools() -> List[str]:
+def discover_mcp_tools(timeout: float = 120) -> List[str]:
     """Entry point: load config, connect to MCP servers, register tools.
 
     Called from ``model_tools`` after ``discover_builtin_tools()``. Safe to call even when
@@ -2772,6 +2773,12 @@ def discover_mcp_tools() -> List[str]:
 
     Idempotent for already-connected servers. If some servers failed on a
     previous call, only the missing ones are retried.
+
+    Args:
+        timeout: Maximum seconds to wait for MCP server connections.
+                 Default 120s for user-triggered rediscovery; use a shorter
+                 timeout (e.g., 5s) for import-time calls so module loading
+                 never blocks for the full discovery window.
 
     Returns:
         List of all registered MCP tool names.
@@ -2792,7 +2799,7 @@ def discover_mcp_tools() -> List[str]:
             if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
         ]
 
-    tool_names = register_mcp_servers(servers)
+    tool_names = register_mcp_servers(servers, timeout=timeout)
     if not new_server_names:
         return tool_names
 

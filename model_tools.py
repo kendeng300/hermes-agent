@@ -138,9 +138,13 @@ def _run_async(coro):
 discover_builtin_tools()
 
 # MCP tool discovery (external MCP servers from config)
+# Use a short 5s timeout at import time so module loading never blocks
+# for the full MCP discovery window. Servers that don't respond quickly
+# can be rediscovered later via the /mcp-reload slash command or gateway
+# startup (which use the full default 120s timeout).
 try:
     from tools.mcp_tool import discover_mcp_tools
-    discover_mcp_tools()
+    discover_mcp_tools(timeout=5)
 except Exception as e:
     logger.debug("MCP tool discovery failed: %s", e)
 

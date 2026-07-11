@@ -396,13 +396,15 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
 
     return {
         "success": True,
+        "blocked": True,
         "skipped": True,
         "reason": "cron_auto_delivery_duplicate_target",
         "target": target_label,
         "note": (
-            f"Skipped send_message to {target_label}. This cron job will already auto-deliver "
-            "its final response to that same target. Put the intended user-facing content in "
-            "your final response instead, or use a different target if you want an additional message."
+            f"BLOCKED: send_message to {target_label} was intercepted by cron auto-delivery de-dupe. "
+            "This send_message call was NOT sent — the cron scheduler will auto-deliver your final "
+            "response to this target instead. To post multi-message reports (root + threaded replies), "
+            "configure deliver_mode='agent_controlled' on this cron job to disable auto-delivery de-dupe."
         ),
     }
 
@@ -550,9 +552,16 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
-    for chunk in chunks:
+    auto_thread_ts = None
+    for i, chunk in enumerate(chunks):
         if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk, thread_id=thread_id)
+            # First chunk: post as root (no thread_ts), capture ts for
+            # subsequent chunks so they thread under a single root message.
+            # Subsequent chunks: thread under the first chunk's ts.
+            chunk_thread_id = auto_thread_ts if auto_thread_ts else thread_id
+            result = await _send_slack(pconfig.token, chat_id, chunk, thread_id=chunk_thread_id)
+            if i == 0 and not thread_id and len(chunks) > 1 and isinstance(result, dict) and result.get("success"):
+                auto_thread_ts = result.get("message_id")
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
