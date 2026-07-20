@@ -179,22 +179,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
-    # Universal task-completion / no-fabrication guidance.  Placed BEFORE
-    # SOUL.md so that SOUL.md, as the user's authoritative persona, is the
-    # most recent instruction and wins any conflict (SYS-2175 audit F4).
-    # Gated by config.yaml ``agent.task_completion_guidance`` (default True).
-    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
-        stable_parts.append(TASK_COMPLETION_GUIDANCE)
-
-    # Try SOUL.md as primary identity unless the caller explicitly skipped it.
-    # Some execution modes (cron) still want HERMES_HOME persona while keeping
-    # cwd project instructions disabled.
+    # SYS-2776 / PROMPT-2197: SOUL.md is placed FIRST as the authoritative
+    # identity.  Quality mandates must frame all downstream interpretation.
+    # TASK_COMPLETION_GUIDANCE and TOOL_USE_ENFORCEMENT_GUIDANCE are
+    # SUBORDINATE — they provide throughput guidance WITHIN the quality
+    # framework, not as competing authority.  When quality and throughput
+    # conflict, quality wins because SOUL.md is first AND last word.
     _soul_loaded = False
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
             _soul_loaded = True
+
+    # Universal task-completion / no-fabrication guidance.  Placed AFTER
+    # SOUL.md so quality mandates are the framing context.
+    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
     if not _soul_loaded:
         # Fallback to hardcoded identity
