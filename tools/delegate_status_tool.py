@@ -4,7 +4,8 @@ Exposes list_active_subagents() to the agent so it can monitor
 delegate_task subagent progress with facts, not guesses.
 
 Quality goal: Zero blind-spawns. Agent always has factual subagent status
-(subagent_id, uptime_seconds, tool_count, status) within 10s of spawn.
+(subagent_id, uptime_seconds, tool_count, last_tool, api_call_count,
+max_iterations, current_tool, budget_used, stale_count, status) within 10s of spawn.
 """
 import time
 from typing import Any, Dict
@@ -14,7 +15,7 @@ from tools.delegate_tool import list_active_subagents
 
 DELEGATE_STATUS_SCHEMA = {
     "name": "delegate_status",
-    "description": "Return live status of all running delegate_task subagents. Each record includes subagent_id, goal (truncated to 120 chars), status, uptime_seconds, tool_count, model, depth. Use this instead of guessing subagent state. Poll every 10-15s during calibration panel sequential spawns.",
+    "description": "Return live status of all running delegate_task subagents. Each record includes subagent_id, goal (truncated to 120 chars), status, uptime_seconds, tool_count, last_tool, api_call_count, max_iterations, current_tool, budget_used, stale_count, model, depth. Use this instead of guessing subagent state. Poll every 10-15s during calibration panel sequential spawns.",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
@@ -35,7 +36,9 @@ def _build_response() -> Dict[str, Any]:
             "started_at": started,
             "uptime_seconds": round(uptime, 1),
             "tool_count": r.get("tool_count", 0),
+            "last_tool": r.get("last_tool", ""),
             "api_call_count": r.get("api_call_count", 0),
+            "max_iterations": r.get("max_iterations", 0),
             "current_tool": r.get("current_tool", ""),
             "budget_used": r.get("budget_used", 0),
             "stale_count": r.get("stale_count", 0),
@@ -50,8 +53,8 @@ def delegate_status(**kw) -> str:
     """Return live status of all running delegate_task subagents.
 
     Each subagent record includes: subagent_id, goal (truncated), status,
-    started_at, uptime_seconds, tool_count, api_call_count, current_tool,
-    budget_used, stale_count, model, depth.
+    started_at, uptime_seconds, tool_count, last_tool, api_call_count,
+    max_iterations, current_tool, budget_used, stale_count, model, depth.
 
     Use this instead of guessing subagent state. Poll every 10-15s during
     calibration panel sequential spawns.
