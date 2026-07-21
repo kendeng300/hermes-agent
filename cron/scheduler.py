@@ -2805,6 +2805,8 @@ def run_job(
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
             )
+            _session_platform = delivery_target["platform"]
+            _session_chat_id = str(delivery_target["chat_id"])
 
         # Model resolution precedence: per-job override > HERMES_MODEL env >
         # config.yaml ``model:`` (string or ``{default: ...}``). The per-job

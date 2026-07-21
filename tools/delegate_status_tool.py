@@ -7,24 +7,21 @@ Quality goal: Zero blind-spawns. Agent always has factual subagent status
 (subagent_id, uptime_seconds, tool_count, status) within 10s of spawn.
 """
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from tools.delegate_tool import list_active_subagents
 
 
-def delegate_status() -> Dict[str, Any]:
-    """Return live status of all running delegate_task subagents.
+DELEGATE_STATUS_SCHEMA = {
+    "name": "delegate_status",
+    "description": "Return live status of all running delegate_task subagents. Each record includes subagent_id, goal (truncated to 120 chars), status, uptime_seconds, tool_count, model, depth. Use this instead of guessing subagent state. Poll every 10-15s during calibration panel sequential spawns.",
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
 
-    Each subagent record includes: subagent_id, goal (truncated), status,
-    started_at, uptime_seconds, tool_count, model, depth.
 
-    Use this instead of guessing subagent state. Poll every 10-15s during
-    calibration panel sequential spawns.
-
-    Quality-first: never fabricate timeout numbers. Read the facts.
-    """
+def _build_response() -> Dict[str, Any]:
+    """Build the delegate_status response from live registry data."""
     records = list_active_subagents()
-
     now = time.time()
     result: Dict[str, Any] = {"active_count": len(records), "subagents": []}
 
@@ -38,8 +35,40 @@ def delegate_status() -> Dict[str, Any]:
             "started_at": started,
             "uptime_seconds": round(uptime, 1),
             "tool_count": r.get("tool_count", 0),
+            "api_call_count": r.get("api_call_count", 0),
+            "current_tool": r.get("current_tool", ""),
+            "budget_used": r.get("budget_used", 0),
+            "stale_count": r.get("stale_count", 0),
             "model": r.get("model", "?"),
             "depth": r.get("depth", 0),
         })
 
     return result
+
+
+def delegate_status(**kw) -> str:
+    """Return live status of all running delegate_task subagents.
+
+    Each subagent record includes: subagent_id, goal (truncated), status,
+    started_at, uptime_seconds, tool_count, api_call_count, current_tool,
+    budget_used, stale_count, model, depth.
+
+    Use this instead of guessing subagent state. Poll every 10-15s during
+    calibration panel sequential spawns.
+
+    Quality-first: never fabricate timeout numbers. Read the facts.
+    """
+    import json
+    return json.dumps(_build_response(), indent=2, default=str)
+
+
+# ── Tool Registration ────────────────────────────────────────────────
+from tools.registry import registry as _registry
+
+_registry.register(
+    name="delegate_status",
+    toolset="delegation",
+    schema=DELEGATE_STATUS_SCHEMA,
+    handler=delegate_status,
+    emoji="📊",
+)

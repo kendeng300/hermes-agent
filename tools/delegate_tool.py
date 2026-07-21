@@ -1832,6 +1832,7 @@ def _run_single_child(
     _last_seen_iter = [0]
     _last_seen_tool = [None]  # type: list
     _stale_count = [0]
+    _subagent_sid = [None]  # SYS-2780: populated after registration
 
     def _heartbeat_loop():
         while not _heartbeat_stop.wait(_HEARTBEAT_INTERVAL):
@@ -1873,6 +1874,20 @@ def _run_single_child(
                     if child_tool
                     else _HEARTBEAT_STALE_CYCLES_IDLE
                 )
+                
+                # ── SYS-2780: Push heartbeat data into _active_subagents ──
+                sid = _subagent_sid[0]
+                if sid:
+                    with _active_subagents_lock:
+                        rec = _active_subagents.get(sid)
+                        if rec is not None:
+                            rec["api_call_count"] = child_iter
+                            rec["max_iterations"] = child_max
+                            rec["current_tool"] = child_tool or ""
+                            rec["budget_used"] = child_summary.get("budget_used", 0)
+                            rec["stale_count"] = _stale_count[0]
+                            rec["status"] = "stale" if _stale_count[0] >= stale_limit else "running"
+
                 if _stale_count[0] >= stale_limit:
                     logger.warning(
                         "Subagent %d appears stale (no progress for %d "
@@ -1910,6 +1925,7 @@ def _run_single_child(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _subagent_sid[0] = _subagent_id  # SYS-2780: capture for heartbeat enrichment
     if _subagent_id:
         _raw_depth = getattr(child, "_delegate_depth", 1)
         _tui_depth = max(0, _raw_depth - 1) if isinstance(_raw_depth, int) else 0
