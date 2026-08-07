@@ -299,6 +299,34 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 
+
+def _record_running_marker(job_id: str, running: bool) -> None:
+    """SYS-770 (P0): maintain the cross-process running-marker file.
+
+    The standalone watchdog (enforcement/calibration_cron_watchdog.py) reads
+    data/cron_running_ids.json to distinguish "job is genuinely in flight"
+    from "job was claimed but never dispatched". Written best-effort here so
+    the marker is scheduler-maintained (not watchdog-fabricated).
+    """
+    try:
+        marker = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "data" / "cron_running_ids.json"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        data = {}
+        if marker.exists():
+            try:
+                data = json.loads(marker.read_text())
+            except (OSError, ValueError, json.JSONDecodeError):
+                data = {}
+        running_ids = set(data.get("running", []))
+        if running:
+            running_ids.add(job_id)
+        else:
+            running_ids.discard(job_id)
+        data["running"] = sorted(running_ids)
+        marker.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass  # best-effort — watchdog falls back to last_run comparison
+
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
 # below). ``run_one_job``'s own completion path checks this set before
@@ -3534,6 +3562,41 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        # SYS-666 §1: Post-delivery completeness gate for the AMC consolidated
+        # calibration job. Mechanically verifies the delivered artifact (3 critic
+        # sections >=1500 chars + PDF + Slack thread) BEFORE last_status=ok is
+        # recorded. Closes the CP-8 gap (gate exists but nothing called it in the
+        # delivery path) — the Aug 4/5 false `ok` on partial deliveries must not
+        # recur. Runs outside the agent's trust domain (SELF-POLICING BAN).
+        # Job id 9e059716170c = "AMC Consolidated Calibration & Panel Review".
+        if success and job.get("id") == "9e059716170c":
+            try:
+                import sys as _sys
+                from pathlib import Path as _Path
+                _scripts_dir = _Path("/home/linux/.hermes/scripts")
+                if str(_scripts_dir) not in _sys.path:
+                    _sys.path.insert(0, str(_scripts_dir))
+                from utilities.calibration_completeness_gate import (
+                    verify_calibration_completeness,
+                )
+                _complete, _report = verify_calibration_completeness(
+                    delivery_state={"thread_ts": delivery_error or ""}
+                )
+                if not _complete:
+                    success = False
+                    error = (
+                        "SYS-666 §1 completeness gate BLOCKED last_status=ok: "
+                        f"{_report.get('issues', [])[:3]}"
+                    )
+                    logger.warning(
+                        "Job '%s': SYS-666 completeness gate failed — last_status forced to error: %s",
+                        job["id"], _report.get("issues", [])[:3],
+                    )
+            except Exception as _e:  # noqa: BLE001
+                # Never crash the scheduler; log and continue (the gate is a
+                # backstop, not a hard dependency).
+                logger.warning("SYS-666 completeness gate check error: %s", _e)
+
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
@@ -3687,16 +3750,33 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
             def _run_and_release(j=job, ctx=_ctx):
                 try:
+                    _record_running_marker(j["id"], True)
                     return ctx.run(_process_job, j)
                 finally:
+                    _record_running_marker(j["id"], False)
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
 
             try:
-                return pool.submit(_run_and_release)
+                fut = pool.submit(_run_and_release)
+                # SYS-770 (P0): the future was accepted — transition the claim
+                # from "claimed" to "dispatched". If this write fails the claim
+                # stays "claimed" and the watchdog re-arms the job; a stale
+                # "claimed" here is safer than an unrecovered silent skip.
+                try:
+                    from cron.jobs import set_dispatch_claim_status
+                    set_dispatch_claim_status(job_id, "dispatched")
+                except Exception:
+                    logger.debug(
+                        "SYS-770: dispatch_claim transition failed for '%s'",
+                        job.get("name", job_id),
+                    )
+                return fut
             except RuntimeError as submit_err:
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
+                # SYS-770: leave the dispatch_claim in "claimed" state — the
+                # watchdog detects it and re-arms the job.
                 if _interpreter_shutting_down(submit_err):
                     with _running_lock:
                         _running_job_ids.discard(job_id)

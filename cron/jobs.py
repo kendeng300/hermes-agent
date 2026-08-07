@@ -1495,6 +1495,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
+                # SYS-770 (P0): clear the dispatch claim — normal-close path
+                # (claim → dispatch → run → clear). A stale claim left behind
+                # after completion would trigger a false watchdog alert.
+                job.pop("dispatch_claim", None)
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
@@ -1679,9 +1683,47 @@ def advance_next_run(job_id: str) -> bool:
                 new_next = compute_next_run(job["schedule"], now)
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
+                    # SYS-770 (P0): record the dispatch claim ATOMICALLY with the
+                    # advance (same _jobs_lock critical section). The claim is a
+                    # one-way door marker: if the job is claimed but never
+                    # dispatched (gateway restart / pool failure between this
+                    # write and pool.submit), the watchdog detects the stale
+                    # "claimed" state and recovers the missed run.
+                    job["dispatch_claim"] = {
+                        "at": now,
+                        "by": _machine_id(),
+                        "status": "claimed",
+                    }
                     save_jobs(jobs)
                     return True
                 return False
+        return False
+
+
+def set_dispatch_claim_status(job_id: str, status: str) -> bool:
+    """SYS-770 (P0): transition a recurring job's dispatch_claim status.
+
+    ``status`` is one of {"claimed", "dispatched", "recovered"}. Call this AFTER
+    a successful pool.submit() ("dispatched") or after the watchdog re-arms a
+    stale claim ("recovered"). Clears the claim entirely when ``status`` is None.
+    Returns True if the transition was written.
+    """
+    if status is not None and status not in {"claimed", "dispatched", "recovered"}:
+        raise ValueError(f"invalid dispatch_claim status: {status!r}")
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                if status is None:
+                    job.pop("dispatch_claim", None)
+                    save_jobs(jobs)
+                    return True
+                claim = job.get("dispatch_claim") or {}
+                claim["status"] = status
+                claim["at"] = claim.get("at", _hermes_now().isoformat())
+                job["dispatch_claim"] = claim
+                save_jobs(jobs)
+                return True
         return False
 
 
