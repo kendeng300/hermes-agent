@@ -540,7 +540,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     }
 
 
-def build_context_breakdown(parts: Dict[str, Any]) -> Any:
+def build_context_breakdown(parts: Optional[Dict[str, Any]]) -> Any:
     """Build a ContextBreakdown from the structural component sizes.
 
     SYS-798 (SYS-788 Phase 2): reads ``parts["_component_sizes"]`` (captured

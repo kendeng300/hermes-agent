@@ -1288,6 +1288,7 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
         return
+    original_sp = sp
     for label, value in (("Model", model), ("Provider", provider)):
         if not value:
             continue
@@ -1296,6 +1297,24 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
             last = matches[-1]
             sp = f"{sp[:last.start()]}{label}: {value}{sp[last.end():]}"
     agent._cached_system_prompt = sp
+    # SYS-798 (SYS-788 Phase 2): the Model/Provider lines live in the
+    # timestamp_model_chars block. If their replacement changes length, keep
+    # the breakdown's counters accurate (deterministic adjustment).
+    breakdown = getattr(agent, "_system_prompt_breakdown", None)
+    if breakdown is not None:
+        try:
+            from dataclasses import replace
+            delta = len(sp) - len(original_sp)
+            agent._system_prompt_breakdown = replace(
+                breakdown,
+                timestamp_model_chars=max(
+                    0,
+                    breakdown.timestamp_model_chars + delta,
+                ),
+                total_system_prompt_chars=len(sp),
+            )
+        except Exception:  # noqa: BLE001
+            pass  # telemetry adjustment is non-fatal
 
 
 def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:

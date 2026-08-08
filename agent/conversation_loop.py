@@ -338,10 +338,19 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # joined string is NOT re-derived, so the cached prefix is untouched).
         try:
             from agent.system_prompt import build_system_prompt_parts, build_context_breakdown
-            _parts = build_system_prompt_parts(agent)
+            from dataclasses import replace
+            _parts = build_system_prompt_parts(
+                agent,
+                system_message=system_message,
+            )
             _bd = build_context_breakdown(_parts)
             if _bd is not None:
-                agent._system_prompt_breakdown = _bd
+                # Components are reconstructed structurally; the total must
+                # describe the exact byte-stable string actually sent.
+                agent._system_prompt_breakdown = replace(
+                    _bd,
+                    total_system_prompt_chars=len(stored_prompt),
+                )
         except Exception:  # noqa: BLE001
             pass  # telemetry breakdown is non-fatal
         return
@@ -2507,6 +2516,22 @@ def run_conversation(
                             if _sanitized_system != active_system_prompt:
                                 active_system_prompt = _sanitized_system
                                 agent._cached_system_prompt = _sanitized_system
+                                # SYS-798 (SYS-788 Phase 2): keep the total
+                                # exact after non-ASCII stripping. Component
+                                # attribution stays approximate (removed chars
+                                # can't be attributed per-category post-hoc).
+                                _bd = getattr(agent, "_system_prompt_breakdown", None)
+                                if _bd is not None:
+                                    try:
+                                        from dataclasses import replace
+                                        agent._system_prompt_breakdown = replace(
+                                            _bd,
+                                            total_system_prompt_chars=len(
+                                                _sanitized_system
+                                            ),
+                                        )
+                                    except Exception:  # noqa: BLE001
+                                        pass
                                 _system_sanitized = True
                         if isinstance(getattr(agent, "ephemeral_system_prompt", None), str):
                             _sanitized_ephemeral = _strip_non_ascii(agent.ephemeral_system_prompt)

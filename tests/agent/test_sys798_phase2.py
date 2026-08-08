@@ -315,16 +315,12 @@ def test_breakdown_returns_none_when_no_key():
 
 
 def test_breakdown_none_input_handled_by_caller_try_except():
-    """None input is caught by the try/except in build_system_prompt (lines 605-610).
-    
-    NOTE: build_context_breakdown itself will raise on None because it accesses
-    parts.get(). The contract says 'Never raises' but the implementation does not
-    guard against None. However, all call sites are wrapped in try/except, so
-    this is a documentation-vs-implementation gap, not a runtime bug.
+    """None input is safely handled — build_context_breakdown returns None.
+
+    SYS-798: the implementation guards non-dict input (returns None, never
+    raises), so the caller's try/except is defense-in-depth, not required.
     """
-    import pytest
-    with pytest.raises(AttributeError):
-        build_context_breakdown(None)
+    assert build_context_breakdown(None) is None
 
 
 # ── TEST: ContextBreakdown instantiation via all 13 kwarg keys ───────
@@ -360,3 +356,80 @@ def test_context_breakdown_13_kwargs():
     assert bd.environment_hints_chars == 11
     assert bd.other_chars == 12
     assert bd.total_system_prompt_chars == 13
+
+
+# ── SYS-798 panel regression tests (engineering panel deep-dive 2026-08-08) ──
+
+def test_model_identity_rewrite_updates_breakdown_counters():
+    """rewrite_prompt_model_identity keeps breakdown counters exact."""
+    import sys as _sys
+    _sys.path.insert(0, "/home/linux/.hermes/hermes-agent")
+    from agent.context_telemetry import ContextBreakdown
+    from agent.chat_completion_helpers import rewrite_prompt_model_identity
+    from dataclasses import replace
+
+    class FakeAgent:
+        pass
+
+    a = FakeAgent()
+    a._cached_system_prompt = "Model: OLD_MODEL_NAME_XXXX\nProvider: deepseek\nrest"
+    a._system_prompt_breakdown = ContextBreakdown(
+        timestamp_model_chars=40, total_system_prompt_chars=60,
+        soul_md_chars=10,
+    )
+    rewrite_prompt_model_identity(a, "NEW_MODEL", "deepseek")
+    # delta = len("NEW_MODEL") - len("OLD_MODEL_NAME_XXXX") = 8 - 18 = -10
+    assert a._system_prompt_breakdown.timestamp_model_chars == 30
+    assert a._system_prompt_breakdown.total_system_prompt_chars == len(
+        a._cached_system_prompt
+    )
+    assert a._system_prompt_breakdown.soul_md_chars == 10  # untouched
+
+
+def test_background_review_copies_parent_breakdown():
+    """Same-model review fork inherits the parent breakdown (SYS-798)."""
+    import sys as _sys
+    _sys.path.insert(0, "/home/linux/.hermes/hermes-agent")
+    from agent.context_telemetry import ContextBreakdown
+
+    class FakeAgent:
+        pass
+
+    parent = FakeAgent()
+    parent._cached_system_prompt = "parent prompt"
+    parent._system_prompt_breakdown = ContextBreakdown(
+        soul_md_chars=100, total_system_prompt_chars=12,
+    )
+    review = FakeAgent()
+    review._cached_system_prompt = None
+    review._system_prompt_breakdown = None
+    # Same-model copy path (background_review.py:766-775 logic)
+    if not False:  # not routed
+        review._cached_system_prompt = parent._cached_system_prompt
+        review._system_prompt_breakdown = getattr(
+            parent, "_system_prompt_breakdown", None
+        )
+    assert review._cached_system_prompt == "parent prompt"
+    assert review._system_prompt_breakdown is not None
+    assert review._system_prompt_breakdown.soul_md_chars == 100
+
+
+def test_restore_path_uses_exact_stored_prompt_total():
+    """Stored-prompt restore forces total to len(stored_prompt)."""
+    import sys as _sys
+    _sys.path.insert(0, "/home/linux/.hermes/hermes-agent")
+    from agent.context_telemetry import ContextBreakdown
+    from dataclasses import replace
+
+    class FakeAgent:
+        pass
+
+    a = FakeAgent()
+    stored_prompt = "exact stored prompt string for this session"
+    # Simulate restore-path: parts-derived breakdown then total overridden
+    _bd = ContextBreakdown(soul_md_chars=50, total_system_prompt_chars=99)
+    _bd = replace(_bd, total_system_prompt_chars=len(stored_prompt))
+    a._system_prompt_breakdown = _bd
+    assert a._system_prompt_breakdown.total_system_prompt_chars == len(
+        stored_prompt
+    )

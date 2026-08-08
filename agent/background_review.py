@@ -765,6 +765,15 @@ def _run_review_in_thread(
             # and would miss anyway, so let the routed fork build its own.
             if not _routed:
                 review_agent._cached_system_prompt = agent._cached_system_prompt
+                # The copied prompt is byte-identical to the parent's prompt,
+                # so its structural telemetry breakdown is identical too
+                # (SYS-798 Phase 2). Without this, the review fork records
+                # total-only telemetry through the primary record site.
+                review_agent._system_prompt_breakdown = getattr(
+                    agent,
+                    "_system_prompt_breakdown",
+                    None,
+                )
                 # Defensive: pin session_start + session_id to the
                 # parent's so any code path that re-renders parts of
                 # the system prompt (compression, plugin hooks) still
