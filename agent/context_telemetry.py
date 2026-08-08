@@ -96,6 +96,17 @@ _queue_lock = threading.Lock()
 _dropped_count = 0
 _flush_thread: Optional[threading.Thread] = None
 _flush_running = False
+# SYS-788 (R4): health metrics for the async writer — queue depth, dropped
+# count, last successful flush, last error, flush-thread liveness. Exposed
+# so an independent operational watchdog can detect silent telemetry gaps.
+_health: dict = {
+    "queue_depth": 0,
+    "dropped_count": 0,
+    "last_successful_flush": 0.0,
+    "last_error": "",
+    "last_error_ts": 0.0,
+    "flush_thread_alive": False,
+}
 
 
 def _daily_file() -> Path:
@@ -126,23 +137,38 @@ def _flush_worker() -> None:
     """Background thread: flush queue to disk every _FLUSH_INTERVAL_S seconds."""
     global _flush_running, _queue, _dropped_count
     while _flush_running:
-        time.sleep(_FLUSH_INTERVAL_S)
-        drained = []
-        dropped = 0
-        with _queue_lock:
-            if _queue:
-                drained = _queue[:]
-                _queue.clear()
-                dropped = _dropped_count
-                _dropped_count = 0
-        if drained:
-            _write_batch(drained, dropped)
+        try:
+            time.sleep(_FLUSH_INTERVAL_S)
+            drained = []
+            dropped = 0
+            with _queue_lock:
+                if _queue:
+                    drained = _queue[:]
+                    _queue.clear()
+                    dropped = _dropped_count
+                    _dropped_count = 0
+            if drained:
+                _write_batch(drained, dropped)
+        except Exception as _flush_err:  # SYS-788 R4: keep the thread alive
+            logger.warning("Context telemetry: flush worker iteration error: %s", _flush_err)
+            _health["last_error"] = str(_flush_err)
+            _health["last_error_ts"] = time.time()
+        finally:
+            with _queue_lock:  # SYS-788 R4: lock-protected health snapshot
+                _health["queue_depth"] = len(_queue)
+                _health["dropped_count"] = _dropped_count
+            _health["flush_thread_alive"] = True
 
 
 def _write_batch(records: list, dropped_before: int = 0) -> None:
-    """Write a batch of records to today's JSONL file (thread-safe)."""
-    filepath = _daily_file()
+    """Write a batch of records to today's JSONL file (thread-safe).
+
+    SYS-788 (R4): the FULL sequence (including _daily_file, which does
+    directory creation + pruning) is inside the try so a failure there
+    cannot escape to the flush worker and kill the thread silently.
+    """
     try:
+        filepath = _daily_file()
         with open(filepath, "a", encoding="utf-8") as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
@@ -162,8 +188,12 @@ def _write_batch(records: list, dropped_before: int = 0) -> None:
                     )
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        # SYS-788 (R4): expose last-successful-flush health metric.
+        _health["last_successful_flush"] = time.time()
     except OSError as e:
         logger.warning("Context telemetry: failed to write %d records: %s", len(records), e)
+        _health["last_error"] = str(e)
+        _health["last_error_ts"] = time.time()
         # Re-queue them if possible; preserve dropped count for retry
         with _queue_lock:
             _could_not_queue = 0
@@ -174,6 +204,10 @@ def _write_batch(records: list, dropped_before: int = 0) -> None:
                     _could_not_queue += 1
             global _dropped_count
             _dropped_count += dropped_before + _could_not_queue
+    except Exception as e:  # SYS-788 R4: catch ANY exception (incl. _daily_file)
+        logger.warning("Context telemetry: batch write failed unexpectedly: %s", e)
+        _health["last_error"] = str(e)
+        _health["last_error_ts"] = time.time()
 
 
 def _start_flush_thread() -> None:
@@ -203,6 +237,7 @@ def record_context_call(
     *,
     user_session: bool = False,
     platform: str = "",
+    outcome: str = "success",  # SYS-788 R3: success/provider_error/cancelled/fallback
 ) -> None:
     """
     Record a context telemetry entry for a single model API call.
@@ -218,7 +253,13 @@ def record_context_call(
         system_breakdown: Breakdown of system prompt component sizes
         user_session: True if this is a user-initiated session (not cron)
         platform: Platform name (e.g., 'slack', 'telegram', 'cli')
+        outcome: Call outcome (success, provider_error, cancelled, or fallback)
     """
+    # SYS-788: honor the config kill-switch (telemetry.context_recording.enabled).
+    # If disabled, drop the record silently (non-fatal, no queue growth).
+    if not telemetry_recording_enabled():
+        return
+
     _start_flush_thread()
 
     # Compute conversation chars: total - system prompt
@@ -231,6 +272,7 @@ def record_context_call(
         "platform": platform,
         "provider": provider,
         "model": model,
+        "outcome": outcome,  # SYS-788 R3
         "timestamp": time.time(),
         "total_chars": total_chars,
         "total_approx_tokens": total_approx_tokens,
@@ -246,6 +288,43 @@ def record_context_call(
         else:
             global _dropped_count
             _dropped_count += 1
+
+
+def telemetry_recording_enabled() -> bool:
+    """SYS-788: read the telemetry kill-switch config toggle.
+
+    ``telemetry.context_recording.enabled`` (default True) lets operators
+    disable recording without redeploying. Any config-read failure is
+    non-fatal — default to enabled so monitoring keeps working.
+    """
+    try:
+        from hermes_cli.config import load_config  # hermes-agent config loader
+    except Exception:
+        return True
+    try:
+        cfg = load_config() or {}
+        return bool(cfg.get("telemetry", {}).get("context_recording", {}).get("enabled", True))
+    except Exception:
+        return True
+
+
+def get_telemetry_health() -> dict:
+    """SYS-788 (R4/R7): expose writer health for the operational watchdog.
+
+    Returns queue depth, dropped count, last successful flush, last error,
+    flush-thread liveness, and today's file state. Lets the independent
+    freshness watchdog (separate control ticket) detect silent telemetry
+    gaps: stale last-flush, dead thread, dropped records.
+    """
+    return {
+        "queue_depth": len(_queue),
+        "dropped_count": _dropped_count,
+        "last_successful_flush": _health.get("last_successful_flush", 0.0),
+        "last_error": _health.get("last_error", ""),
+        "last_error_ts": _health.get("last_error_ts", 0.0),
+        "flush_thread_alive": bool(_flush_thread and _flush_thread.is_alive()),
+        "today_file": str(_daily_file()) if _flush_running else "",
+    }
 
 
 def get_stats(

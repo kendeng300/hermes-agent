@@ -2757,6 +2757,17 @@ def run_job(
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
+    # SYS-788: bind the cron job name for telemetry attribution. The
+    # ContextVar (gateway.session_context._CRON_JOB_NAME) is concurrency-safe
+    # (per-asyncio-task) so parallel jobs each see their own job name. Cleared
+    # in the finally block alongside the delivery vars. Without this, the
+    # context telemetry recorder would classify every cron session as a
+    # user session (user_session=True, cron_job_name=""), corrupting the
+    # SYS-779 context-size and SYS-787 API-calls reports' attribution.
+    _CRON_JOB_NAME_VAR = _VAR_MAP.get("HERMES_CRON_JOB_NAME")
+    if _CRON_JOB_NAME_VAR is not None:
+        _CRON_JOB_NAME_VAR.set(job_name or "")
+
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
     #   - build_context_files_prompt() picks up AGENTS.md / CLAUDE.md /
@@ -3367,6 +3378,11 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        # SYS-788: clear the cron-job-name ContextVar bound at job start so a
+        # following non-cron task in the same asyncio context does not inherit
+        # this job's attribution.
+        if _CRON_JOB_NAME_VAR is not None:
+            _CRON_JOB_NAME_VAR.set("")
         if _session_db:
             # Title the cron session from the job (name → short prompt → id) so
             # sidebars/history show a meaningful label instead of the injected

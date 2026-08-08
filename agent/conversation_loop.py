@@ -1387,6 +1387,48 @@ def run_conversation(
                 
                 if not agent.quiet_mode:
                     agent._vprint(f"{agent.log_prefix}⏱️  API call completed in {api_duration:.2f}s")
+
+                # SYS-788: record context telemetry for this primary
+                # conversation-loop API call. Phase 1: total_system_prompt_chars
+                # only (component breakdown deferred to Phase 2 follow-up). The
+                # recorder is non-fatal — any failure here is logged, never
+                # propagated to the agent loop. Guard the import too so an
+                # older hermes-agent install without this module cannot crash.
+                try:
+                    from agent.context_telemetry import record_context_call, ContextBreakdown
+                    from gateway.session_context import get_session_env
+
+                    _telemetry_outcome = "success"
+                    if response is None:
+                        _telemetry_outcome = "provider_error"
+                    elif getattr(response, "cancelled", False):
+                        _telemetry_outcome = "cancelled"
+                    _telemetry_cron_name = get_session_env("HERMES_CRON_JOB_NAME", "")
+                    _telemetry_user_session = not bool(_telemetry_cron_name)
+                    _system_prompt_text = active_system_prompt or ""
+                    _breakdown = ContextBreakdown(
+                        total_system_prompt_chars=len(_system_prompt_text)
+                    )
+                    record_context_call(
+                        session_id=agent.session_id or "",
+                        cron_job_name=_telemetry_cron_name,
+                        provider=agent.provider or "",
+                        model=agent.model or "",
+                        total_chars=total_chars,
+                        total_approx_tokens=approx_tokens,
+                        message_count=len(api_messages),
+                        system_breakdown=_breakdown,
+                        user_session=_telemetry_user_session,
+                        platform=agent.platform or "",
+                        outcome=_telemetry_outcome,
+                    )
+                except ImportError:
+                    pass  # module not present in this installation
+                except Exception as _telem_err:
+                    logging.getLogger(__name__).debug(
+                        "Context telemetry record failed (non-fatal): %s", _telem_err,
+                        exc_info=True,
+                    )
                 
                 if agent.verbose_logging:
                     # Log response with provider info if available
