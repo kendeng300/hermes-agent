@@ -1282,6 +1282,10 @@ def init_agent(
     
     # Cached system prompt -- built once per session, only rebuilt on compression
     agent._cached_system_prompt: Optional[str] = None
+    # SYS-798 (SYS-788 Phase 2): cached ContextBreakdown for telemetry —
+    # set alongside _cached_system_prompt in build_system_prompt(), cleared in
+    # invalidate_system_prompt(). None = Phase-1 fallback (zeros) in the loop.
+    agent._system_prompt_breakdown = None
     
     # Filesystem checkpoint manager (transparent — not a tool)
     from tools.checkpoint_manager import CheckpointManager

@@ -1406,9 +1406,15 @@ def run_conversation(
                     _telemetry_cron_name = get_session_env("HERMES_CRON_JOB_NAME", "")
                     _telemetry_user_session = not bool(_telemetry_cron_name)
                     _system_prompt_text = active_system_prompt or ""
-                    _breakdown = ContextBreakdown(
-                        total_system_prompt_chars=len(_system_prompt_text)
-                    )
+                    # SYS-798 (SYS-788 Phase 2): use the cached component
+                    # breakdown when available; fall back to Phase-1 total-only.
+                    _cached_breakdown = getattr(agent, "_system_prompt_breakdown", None)
+                    if _cached_breakdown is not None:
+                        _breakdown = _cached_breakdown
+                    else:
+                        _breakdown = ContextBreakdown(
+                            total_system_prompt_chars=len(_system_prompt_text)
+                        )
                     record_context_call(
                         session_id=agent.session_id or "",
                         cron_job_name=_telemetry_cron_name,

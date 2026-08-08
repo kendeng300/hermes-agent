@@ -142,7 +142,7 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
-def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, str]:
+def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, Any]:
     """Assemble the system prompt as three ordered parts.
 
     Returns a dict with three keys:
@@ -179,6 +179,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
+    # SYS-798 (SYS-788 Phase 2): structural component-size tracking.
+    # Each appended block records its char count by category — captured as a
+    # byproduct of building (zero extra cost), NOT post-hoc string parsing
+    # (the joined tiers have no sub-component delimiters).
+    component_sizes: Dict[str, int] = {}
+
+    def _track(category: str, value: Optional[str]) -> None:
+        """Record the char count for a prompt block identified by category.
+
+        Called by the caller after appending the block to its tier list — this
+        function only records the count (it does not append).
+        """
+        # NOTE: value is the *pre-join* block; the joined tier strips+joins,
+        # so the tracked size slightly overcounts whitespace. Telemetry is
+        # approximate (char counts for reporting, not billing).
+        if value and value.strip():
+            component_sizes[category] = component_sizes.get(category, 0) + len(value.strip())
+
     # SYS-2776 / PROMPT-2197: SOUL.md is placed FIRST as the authoritative
     # identity.  Quality mandates must frame all downstream interpretation.
     # TASK_COMPLETION_GUIDANCE and TOOL_USE_ENFORCEMENT_GUIDANCE are
@@ -190,6 +208,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
+            _track("soul_md_chars", _soul_content)
             _soul_loaded = True
 
     # Universal task-completion / no-fabrication guidance.  Placed AFTER
@@ -235,6 +254,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+        _track("tool_guidance_chars", " ".join(tool_guidance))
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
@@ -319,6 +339,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         skills_prompt = ""
     if skills_prompt:
         stable_parts.append(skills_prompt)
+        _track("skills_chars", skills_prompt)
 
     # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
     # of the requested model. Inject explicit model identity into the system prompt
@@ -340,6 +361,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _env_hints = _r.build_environment_hints()
     if _env_hints:
         stable_parts.append(_env_hints)
+        _track("environment_hints_chars", _env_hints)
 
     # Coding posture (base Hermes, any interactive coding surface in a code
     # workspace — see agent/coding_context.py). The operating brief + the live
@@ -433,6 +455,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         _effective_hint = _tui_embedded_pane_clarifier(_effective_hint)
     if _effective_hint:
         stable_parts.append(_effective_hint)
+        _track("platform_hints_chars", _effective_hint)
 
     # ── Context tier (cwd-dependent, may change between sessions) ─
     context_parts: List[str] = []
@@ -448,6 +471,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             + system_message
             + "\n</caller_instruction>"
         )
+        _track("system_message_chars", "<caller_instruction>\n" + system_message + "\n</caller_instruction>")
 
     if not agent.skip_context_files:
         # Prefer the configured TERMINAL_CWD (gateway mode). When unset (local
@@ -459,6 +483,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             context_length=_ctx_len)
         if context_files_prompt:
             context_parts.append(context_files_prompt)
+            _track("context_files_chars", context_files_prompt)
 
     # ── Volatile tier (changes per session/turn — never cached) ───
     volatile_parts: List[str] = []
@@ -468,11 +493,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             mem_block = agent._memory_store.format_for_system_prompt("memory")
             if mem_block:
                 volatile_parts.append(mem_block)
+                _track("memory_chars", mem_block)
         # USER.md is always included when enabled.
         if agent._user_profile_enabled:
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+                _track("user_profile_chars", user_block)
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:
@@ -480,6 +507,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _ext_mem_block = agent._memory_manager.build_system_prompt()
             if _ext_mem_block:
                 volatile_parts.append(_ext_mem_block)
+                _track("external_memory_chars", _ext_mem_block)
         except Exception:
             pass
 
@@ -499,12 +527,64 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
+    _track("timestamp_model_chars", timestamp_line)
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
         "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
+        # SYS-798 (SYS-788 Phase 2): structural component sizes captured during
+        # build. Not used by the public joined-string API — consumed by
+        # build_context_breakdown() for telemetry.
+        "_component_sizes": component_sizes,
     }
+
+
+def build_context_breakdown(parts: Dict[str, Any]) -> Any:
+    """Build a ContextBreakdown from the structural component sizes.
+
+    SYS-798 (SYS-788 Phase 2): reads ``parts["_component_sizes"]`` (captured
+    during build_system_prompt_parts — structural, zero parsing) and maps the
+    per-component char counts to ContextBreakdown's 13 fields. Any unmapped
+    component sizes roll into ``other_chars``.
+
+    Returns a ContextBreakdown instance, or None if unavailable (import fails,
+    no sizes recorded). Never raises — caller wraps in try/except.
+    """
+    try:
+        from agent.context_telemetry import ContextBreakdown
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(parts, dict):
+        return None
+    sizes = parts.get("_component_sizes") or {}
+    if not sizes:
+        return None
+
+    mapped = {
+        "soul_md_chars": sizes.get("soul_md_chars", 0),
+        "tool_guidance_chars": sizes.get("tool_guidance_chars", 0),
+        "system_message_chars": sizes.get("system_message_chars", 0),
+        "memory_chars": sizes.get("memory_chars", 0),
+        "user_profile_chars": sizes.get("user_profile_chars", 0),
+        "external_memory_chars": sizes.get("external_memory_chars", 0),
+        "skills_chars": sizes.get("skills_chars", 0),
+        "context_files_chars": sizes.get("context_files_chars", 0),
+        "timestamp_model_chars": sizes.get("timestamp_model_chars", 0),
+        "platform_hints_chars": sizes.get("platform_hints_chars", 0),
+        "environment_hints_chars": sizes.get("environment_hints_chars", 0),
+    }
+    named_total = sum(mapped.values())
+    tracked_total = sum(sizes.values())
+    mapped["other_chars"] = max(0, tracked_total - named_total)
+
+    joined = "\n\n".join(p for p in (parts.get("stable", ""), parts.get("context", ""), parts.get("volatile", "")) if p)
+    mapped["total_system_prompt_chars"] = len(joined)
+
+    try:
+        return ContextBreakdown(**mapped)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str:
@@ -525,6 +605,16 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
 
+    # SYS-798 (SYS-788 Phase 2): cache the component breakdown alongside the
+    # cached prompt. Derived from the already-built parts (zero extra build
+    # cost), refreshed only when the prompt is rebuilt (invalidate clears both).
+    try:
+        _breakdown = build_context_breakdown(parts)
+        if _breakdown is not None:
+            agent._system_prompt_breakdown = _breakdown
+    except Exception:  # noqa: BLE001
+        pass  # telemetry breakdown is non-fatal — never blocks prompt build
+
     # Surface context-file truncation warnings through the normal agent status
     # channel so gateway/CLI users see them in chat instead of only in logs.
     for warning in drain_truncation_warnings():
@@ -540,6 +630,9 @@ def invalidate_system_prompt(agent: Any) -> None:
     so the rebuilt prompt captures any writes from this session.
     """
     agent._cached_system_prompt = None
+    # SYS-798 (SYS-788 Phase 2): clear the cached breakdown too — it is only
+    # valid while the prompt it describes is the current one.
+    agent._system_prompt_breakdown = None
     if agent._memory_store:
         agent._memory_store.load_from_disk()
 
