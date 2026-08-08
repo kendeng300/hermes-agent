@@ -332,6 +332,18 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         # Continuing session — reuse the exact system prompt from the
         # previous turn so the Anthropic cache prefix matches.
         agent._cached_system_prompt = stored_prompt
+        # SYS-798 (SYS-788 Phase 2): the stored prompt string is the joined
+        # text — component sizes can't be recovered from it. Rebuild the
+        # breakdown from a fresh parts build (structural sizes only; the
+        # joined string is NOT re-derived, so the cached prefix is untouched).
+        try:
+            from agent.system_prompt import build_system_prompt_parts, build_context_breakdown
+            _parts = build_system_prompt_parts(agent)
+            _bd = build_context_breakdown(_parts)
+            if _bd is not None:
+                agent._system_prompt_breakdown = _bd
+        except Exception:  # noqa: BLE001
+            pass  # telemetry breakdown is non-fatal
         return
     if stored_prompt:
         stored_state = "stale_runtime"
