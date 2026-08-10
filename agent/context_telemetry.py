@@ -280,6 +280,16 @@ def record_context_call(
         "system_prompt_chars": system_breakdown.total_system_prompt_chars,
         "conversation_chars": conv_chars,
         "breakdown": system_breakdown.to_dict(),
+        # PROMPT-818: real API-reported token counts (patched post-response
+        # via patch_context_call_output_tokens after usage is processed)
+        "output_tokens": None,
+        "input_tokens": None,
+        "completion_tokens": None,
+        "prompt_tokens": None,
+        "total_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "reasoning_tokens": None,
     }
 
     with _queue_lock:
@@ -288,6 +298,46 @@ def record_context_call(
         else:
             global _dropped_count
             _dropped_count += 1
+
+
+def patch_context_call_output_tokens(
+    session_id: str,
+    *,
+    output_tokens: int = 0,
+    input_tokens: int = 0,
+    completion_tokens: int = 0,
+    prompt_tokens: int = 0,
+    total_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    reasoning_tokens: int = 0,
+) -> None:
+    """PROMPT-818: Patch the most recent telemetry record with real API token counts.
+
+    Called AFTER the API response usage is processed (conversation_loop.py L2249+).
+    Finds the most recent queued record for this session_id and updates its token
+    fields. If no matching record is found (already flushed or session_id mismatch),
+    the call is silently dropped — the record with estimated tokens is better than
+    no record at all.
+    """
+    if not telemetry_recording_enabled():
+        return
+    _start_flush_thread()
+    with _queue_lock:
+        # Walk backwards through the queue to find the most recent matching record
+        for i in range(len(_queue) - 1, -1, -1):
+            if _queue[i].get("session_id") == session_id:
+                _queue[i]["output_tokens"] = output_tokens
+                _queue[i]["input_tokens"] = input_tokens
+                _queue[i]["completion_tokens"] = completion_tokens
+                _queue[i]["prompt_tokens"] = prompt_tokens
+                _queue[i]["total_tokens"] = total_tokens
+                _queue[i]["cache_read_tokens"] = cache_read_tokens
+                _queue[i]["cache_write_tokens"] = cache_write_tokens
+                _queue[i]["reasoning_tokens"] = reasoning_tokens
+                return
+    # Record already flushed — non-fatal. The next flush cycle will
+    # have the estimated-only record, which is still valid.
 
 
 def telemetry_recording_enabled() -> bool:

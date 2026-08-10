@@ -190,6 +190,26 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
+    # PROMPT-818: patch context telemetry record with real API token counts
+    try:
+        from agent.context_telemetry import patch_context_call_output_tokens
+        patch_context_call_output_tokens(
+            session_id=agent.session_id or "",
+            output_tokens=canonical_usage.output_tokens,
+            input_tokens=canonical_usage.input_tokens,
+            completion_tokens=canonical_usage.output_tokens,
+            prompt_tokens=prompt_tokens,
+            total_tokens=total_tokens,
+            cache_read_tokens=canonical_usage.cache_read_tokens,
+            cache_write_tokens=canonical_usage.cache_write_tokens,
+            reasoning_tokens=canonical_usage.reasoning_tokens,
+        )
+    except ImportError:
+        pass
+    except Exception as _telem_patch_err:
+        logger.debug("Codex context telemetry output-token patch failed (non-fatal): %s",
+                     _telem_patch_err, exc_info=True)
+
     cost_result = estimate_usage_cost(
         agent.model,
         canonical_usage,

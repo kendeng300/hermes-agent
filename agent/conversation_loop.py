@@ -2248,6 +2248,29 @@ def run_conversation(
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
+                    # PROMPT-818: patch context telemetry record with real API token counts
+                    try:
+                        from agent.context_telemetry import patch_context_call_output_tokens
+                        patch_context_call_output_tokens(
+                            session_id=agent.session_id or "",
+                            output_tokens=canonical_usage.output_tokens,
+                            input_tokens=canonical_usage.input_tokens,
+                            completion_tokens=canonical_usage.output_tokens,
+                            prompt_tokens=prompt_tokens,
+                            total_tokens=total_tokens,
+                            cache_read_tokens=canonical_usage.cache_read_tokens,
+                            cache_write_tokens=canonical_usage.cache_write_tokens,
+                            reasoning_tokens=canonical_usage.reasoning_tokens,
+                        )
+                    except ImportError:
+                        pass  # module not present
+                    except Exception as _telem_patch_err:
+                        logger.debug(
+                            "Context telemetry output-token patch failed (non-fatal): %s",
+                            _telem_patch_err,
+                            exc_info=True,
+                        )
+
                     # Log API call details for debugging/observability
                     _cache_pct = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
