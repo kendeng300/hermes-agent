@@ -7,16 +7,20 @@ upstream prefix cache warm.  See ``hermes-agent-dev``'s
 ``references/self-improvement-loop.md`` for how the background-review
 fork inherits the cached prompt verbatim.
 
-Three tiers are joined with ``\\n\\n``:
+Two tiers are joined with ``\n\n`` (PROMPT-815 prefix alignment —
+the mid-prefix ``context`` tier is eliminated to keep the STABLE prefix
+byte-stable for DeepSeek cache hits):
 
 * ``stable``   — identity (SOUL.md or DEFAULT_AGENT_IDENTITY), tool
   guidance, computer-use guidance, nous subscription block, tool-use
   enforcement guidance + per-model operational guidance, skills prompt,
   alibaba model-name workaround, environment hints, platform hints.
-* ``context``  — caller-supplied ``system_message`` plus context files
-  (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``.
+  Byte-stable across sessions with the same persona — cached by provider.
 * ``volatile`` — memory snapshot, USER.md profile, external memory
-  provider block, timestamp/session/model/provider line.
+  provider block, caller-supplied ``system_message``, context files
+  (AGENTS.md / .cursorrules / etc.) discovered under ``TERMINAL_CWD``,
+  timestamp/session/model/provider line.  All dynamic content lives here
+  at the TAIL so the STABLE prefix is never invalidated.
 
 Pure helpers that read the agent's state.  AIAgent keeps thin forwarders.
 """
@@ -143,16 +147,21 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
 
 
 def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) -> Dict[str, Any]:
-    """Assemble the system prompt as three ordered parts.
+    """Assemble the system prompt as two ordered parts (PROMPT-815).
 
-    Returns a dict with three keys:
+    Returns a dict with three keys (``context`` is retained as an empty
+    string for backward compatibility — callers that reference
+    ``parts["context"]`` still compile):
       * ``stable``   — identity, tool guidance, skills prompt,
         environment hints, platform hints, model-family operational
-        guidance.
-      * ``context``  — context files (AGENTS.md, .cursorrules, etc.)
-        and caller-supplied system_message.
-      * ``volatile`` — memory snapshot, user profile, external
-        memory provider block, timestamp line.
+        guidance.  Byte-stable across sessions for prefix caching.
+      * ``context``  — **empty** (PROMPT-815: system_message and
+        context_files moved to ``volatile`` to keep STABLE prefix
+        byte-stable).  Retained for backward API compatibility.
+      * ``volatile`` — memory snapshot, user profile, external memory
+        provider block, caller-supplied system_message, context files
+        (AGENTS.md, .cursorrules, etc.), timestamp line.  All dynamic
+        content lives at the TAIL.
 
     Joined into a single string by :func:`build_system_prompt` and
     cached on ``agent._cached_system_prompt`` for the lifetime of the
@@ -457,8 +466,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         stable_parts.append(_effective_hint)
         _track("platform_hints_chars", _effective_hint)
 
-    # ── Context tier (cwd-dependent, may change between sessions) ─
+    # ── Context tier (PROMPT-815: eliminated — kept as empty list for
+    #    backward API compatibility. system_message and context_files
+    #    moved to volatile tier to keep the STABLE prefix byte-stable.) ─
     context_parts: List[str] = []
+
+    # ── Volatile tier (all dynamic content — never cached) ─────────
+    volatile_parts: List[str] = []
+
+    # PROMPT-815: system_message and context_files moved here from the
+    # former context tier to keep the STABLE prefix byte-stable for
+    # provider prompt caching (DeepSeek 50-120x price differential).
+    # Order: memory → user_profile → external_memory →
+    #        system_message → context_files → timestamp.
+    # context_files must be at the volatile tail (before timestamp) so
+    # they are injected as close as possible to the user message.
 
     # Note: ephemeral_system_prompt is NOT included here. It's injected at
     # API-call time only so it stays out of the cached/stored system prompt.
@@ -466,7 +488,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Wrap caller-supplied instructions in safety tags to prevent
         # prompt-injection attacks that could override identity or
         # tool-use enforcement directives.  See PROMPT-001.
-        context_parts.append(
+        volatile_parts.append(
             "<caller_instruction>\n"
             + system_message
             + "\n</caller_instruction>"
@@ -482,11 +504,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             cwd=resolve_context_cwd(), skip_soul=_soul_loaded,
             context_length=_ctx_len)
         if context_files_prompt:
-            context_parts.append(context_files_prompt)
+            volatile_parts.append(context_files_prompt)
             _track("context_files_chars", context_files_prompt)
-
-    # ── Volatile tier (changes per session/turn — never cached) ───
-    volatile_parts: List[str] = []
 
     if agent._memory_store:
         if agent._memory_enabled:
@@ -532,6 +551,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
+        # PROMPT-815: ``context`` is always empty (system_message + context_files
+        # now live in ``volatile``). Retained for backward API compatibility.
         "volatile": "\n\n".join(p.strip() for p in volatile_parts if p and p.strip()),
         # SYS-798 (SYS-788 Phase 2): structural component sizes captured during
         # build. Not used by the public joined-string API — consumed by
@@ -578,6 +599,9 @@ def build_context_breakdown(parts: Optional[Dict[str, Any]]) -> Any:
     tracked_total = sum(sizes.values())
     mapped["other_chars"] = max(0, tracked_total - named_total)
 
+    # PROMPT-815: context tier is always empty (system_message + context_files
+    # moved to volatile). The join still references "context" for backward
+    # compatibility — it's filtered out by ``if p`` when empty.
     joined = "\n\n".join(p for p in (parts.get("stable", ""), parts.get("context", ""), parts.get("volatile", "")) if p)
     mapped["total_system_prompt_chars"] = len(joined)
 
@@ -595,10 +619,11 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     prompt is stable across all turns in a session, maximizing prefix cache
     hits.
 
-    Layers are ordered cache-friendly: stable identity/guidance first,
-    then session-stable context files, then per-call volatile content
-    (memory, USER profile, timestamp).  The whole string is treated as
-    one cached block — Hermes never rebuilds or reinjects parts of it
+    Layers are ordered cache-friendly (PROMPT-815): byte-stable
+    identity/guidance first (``stable``), then all dynamic content
+    at the tail (``volatile``: memory, USER profile, system_message,
+    context files, timestamp).  The whole string is treated as one
+    cached block — Hermes never rebuilds or reinjects parts of it
     mid-session, which is the only way to keep upstream prompt caches
     warm across turns.
     """

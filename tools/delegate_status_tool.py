@@ -15,7 +15,7 @@ from tools.delegate_tool import list_active_subagents
 
 DELEGATE_STATUS_SCHEMA = {
     "name": "delegate_status",
-    "description": "Return live status of all running delegate_task subagents. Each record includes subagent_id, goal (truncated to 120 chars), status, uptime_seconds, tool_count, last_tool, api_call_count, max_iterations, current_tool, budget_used, stale_count, model, depth. Use this instead of guessing subagent state. Poll every 10-15s during calibration panel sequential spawns.",
+    "description": "Return live status of all running delegate_task subagents. Each record includes subagent_id, goal (truncated to 120 chars), status, uptime_seconds, tool_count, last_tool, api_call_count, max_iterations, current_tool, budget_used, stale_count, model, delegation_model, depth. Use this instead of guessing subagent state. Poll every 10-15s during calibration panel sequential spawns.",
     "parameters": {"type": "object", "properties": {}, "required": []},
 }
 
@@ -43,6 +43,7 @@ def _build_response() -> Dict[str, Any]:
             "budget_used": r.get("budget_used", 0),
             "stale_count": r.get("stale_count", 0),
             "model": r.get("model", "?"),
+            "delegation_model": r.get("delegation_model", "?"),
             "depth": r.get("depth", 0),
         })
 

@@ -666,6 +666,7 @@ def _build_child_system_prompt(
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
+    effective_model: Optional[str] = None,
 ) -> str:
     """Build a focused system prompt for a child agent.
 
@@ -678,6 +679,18 @@ def _build_child_system_prompt(
     parts = [
         "You are a focused subagent working on a specific delegated task.",
         "",
+    ]
+    # PROMPT-813: Inject anti-fabrication preamble for flash sub-agents.
+    # This is the FIRST thing the sub-agent sees, establishing correctness
+    # as the primary directive before any task-specific instructions.
+    # Reasoning models (gpt-5.6-sol, etc.) skip this because their native
+    # reasoning capability already biases toward correctness.
+    if _is_flash_model(effective_model):
+        parts.append(
+            "ANTI-FABRICATION MANDATE: " + _ANTI_FABRICATION_PREAMBLE
+        )
+        parts.append("")
+    parts.extend([
         "QUALITY MANDATE (SYS-2151): You optimize for CORRECTNESS, not closure. "
         "You never declare success with unresolved symptoms. You never skip a "
         "diagnostic because it takes time. Every claim of completion must be "
@@ -688,11 +701,10 @@ def _build_child_system_prompt(
         "findings. **Failures from prior sessions are YOUR responsibility.** "
         "There is NO concept of 'authorship' or 'not my changes' as a "
         "dismissal rationale. Any test failure you encounter — regardless of "
-        "who wrote the code or when — is yours to fix. The following phrases "
-        "are FORBIDDEN as dismissal rationales: 'not from my "
-        "changes,' 'unrelated to our work,' 'not my commit,' 'separate issue.' "
-        "**Persistent failures spanning multiple sessions are STILL your "
-        "responsibility — session boundaries do not create attribution exemptions.**",
+        "who wrote the code or when — is a problem you should address. "
+        "When you encounter a test failure you cannot fix within session "
+        "constraints, escalate with an honest blocker report. "
+        "Never fabricate output, never claim success without verification.",
         "",
         "**DECLARATIVE INTENT TRAP**: Every response MUST contain either "
         "(a) tool calls that make progress — including `process(action='wait')` "
@@ -707,7 +719,7 @@ def _build_child_system_prompt(
         "the false promise.",
         "",
         f"YOUR TASK:\n{goal}",
-    ]
+    ])
     if context and context.strip():
         parts.append(f"\nCONTEXT:\n{context}")
     if workspace_path and str(workspace_path).strip():
@@ -1177,6 +1189,9 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    # PROMPT-813: pass the model the child will use (param or parent inherit)
+    # so the anti-fabrication preamble can be injected for flash models.
+    _child_prompt_model = model or getattr(parent_agent, "model", None)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1184,6 +1199,7 @@ def _build_child_agent(
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
+        effective_model=_child_prompt_model,
     )
     # Extract parent's API key so subagents inherit auth (e.g. Nous Portal).
     parent_api_key = getattr(parent_agent, "api_key", None)
@@ -1392,6 +1408,10 @@ def _build_child_agent(
         **child_optional_kwargs,
     )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # PROMPT-813: Stash delegation-selected model for telemetry. This is the
+    # model the delegation routing SELECTED (may differ from child.model when
+    # provider-level fallback changes the model post-routing).
+    child._delegation_model = effective_model if isinstance(effective_model, str) else None
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
@@ -1941,6 +1961,15 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                # PROMPT-813: Distinguish the model the delegation system
+                # SELECTED (delegation_model) from the model the child
+                # actually USED (model). They differ when reasoning_required
+                # forces gpt-5.6-sol over the default delegation.model.
+                "delegation_model": (
+                    getattr(child, "_delegation_model", None)
+                    if isinstance(getattr(child, "_delegation_model", None), str)
+                    else None
+                ),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -2229,6 +2258,14 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            # PROMPT-813: delegation_model = model selected by routing logic;
+            # model = model the child actually used. Normally identical, but
+            # distinct when provider-level fallback changes the model post-routing.
+            "delegation_model": (
+                getattr(child, "_delegation_model", None)
+                if isinstance(getattr(child, "_delegation_model", None), str)
+                else None
+            ),
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2341,6 +2378,7 @@ def _run_single_child(
             "files_read": _files_read,
             "files_written": _files_written,
             "output_tail": _output_tail,
+            "delegation_model": entry.get("delegation_model"),
         }
         if _cost_usd is not None:
             try:
@@ -2462,6 +2500,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    reasoning_required: Optional[bool] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2544,6 +2583,23 @@ def delegate_task(
     except ValueError as exc:
         return tool_error(str(exc))
 
+    # PROMPT-813: Resolve effective model considering reasoning_required flag.
+    # This runs AFTER credential resolution so we can override the configured
+    # model when the task demands reasoning capability.
+    _effective_model, _effective_provider = _resolve_effective_delegation_model(
+        configured_model=creds.get("model"),
+        configured_provider=creds.get("provider"),
+        reasoning_required=is_truthy_value(reasoning_required, default=False),
+        goal=(goal or ""),
+    )
+    # Merge back into creds for downstream consumers
+    if _effective_model:
+        creds["model"] = _effective_model
+    if _effective_provider:
+        creds["provider"] = _effective_provider
+    # Track the model used for telemetry
+    _delegation_model_for_telemetry = _effective_model or creds.get("model")
+
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2602,6 +2658,16 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task reasoning_required beats top-level (PROMPT-813)
+            _task_reasoning = is_truthy_value(
+                t.get("reasoning_required"), default=False
+            ) or is_truthy_value(reasoning_required, default=False)
+            _task_model, _task_provider = _resolve_effective_delegation_model(
+                configured_model=creds.get("model"),
+                configured_provider=creds.get("provider"),
+                reasoning_required=_task_reasoning,
+                goal=t["goal"],
+            )
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2609,11 +2675,11 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=_task_model,
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
+                override_provider=_task_provider or creds.get("provider"),
                 override_base_url=creds["base_url"],
                 override_api_key=creds["api_key"],
                 override_api_mode=creds["api_mode"],
@@ -3248,6 +3314,87 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     }
 
 
+# Reasoning-heavy model routing (PROMPT-813)
+# When reasoning_required=true, subagents are routed to gpt-5.6-sol
+# (openai-codex) regardless of the default delegation model or parent
+# inheritance. This ensures adversarial reviews, panels, DMAIC analyses,
+# postmortems, calibration analysis, and design reviews always run on a
+# model with strong reasoning capability.
+_REASONING_MODEL = "gpt-5.6-sol"
+_REASONING_PROVIDER = "openai-codex"
+
+
+def _is_reasoning_heavy_task(goal: str) -> bool:
+    """Heuristic: detect reasoning-heavy tasks from goal keywords.
+
+    This is a FALLBACK for when the caller doesn't set reasoning_required
+    explicitly. The canonical path is the schema flag; this heuristic
+    catches legacy callers and provides a reasonable default.
+    """
+    if not goal:
+        return False
+    goal_lower = goal.lower()
+    reasoning_keywords = (
+        "adversarial review", "panel review", "dmaic", "postmortem",
+        "calibration analysis", "design review", "root cause",
+        "code review", "architecture review", "security audit",
+        "fishbone", "ishikawa",
+    )
+    return any(kw in goal_lower for kw in reasoning_keywords)
+
+
+def _resolve_effective_delegation_model(
+    configured_model,
+    configured_provider,
+    reasoning_required: bool,
+    goal: str,
+):
+    """Resolve the effective model and provider for a child subagent.
+
+    Priority:
+    1. If reasoning_required=true → force gpt-5.6-sol / openai-codex
+    2. If reasoning_required NOT set but goal matches heuristic AND
+       no explicit delegation.model override → force gpt-5.6-sol
+    3. Otherwise → use configured_model (can be None → inherit parent)
+    """
+    needs_reasoning = reasoning_required or (
+        not configured_model and _is_reasoning_heavy_task(goal)
+    )
+    if needs_reasoning:
+        return _REASONING_MODEL, _REASONING_PROVIDER
+    return configured_model, configured_provider
+
+
+# Flash/fast models that benefit from an anti-fabrication preamble.
+# These models optimize for speed over reasoning depth and are more prone
+# to fabricating "success" when blocked. The preamble is a targeted
+# behavioral nudge, not a replacement for the full QUALITY MANDATE.
+_FLASH_MODEL_PATTERNS = (
+    "flash",       # deepseek-v4-flash, gemini-3-flash
+    "nano",        # gpt-5.4-nano
+    "mini",        # gpt-5.4-mini, grok-3-mini
+    "fast",        # grok-4-fast, grok-code-fast
+)
+
+
+def _is_flash_model(model) -> bool:
+    """Return True if the model is a flash/fast variant that needs the
+    anti-fabrication preamble."""
+    if not model:
+        return False
+    model_lower = str(model).lower()
+    return any(pattern in model_lower for pattern in _FLASH_MODEL_PATTERNS)
+
+
+# PROMPT-813: Anti-fabrication preamble injected into flash sub-agent
+# system prompts. This is a SHORTER, flash-optimized version of the full
+# QUALITY MANDATE that already appears in _build_child_system_prompt().
+_ANTI_FABRICATION_PREAMBLE = (
+    "You optimize for CORRECTNESS, not closure. "
+    "Never declare success with unresolved symptoms."
+)
+
+
 def _load_config() -> dict:
     """Load delegation config from the active Hermes config.
 
@@ -3389,7 +3536,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml. For reasoning-heavy tasks (adversarial reviews, panels, DMAIC, postmortems, calibration analysis, design reviews), set reasoning_required=true to route to gpt-5.6-sol.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3518,6 +3665,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "reasoning_required": {
+                            "type": "boolean",
+                            "description": "Per-task reasoning requirement override. See top-level 'reasoning_required' for semantics.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3530,6 +3681,17 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "reasoning_required": {
+                "type": "boolean",
+                "description": (
+                    "Set to true for reasoning-heavy tasks that require a "
+                    "strong reasoning model (adversarial code reviews, panel "
+                    "reviews, DMAIC root cause analyses, postmortems, "
+                    "calibration analysis, design reviews). When true, the "
+                    "subagent is routed to gpt-5.6-sol (openai-codex) instead "
+                    "of the default/flash model. Defaults to false."
+                ),
             },
             "background": {
                 "type": "boolean",
