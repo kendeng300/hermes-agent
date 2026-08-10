@@ -298,6 +298,10 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "When you say you will perform an action, execute it. "
     "Do not describe plans without executing them.\n"
     "\n"
+    "Tool calls are how work gets done — take the action, then report the "
+    "result. A response that only describes or promises what you will do is "
+    "not a response: you MUST execute the tool calls first.\n"
+    "\n"
     "Keep working until the task is verified complete against the "
     "quality standard specified in SOUL.md."
 )
@@ -462,10 +466,7 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     "- **Verification:** Be thorough — correctness matters more than brevity. "
     "Verify claims against evidence before presenting. Include verification "
     "results in your response and note any uncertainties.\n"
-    "- **Parallel tool calls:** When you need to perform multiple independent "
-    "operations (e.g. reading several files), make all the tool calls in a "
-    "single response rather than sequentially.\n"
-
+    "\n"
     "- **Non-interactive commands:** Use flags like -y, --yes, --non-interactive "
     "to prevent CLI tools from hanging on prompts.\n"
     "- **Keep going:** Work autonomously until the task is fully resolved. "
@@ -1478,12 +1479,72 @@ def build_skills_system_prompt(
     the rendered index. Nothing is ever hidden: every skill name stays
     visible and loadable via ``skill_view`` / ``skills_list``; only the
     descriptions are dropped, and a footer note explains the demotion.
+
+    PROMPT-810 (on-demand index mode): when ``skills.on_demand_index`` is
+    true in config.yaml, the full enumeration is replaced with a short
+    discovery instruction (~500 chars) that points the agent at
+    ``skills_list()`` / ``skill_view()``. This removes the 61.5KB/604-skill
+    block from the system prompt (32.3% of prompt tokens) and switches from
+    passive enumeration to active retrieval. Anti-fabrication clause included
+    ('never guess a skill name'). The mode is fully reversible via config.
+    Flag changes take effect on the next session start (or after a context
+    compression event that triggers a system-prompt rebuild).  Mid-session
+    config reloads do NOT invalidate the cached system prompt — this is
+    intentional per the "per-conversation prompt caching is sacred"
+    principle.  When the flag changes via a skill-edit operation (which
+    already calls ``clear_skills_system_prompt_cache()`` from
+    skill_manager_tool.py / skills_hub.py), the next prompt build picks up
+    the new value.
     """
     skills_dir = get_skills_dir()
     external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
 
     if not skills_dir.exists() and not external_dirs:
         return ""
+
+    # ── PROMPT-810: on-demand index mode ──────────────────────────────
+    # When skills.on_demand_index=true, skip the full 61.5KB enumeration and
+    # return a short discovery instruction instead. This is the token-
+    # efficiency win: ~32% of system-prompt tokens removed while keeping
+    # skill discoverability via skills_list()/skill_view().
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        _cfg = load_config_readonly()
+        _on_demand = bool(
+            (_cfg.get("skills") or {}).get("on_demand_index", False)
+        )
+    except Exception:
+        _on_demand = False
+    if _on_demand:
+        return (
+            "## Skills (on-demand)\n"
+            "Before replying, scan available skills with `skills_list()` "
+            "(use `skills_list(category=\"<domain>\")` for focused discovery "
+            "— categories: devops, data-science, mlops, creative, etc.). "
+            "If a skill matches or is even partially relevant, "
+            "you MUST load it with skill_view(name) and follow its "
+            "instructions. Err on the side of loading — it is better "
+            "to have context you don't need than to miss critical steps "
+            "or pitfalls. Skills contain specialized knowledge "
+            "(API endpoints, tool-specific commands, proven workflows) "
+            "and also encode the user's conventions and quality standards "
+            "for tasks like code review, planning, and testing — load them "
+            "even for tasks you already know, because the skill defines "
+            "how it should be done here.\n"
+            "When the user asks about configuring, installing, modifying, "
+            "or troubleshooting Hermes Agent — its CLI, config, models, "
+            "providers, tools, skills, voice, gateway, plugins — load "
+            "the `hermes-agent` skill first. It has the actual commands "
+            "(e.g. `hermes config set …`, `hermes tools`, `hermes setup`).\n"
+            "If a skill has issues, fix it with "
+            "skill_manage(action='patch'). After difficult/iterative "
+            "tasks, offer to save as a skill. Update skills you discover "
+            "missing steps or wrong commands in before finishing.\n"
+            "Never guess a skill name — call skills_list() to discover. "
+            "Only proceed without loading a skill if genuinely none are "
+            "relevant to the task."
+        )
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists

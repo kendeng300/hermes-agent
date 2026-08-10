@@ -1715,13 +1715,40 @@ SKILL_VIEW_SCHEMA = {
     },
 }
 
+def _skills_list_with_bump(args, **kw):
+    """Wrapper that records telemetry for every skill surfaced by skills_list().
+
+    PROMPT-810 (discoverability baseline): each skill returned by skills_list()
+    gets a bump_list() call that sets discovery_method='skills_list' on its
+    usage record.  This enables the 1-week baseline comparison: when
+    on_demand_index is enabled, the agent discovers skills via skills_list()
+    instead of the full index, and we can measure whether skill-load rate
+    drops.
+
+    Telemetry failures are silent — a broken sidecar never breaks the tool call.
+    """
+    name_list = args.get("name")  # not used for list — it's a category filter
+    result = skills_list(
+        category=args.get("category"), task_id=kw.get("task_id")
+    )
+    try:
+        parsed = json.loads(result)
+        if isinstance(parsed, dict) and parsed.get("success"):
+            from tools.skill_usage import bump_list
+            for skill in parsed.get("skills", []):
+                skill_name = skill.get("name")
+                if skill_name:
+                    bump_list(str(skill_name))
+    except Exception:
+        pass
+    return result
+
+
 registry.register(
     name="skills_list",
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
-    handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
-    ),
+    handler=_skills_list_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
 )

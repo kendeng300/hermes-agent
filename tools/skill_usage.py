@@ -494,6 +494,14 @@ def _empty_record() -> Dict[str, Any]:
         "state": STATE_ACTIVE,
         "pinned": False,
         "archived_at": None,
+        # PROMPT-810 (discoverability baseline): tracks how the agent first
+        # discovered this skill.  Values: "index" (scanned from full system
+        # prompt enumeration), "skills_list" (discovered via skills_list()
+        # tool call), "skill_view" (direct load by name), None (unknown /
+        # pre-existing record).  Set by bump_list() and the on-demand
+        # discovery path.  Used for the 1-week baseline comparison before
+        # enabling skills.on_demand_index.
+        "discovery_method": None,
     }
 
 
@@ -629,6 +637,25 @@ def bump_use(skill_name: str) -> None:
     def _apply(rec: Dict[str, Any]) -> None:
         rec["use_count"] = int(rec.get("use_count") or 0) + 1
         rec["last_used_at"] = _now_iso()
+    _mutate(skill_name, _apply)
+
+
+def bump_list(skill_name: str) -> None:
+    """Bump view_count and set discovery_method='skills_list'.
+
+    Called from the skills_list() tool handler to record that the agent
+    discovered this skill via a programmatic list call (as opposed to
+    scanning the full index or loading by name).  This is the telemetry
+    hook for the PROMPT-810 1-week discoverability baseline: it lets us
+    compare "skills loaded after index scan" vs "skills loaded after
+    skills_list()" when on_demand_index is enabled.
+
+    Tracks every skill regardless of provenance.
+    """
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["view_count"] = int(rec.get("view_count") or 0) + 1
+        if rec.get("discovery_method") is None:
+            rec["discovery_method"] = "skills_list"
     _mutate(skill_name, _apply)
 
 

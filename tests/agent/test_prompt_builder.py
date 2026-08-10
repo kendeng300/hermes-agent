@@ -474,6 +474,139 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_on_demand_index_mode_replaces_full_index(self, monkeypatch, tmp_path):
+        """PROMPT-810: skills.on_demand_index=true returns the short discovery
+        instruction instead of the full 61.5KB enumeration (token efficiency),
+        with the anti-fabrication clause and skills_list()/skill_view() pointers.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "coding" / "python-debug"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        # Patch the config read to simulate on_demand_index=true.
+        from unittest.mock import patch as _patch
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"on_demand_index": True}},
+        ):
+            result = build_skills_system_prompt()
+        # Short discovery instruction, NOT the full index.
+        assert "python-debug" not in result
+        assert len(result) < 1500
+        assert "skills_list" in result
+        assert "skill_view" in result
+        assert "never guess a skill name" in result.lower()
+
+    def test_on_demand_index_off_returns_full_index(self, monkeypatch, tmp_path):
+        """PROMPT-810: default (flag absent/false) keeps the full index — the
+        opt-in baseline requirement is preserved (1-week discoverability
+        baseline before enabling).
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "coding" / "python-debug"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        from unittest.mock import patch as _patch
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"on_demand_index": False}},
+        ):
+            result = build_skills_system_prompt()
+        assert "python-debug" in result
+        assert "available_skills" in result
+
+    def test_on_demand_flag_absent_returns_full_index(self, monkeypatch, tmp_path):
+        """PROMPT-810: when config.yaml has no 'skills' key at all (flag absent),
+        the default False preserves the full index — opt-in baseline is the
+        safe default (DESIGN review Finding 4, test 1).
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "coding" / "python-debug"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        from unittest.mock import patch as _patch
+        # No 'skills' key at all.
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={},
+        ):
+            result = build_skills_system_prompt()
+        assert "python-debug" in result
+        assert "available_skills" in result
+
+    def test_on_demand_config_exception_falls_back_to_full_index(
+        self, monkeypatch, tmp_path
+    ):
+        """PROMPT-810: when load_config_readonly() raises an exception
+        (e.g. broken YAML), the except path sets _on_demand=False →
+        full index is returned — safe degradation (DESIGN review Finding 4,
+        test 2).
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "coding" / "python-debug"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        from unittest.mock import patch as _patch
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=RuntimeError("simulated config parse failure"),
+        ):
+            result = build_skills_system_prompt()
+        assert "python-debug" in result
+        assert "available_skills" in result
+
+    def test_on_demand_flag_flip_no_cross_contamination(
+        self, monkeypatch, tmp_path
+    ):
+        """PROMPT-810: flipping on_demand_index within a single test must never
+        serve stale text — the on-demand early return is NOT cached, and the
+        full-index cache was never populated during on-demand mode
+        (DESIGN review Finding 4, test 3).
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "coding" / "python-debug"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
+        )
+        from unittest.mock import patch as _patch
+
+        # Phase 1: on-demand → short text, no skill names.
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"on_demand_index": True}},
+        ):
+            r1 = build_skills_system_prompt()
+        assert "python-debug" not in r1
+        assert "skills_list" in r1
+
+        # Phase 2: flip to false → full index with skill names.
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"on_demand_index": False}},
+        ):
+            r2 = build_skills_system_prompt()
+        assert "python-debug" in r2
+        assert "available_skills" in r2
+
+        # Phase 3: flip back to true → short text again, no contamination.
+        with _patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"skills": {"on_demand_index": True}},
+        ):
+            r3 = build_skills_system_prompt()
+        assert "python-debug" not in r3
+        assert "skills_list" in r3
+        assert len(r3) < 1500
+
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

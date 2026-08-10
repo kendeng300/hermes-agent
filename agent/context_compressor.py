@@ -1857,6 +1857,29 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             "or connection strings in the summary — replace any that appear "
             "with [REDACTED]. Note that the user had credentials present, but "
             "do not preserve their values."
+            # PROMPT-812 (token-efficiency 3-panel consensus): verbatim-
+            # preservation rules for the safety-critical classes the prior
+            # panel flagged as single-point-of-fabrication risk. The
+            # summarizer is an untrusted intermediary between ground truth
+            # and working memory — it MUST preserve corrections, errors,
+            # blockers, and gate results verbatim or the agent loses ground
+            # truth after compaction. Violating these is a fabrication.
+            " VERBATIM PRESERVATION RULES (violating any of these is a "
+            "fabrication): "
+            "1) ALL user correction instructions ('stop', 'undo', 'don't', "
+            "'instead do Y', 'never mind', 'wrong', 'incorrect', 'roll back') "
+            "MUST be preserved word-for-word. "
+            "2) ALL blocker reports, error messages, and tracebacks MUST be "
+            "preserved verbatim (never summarize a failure as resolved). "
+            "3) ALL quality-gate results ('PASS', 'FAIL', exit codes) MUST be "
+            "preserved verbatim; never report a gate as passed without the "
+            "original pass/fail data. "
+            "4) ALL ticket references (SYS-XXXX, STRATS-XXX, PROMPT-XXXX) "
+            "MUST be preserved exactly. "
+            "5) If uncertain whether something is critical: PRESERVE IT "
+            "verbatim — never paraphrase away a correction or a failure. "
+            "6) A mid-context 'stop what you're doing' instruction MUST "
+            "appear as the FIRST sentence of the summary."
         )
 
         # Temporal anchoring directive. Rewrites relative / still-pending-sounding
