@@ -165,19 +165,40 @@ class InProcessCronScheduler(CronScheduler):
 
     def start(self, stop_event, *, adapters=None, loop=None, interval=60):
         import logging
+        import os
+        import time as _time
         from cron.scheduler import tick as cron_tick
         from cron.jobs import record_ticker_heartbeat
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
+        # SYS-819 restart provenance: capture initiator/prior-PID/start time
+        # BEFORE the loop so a restart can be attributed (who/what started us,
+        # what the prior gateway PID was, when we came up).
+        _provenance = {
+            "initiator": os.environ.get("HERMES_CRON_START_INITIATOR", "gateway"),
+            "reason_code": os.environ.get("HERMES_CRON_START_REASON", "unknown"),
+            "prior_pid": os.environ.get("HERMES_GATEWAY_PRIOR_PID", ""),
+            "replacement_pid": str(os.getpid()),
+            "start_ts": _time.time(),
+            "phase": "STARTED",
+        }
+        logger.info("SYS-819 restart provenance: %s", _provenance)
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
         record_ticker_heartbeat()
         while not stop_event.is_set():
+            # Write heartbeat BEFORE the tick so the liveness file is always
+            # fresh — proves the daemon loop is alive even when cron_tick()
+            # blocks (e.g. during Slack WebSocket reconnection). The success
+            # marker is still written separately AFTER a successful tick.
+            record_ticker_heartbeat()
             ok = False
             try:
+                _provenance["phase"] = "TICK_START"
                 cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
                 ok = True
+                _provenance["phase"] = "TICK_OK"
             except BaseException as e:
                 # Catch BaseException (not just Exception) so a SystemExit from
                 # a misbehaving provider SDK / agent retry path does not kill
@@ -187,6 +208,7 @@ class InProcessCronScheduler(CronScheduler):
                 # an exception in this daemon thread, so swallowing it and
                 # re-checking stop_event keeps shutdown clean.
                 logger.error("Cron tick error: %s", e, exc_info=True)
+                _provenance["phase"] = "TICK_BLOCKED"
             # Record liveness every iteration; bump the success marker only on a
             # clean tick, so status can tell "alive but failing every tick" from
             # "actually firing jobs" (#32612, #32895).

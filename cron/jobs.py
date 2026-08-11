@@ -782,16 +782,25 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     plain heartbeat fresh and falsely report healthy (#32612, #32895).
 
     Best-effort: a write failure must never disrupt the tick loop.
+
+    SYS-819: persistence failures are OBSERVABLE (logged at WARNING), not
+    silently swallowed — a heartbeat that cannot be written is a health
+    signal itself (the observer must be able to distinguish WRITE_FAILED
+    from a healthy heartbeat).
     """
+    import logging
+    _log = logging.getLogger("cron.jobs.heartbeat")
     try:
         _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 - best-effort by contract
+        _log.warning("SYS-819: ticker heartbeat persistence failed: %s", e,
+                     exc_info=True)
     if success:
         try:
             _atomic_write_epoch(TICKER_SUCCESS_FILE)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001 - best-effort by contract
+            _log.warning("SYS-819: ticker success-marker persistence failed: %s", e,
+                         exc_info=True)
 
 
 def _epoch_file_age(path: Path) -> Optional[float]:
