@@ -111,8 +111,8 @@ def test_admission_uses_effective_window_and_reserves() -> None:
         spec,
         runtime_window=272_000,
         policy_core_tokens=20_000,
-        fixed_tokens=48_000,
-        conversation_tokens=160_000,
+        fixed_tokens=56_000,
+        conversation_tokens=152_000,
         requested_output_tokens=32_000,
     )
     assert admitted.effective_window == 257_000
@@ -122,8 +122,8 @@ def test_admission_uses_effective_window_and_reserves() -> None:
         spec,
         runtime_window=272_000,
         policy_core_tokens=20_000,
-        fixed_tokens=48_001,
-        conversation_tokens=160_000,
+        fixed_tokens=56_001,
+        conversation_tokens=152_000,
         requested_output_tokens=32_000,
     )
     assert rejected.admitted is False

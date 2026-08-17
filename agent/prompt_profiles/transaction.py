@@ -84,6 +84,7 @@ class PreparedModelSwitch:
     journal_path: str | None = None
     session_id: str | None = None
     hermes_home: str | None = None
+    journal_old_identity: tuple[Any, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -420,6 +421,9 @@ def _read_commit_authority(agent: Any, home: Path, session_id: str) -> Mapping[s
     reader = _explicit_bound_method(session_db, "get_model_switch_state")
     if callable(reader):
         try:
+            session_reader = _explicit_bound_method(session_db, "get_session")
+            if callable(session_reader) and session_reader(session_id) is None:
+                return _read_authoritative_state(home, session_id)
             return MappingProxyType(dict(reader(session_id)))
         except Exception as exc:
             raise PromptProfileError("SWITCH_STATE_AMBIGUOUS") from exc
@@ -433,6 +437,10 @@ def _cas_commit_authority(
     cas = _explicit_bound_method(session_db, "compare_and_swap_model_switch")
     if callable(cas):
         try:
+            session_reader = _explicit_bound_method(session_db, "get_session")
+            if callable(session_reader) and session_reader(session_id) is None:
+                _publish_authoritative_state(home, session_id, record)
+                return
             changed = cas(
                 session_id, expected_generation=expected, generation=record["generation"],
                 transaction_id=record["transaction_id"], provider=record["provider"],
@@ -508,6 +516,8 @@ def prepare_model_switch(
     runtime_updates: Mapping[str, Any] | None = None,
     durable_mutations: Sequence[DurableMutation] = (),
     requested_output_tokens: int | None = None,
+    durable: bool = True,
+    journal_old_identity: tuple[Any, Any] | None = None,
 ) -> PreparedModelSwitch:
     """Validate and stage a candidate without mutating ``agent``.
 
@@ -559,7 +569,7 @@ def prepare_model_switch(
     session_id = getattr(agent, "session_id", None)
     home = _switch_home(agent)
     old_generation = getattr(agent, "_prompt_profile_state_version", None)
-    if home is not None:
+    if home is not None and durable:
         session_id = _safe_session_id(
             session_id, fallback_identity=(provider, model),
         )
@@ -570,8 +580,14 @@ def prepare_model_switch(
             "transaction_id": transaction_id,
             "session_id": session_id,
             "old": {
-                "provider": getattr(agent, "provider", None),
-                "model": getattr(agent, "model", None),
+                "provider": (
+                    journal_old_identity[0] if journal_old_identity is not None
+                    else getattr(agent, "provider", None)
+                ),
+                "model": (
+                    journal_old_identity[1] if journal_old_identity is not None
+                    else getattr(agent, "model", None)
+                ),
             },
             "new": {"provider": provider, "model": model},
         }
@@ -596,7 +612,8 @@ def prepare_model_switch(
         transaction_id=transaction_id,
         journal_path=journal_path,
         session_id=session_id,
-        hermes_home=str(home) if home is not None else None,
+        hermes_home=str(home) if home is not None and durable else None,
+        journal_old_identity=journal_old_identity,
     )
 
 
@@ -675,10 +692,15 @@ def commit_model_switch(
 
 
 def _journal_payload(prepared: PreparedModelSwitch, session_id: str, transaction_id: str) -> dict[str, Any]:
+    old_provider, old_model = (
+        prepared.journal_old_identity
+        if prepared.journal_old_identity is not None
+        else prepared.old_identity[:2]
+    )
     return {
         "transaction_id": transaction_id,
         "session_id": session_id,
-        "old": {"provider": prepared.old_identity[0], "model": prepared.old_identity[1]},
+        "old": {"provider": old_provider, "model": old_model},
         "new": {"provider": prepared.provider, "model": prepared.model},
     }
 
@@ -1058,6 +1080,9 @@ def activate_initial_profile(agent: Any, *, messages=(), tools=None) -> Prepared
     """Run the same render/admission transaction for construction/resume."""
     home = _switch_home(agent)
     session_id = getattr(agent, "session_id", None)
+    authoritative: Mapping[str, Any] = MappingProxyType({
+        "generation": 0, "transaction_id": None,
+    })
     if home is not None:
         session_id = _safe_session_id(
             session_id,
@@ -1071,20 +1096,32 @@ def activate_initial_profile(agent: Any, *, messages=(), tools=None) -> Prepared
         )
         authoritative = _read_commit_authority(agent, home, session_id)
         agent._prompt_profile_state_version = authoritative["generation"]
-        if authoritative["generation"]:
-            if (
-                getattr(agent, "provider", None) != authoritative.get("provider")
-                or getattr(agent, "model", None) != authoritative.get("model")
-            ):
-                raise PromptProfileError("RECOVERY_CONFLICT")
-    if find_profile(getattr(agent, "provider", ""), getattr(agent, "model", "")) is None:
+    provider = getattr(agent, "provider", "")
+    model = getattr(agent, "model", "")
+    generation = authoritative["generation"]
+    route_matches_authority = bool(generation) and (
+        provider == authoritative.get("provider")
+        and model == authoritative.get("model")
+    )
+    profile = find_profile(provider, model)
+    if profile is None and (not generation or route_matches_authority):
         agent._prompt_profile = None
         agent._prompt_profile_rendered = None
         return None
+    # A fully recovered authority record is the base generation, not a
+    # permanent route pin.  If config/session routing now selects another
+    # model, publish that legitimate transition as the next CAS generation.
+    # Ambiguous or incomplete transitions have already failed closed in
+    # recover_model_switches() above.
+    durable_activation = not route_matches_authority
+    journal_old_identity = (
+        (authoritative.get("provider"), authoritative.get("model"))
+        if generation and durable_activation else None
+    )
     prepared = prepare_model_switch(
         agent,
-        model=agent.model,
-        provider=agent.provider,
+        model=model,
+        provider=provider,
         api_key=getattr(agent, "api_key", ""),
         base_url=getattr(agent, "base_url", ""),
         api_mode=getattr(agent, "api_mode", ""),
@@ -1099,6 +1136,24 @@ def activate_initial_profile(agent: Any, *, messages=(), tools=None) -> Prepared
                 0,
             ) if isinstance(value, int) and not isinstance(value, bool) and value >= 0
         ),
+        durable=durable_activation,
+        journal_old_identity=journal_old_identity,
     )
-    commit_model_switch(agent, prepared)
+    if durable_activation:
+        commit_model_switch(agent, prepared)
+    else:
+        # Resuming the already-authoritative route only needs the reviewed
+        # render/admission applied to this fresh process-local agent.  Do not
+        # manufacture a new durable model switch on every reconstruction.
+        snapshot = capture_model_switch_snapshot(agent)
+        try:
+            _apply_prepared_runtime(agent, prepared, None)
+            agent._prompt_profile_state_version = generation
+        except BaseException as original:
+            failures = rollback_model_switch(agent, snapshot)
+            if failures:
+                raise PromptProfileError(
+                    "ROLLBACK_INCOMPLETE: " + "; ".join(failures)
+                ) from original
+            raise
     return prepared

@@ -5,6 +5,7 @@ import importlib
 import hashlib
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
@@ -77,10 +78,13 @@ class DeepSeekTokenCounter:
                 if actual != expected:
                     raise TokenizerUnavailable(f"TOKENIZER_FIXTURE_MISMATCH: {name}")
                 resolved.append(path)
+            # Loading by Hub model id can still make a metadata request in
+            # recent Transformers releases even with ``local_files_only``.
+            # Use the snapshot that we just hash-verified instead: admission
+            # must remain usable after the initial assets are cached.
             self._tokenizer = transformers.AutoTokenizer.from_pretrained(
-                self.model_id,
+                str(Path(resolved[0]).parent),
                 trust_remote_code=False,
-                revision=self.revision,
                 local_files_only=True,
             )
             self.tokenizer_version = getattr(transformers, "__version__", "unknown")

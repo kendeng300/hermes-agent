@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -585,6 +586,95 @@ def test_initial_profile_reserves_largest_output_cap() -> None:
         activate_initial_profile(agent)
 
     assert prepare.call_args.kwargs["requested_output_tokens"] == 384_000
+
+
+def test_initial_profile_same_authority_applies_locally_without_new_generation() -> None:
+    from agent.prompt_profiles.transaction import activate_initial_profile
+
+    agent = SimpleNamespace(
+        provider="openai-codex", model="gpt-5.6-sol", api_key="", base_url="",
+        api_mode="", tools=(), _prompt_profile=None, session_id="session-id",
+        hermes_home=Path("/unused"),
+    )
+    authoritative = {
+        "generation": 7, "transaction_id": "committed",
+        "provider": "openai-codex", "model": "gpt-5.6-sol",
+    }
+    prepared = MagicMock()
+    with (
+        patch("agent.prompt_profiles.transaction.recover_model_switches"),
+        patch("agent.prompt_profiles.transaction._read_commit_authority", return_value=authoritative),
+        patch("agent.prompt_profiles.transaction.find_profile", return_value=MagicMock()),
+        patch("agent.prompt_profiles.transaction.prepare_model_switch", return_value=prepared) as prepare,
+        patch("agent.prompt_profiles.transaction._apply_prepared_runtime") as apply_local,
+        patch("agent.prompt_profiles.transaction.commit_model_switch") as commit,
+        patch("agent.prompt_profiles.transaction.capture_model_switch_snapshot"),
+    ):
+        returned = activate_initial_profile(agent)
+
+    assert returned is prepared
+    assert prepare.call_args.kwargs["durable"] is False
+    apply_local.assert_called_once_with(agent, prepared, None)
+    commit.assert_not_called()
+    assert agent._prompt_profile_state_version == 7
+
+
+def test_initial_profile_reconciles_completed_authority_to_current_route() -> None:
+    from agent.prompt_profiles.transaction import activate_initial_profile
+
+    agent = SimpleNamespace(
+        provider="deepseek", model="deepseek-v4-flash", api_key="", base_url="",
+        api_mode="", tools=(), _prompt_profile=None, session_id="session-id",
+        hermes_home=Path("/unused"),
+    )
+    authoritative = {
+        "generation": 3, "transaction_id": "committed",
+        "provider": "openai-codex", "model": "gpt-5.6-sol",
+    }
+    prepared = MagicMock()
+    with (
+        patch("agent.prompt_profiles.transaction.recover_model_switches"),
+        patch("agent.prompt_profiles.transaction._read_commit_authority", return_value=authoritative),
+        patch("agent.prompt_profiles.transaction.find_profile", return_value=MagicMock()),
+        patch("agent.prompt_profiles.transaction.prepare_model_switch", return_value=prepared) as prepare,
+        patch("agent.prompt_profiles.transaction.commit_model_switch") as commit,
+    ):
+        returned = activate_initial_profile(agent)
+
+    assert returned is prepared
+    assert prepare.call_args.kwargs["durable"] is True
+    assert prepare.call_args.kwargs["journal_old_identity"] == (
+        "openai-codex", "gpt-5.6-sol",
+    )
+    commit.assert_called_once_with(agent, prepared)
+
+
+def test_missing_session_db_row_uses_file_backed_switch_authority(tmp_path) -> None:
+    from agent.prompt_profiles.transaction import commit_model_switch
+    from tests.agent.prompt_profiles.test_switch_transaction_durability import (
+        _agent, _prepared,
+    )
+
+    class MissingSessionDB:
+        def get_session(self, session_id):
+            return None
+
+        def get_model_switch_state(self, session_id):
+            raise AssertionError("missing DB rows must use file authority")
+
+        def compare_and_swap_model_switch(self, *args, **kwargs):
+            raise AssertionError("missing DB rows must use file authority")
+
+    agent = _agent(tmp_path)
+    agent._session_db = MissingSessionDB()
+    commit_model_switch(agent, _prepared(agent))
+
+    state = json.loads(
+        (tmp_path / "state/model_switch_state/session-2977.json").read_text()
+    )
+    assert (state["generation"], state["provider"], state["model"]) == (
+        1, "provider", "new",
+    )
 
 
 def test_tui_model_switch_exception_redacts_credential_canary(monkeypatch, caplog) -> None:
