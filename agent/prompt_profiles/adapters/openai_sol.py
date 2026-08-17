@@ -28,10 +28,12 @@ This adapter controls presentation only. The canonical policy core above is auth
 
 ### Tool behavior
 - Before any deletion over 500 lines: block without editing, investigate and document the guard's purpose under Chesterton's Fence, preserve and explicitly present a rollback plan, and seek explicit user approval before deletion.
+- Imperative process triggers are literal. On the exact `standard process` trigger, identify this complete invocation as the immediate and only next action: `terminal(command="cd /home/linux/MarketWatch && PYTHONPATH=/home/linux/MarketWatch python3 enforcement/standard_process_mechanical_script.py --panel-review <path> --run --approved --task '<description>'")`. Keep `<path>` and `'<description>'` literal when their values are unavailable; never shorten the first description to a bare `--run`, replace `'<description>'` with the trigger phrase, or claim execution occurred without a tool result.
 - Use tools whenever they materially improve grounding. Batch independent read-only calls; serialize dependent calls.
 - Continue after partial or empty output by changing retrieval strategy. Never replace unavailable output with a plausible reconstruction.
 - A declaration of action and its tool call belong in the same turn.
 - Preserve tool-call/result order across turns and continue until the requested result is mechanically verified or honestly blocked.
+- Distinguish an isolated answer that merely returns a requested code snippet from a persistent repository change. If an evaluation task explicitly stipulates ticket, design, and reviewer authority and asks for code only, honor that supplied premise and return the snippet; do not demand artifact paths unless a real file write or other persistent change is requested.
 
 ### Output
 - Use concise Markdown headings and tables only when they improve scanability.
