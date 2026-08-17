@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import copy
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
@@ -213,7 +214,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # framework, not as competing authority.  When quality and throughput
     # conflict, quality wins because SOUL.md is first AND last word.
     _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
+    _registered_profile = getattr(agent, "_prompt_profile_rendered", None)
+    if _registered_profile is not None:
+        # SYS-2977: reuse the exact full-core + adapter bytes admitted before
+        # the model switch; never route the policy core through truncation.
+        _soul_content = _registered_profile.stable
+        if _soul_content:
+            stable_parts.append(_soul_content)
+            _track("soul_md_chars", _soul_content)
+            _soul_loaded = True
+    elif agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
@@ -314,7 +324,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # Also applied to xAI Grok — same failure modes (claims completion
             # without tool calls, suggests workarounds instead of using
             # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+            if (
+                _registered_profile is None
+                and ("gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower)
+            ):
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
@@ -630,6 +643,21 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     parts = build_system_prompt_parts(agent, system_message=system_message)
     joined = "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
 
+    # Persisted prompt reuse is authorized by this complete immutable profile
+    # identity, not by mutable model/provider labels alone.
+    _identity = getattr(agent, "_prompt_profile", None)
+    if isinstance(_identity, (tuple, list)) and len(_identity) >= 6:
+        _provider, _model, _profile_id, _core_hash, _adapter_hash, _render_hash = _identity[:6]
+        _identity_block = (
+            f"Profile-ID: {_profile_id}\n"
+            f"Canonical-Core-SHA256: {_core_hash}\n"
+            f"Adapter-SHA256: {_adapter_hash}\n"
+            f"Stable-Render-SHA256: {_render_hash}"
+        )
+        if len(_identity) >= 7:
+            _identity_block += f"\nFull-Prompt-SHA256: {_identity[6]}"
+        joined = f"{_identity_block}\n\n{joined}"
+
     # SYS-798 (SYS-788 Phase 2): cache the component breakdown alongside the
     # cached prompt. Derived from the already-built parts (zero extra build
     # cost), refreshed only when the prompt is rebuilt (invalidate clears both).
@@ -646,6 +674,26 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
         agent._emit_status(warning)
 
     return joined
+
+
+def build_system_prompt_candidate(
+    agent: Any,
+    rendered_profile: Any,
+    system_message: Optional[str] = None,
+) -> str:
+    """Render the exact eventual prompt without mutating live agent state.
+
+    The shallow candidate deliberately shares read-only services (memory,
+    skills and context loaders) while isolating every prompt/cache field that
+    assembly writes.  Admission uses this result, so universal guidance and
+    every stable/volatile source are included in the provider token count.
+    """
+    candidate = copy.copy(agent)
+    candidate._prompt_profile = getattr(rendered_profile, "cache_identity", None)
+    candidate._prompt_profile_rendered = rendered_profile
+    candidate._cached_system_prompt = None
+    candidate._system_prompt_breakdown = None
+    return build_system_prompt(candidate, system_message=system_message)
 
 
 def invalidate_system_prompt(agent: Any) -> None:
@@ -688,6 +736,7 @@ def format_tools_for_system_message(agent: Any) -> str:
 
 __all__ = [
     "build_system_prompt_parts",
+    "build_system_prompt_candidate",
     "build_system_prompt",
     "invalidate_system_prompt",
     "format_tools_for_system_message",

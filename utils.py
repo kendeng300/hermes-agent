@@ -305,33 +305,46 @@ def atomic_roundtrip_yaml_update(
     should survive a single setting mutation.  Writes still use the same temp
     file + fsync + atomic replace pattern.
     """
-    from ruamel.yaml import YAML
-    from ruamel.yaml.comments import CommentedMap
-
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    yaml_rt = YAML(typ="rt")
-    yaml_rt.preserve_quotes = True
-    yaml_rt.allow_unicode = True
-    yaml_rt.default_flow_style = False
-    yaml_rt.indent(mapping=2, sequence=4, offset=2)
+    try:
+        import importlib
 
+        ruamel_yaml = importlib.import_module("ruamel.yaml")
+        ruamel_comments = importlib.import_module("ruamel.yaml.comments")
+    except ImportError:
+        # ruamel is optional in lightweight/runtime environments.  Preserve
+        # the atomic targeted-update contract with the already-required
+        # PyYAML dependency; comment/quote round-tripping remains available
+        # whenever ruamel is installed.
+        yaml_rt = None
+        mapping_type = dict
+        mapping_factory = dict
+    else:
+        yaml_rt = ruamel_yaml.YAML(typ="rt")
+        yaml_rt.preserve_quotes = True
+        yaml_rt.allow_unicode = True
+        yaml_rt.default_flow_style = False
+        yaml_rt.indent(mapping=2, sequence=4, offset=2)
+        mapping_type = ruamel_comments.CommentedMap
+        mapping_factory = ruamel_comments.CommentedMap
+
+    loaded: Any = None
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
-            config = yaml_rt.load(f) or CommentedMap()
-    else:
-        config = CommentedMap()
+            loaded = yaml_rt.load(f) if yaml_rt is not None else yaml.safe_load(f)
+    config: Any = loaded if loaded is not None else mapping_factory()
 
-    if not isinstance(config, CommentedMap):
-        config = CommentedMap(config)
+    if not isinstance(config, mapping_type):
+        config = mapping_factory(config)
 
     current = config
     keys = key_path.split(".")
     for key in keys[:-1]:
         next_value = current.get(key)
-        if not isinstance(next_value, CommentedMap):
-            next_value = CommentedMap()
+        if not isinstance(next_value, mapping_type):
+            next_value = mapping_factory()
             current[key] = next_value
         current = next_value
     current[keys[-1]] = value
@@ -345,7 +358,17 @@ def atomic_roundtrip_yaml_update(
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            yaml_rt.dump(config, f)
+            if yaml_rt is not None:
+                yaml_rt.dump(config, f)
+            else:
+                yaml.dump(
+                    config,
+                    f,
+                    Dumper=IndentDumper,
+                    default_flow_style=False,
+                    sort_keys=False,
+                    allow_unicode=True,
+                )
             f.flush()
             os.fsync(f.fileno())
         real_path = atomic_replace(tmp_path, path)

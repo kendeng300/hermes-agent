@@ -464,6 +464,7 @@ class AIAgent:
         service_tier: str = None,
         request_overrides: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
+        initial_conversation_history: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
         user_id_alt: str = None,
@@ -540,6 +541,7 @@ class AIAgent:
             service_tier=service_tier,
             request_overrides=request_overrides,
             prefill_messages=prefill_messages,
+            initial_conversation_history=initial_conversation_history,
             platform=platform,
             user_id=user_id,
             user_id_alt=user_id_alt,
@@ -791,10 +793,13 @@ class AIAgent:
         except Exception as err:
             logger.debug("LM Studio preload skipped: %s", err)
 
-    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
+    def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode='', *, messages=None, durable_mutations=()):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
         from agent.agent_runtime_helpers import switch_model
-        return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
+        return switch_model(
+            self, new_model, new_provider, api_key, base_url, api_mode,
+            messages=messages, durable_mutations=durable_mutations,
+        )
 
     def _safe_print(self, *args, **kwargs):
         """Print that silently handles broken pipes / closed stdout.

@@ -16,6 +16,7 @@ call time (run.py fully loaded by then), avoiding an import cycle.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import hashlib
 import inspect
@@ -1574,6 +1575,9 @@ class GatewaySlashCommandsMixin:
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
+                                    messages=tuple(
+                                        getattr(cached_entry[0], "conversation_history", ()) or ()
+                                    ),
                                 )
                             except Exception as exc:
                                 # The in-place swap rolled the agent back to the
@@ -1805,6 +1809,124 @@ class GatewaySlashCommandsMixin:
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
+            from agent.prompt_profiles.transaction import DurableMutation
+
+            old_override = copy.deepcopy(self._session_model_overrides.get(session_key))
+            old_note = copy.deepcopy(getattr(self, "_pending_model_notes", {}).get(session_key))
+            old_cfg = _load_gateway_config()
+            new_override = {
+                "model": result.new_model, "provider": result.target_provider,
+                "api_key": result.api_key, "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            # Normal runners own synchronous stores plus async facades. Durable
+            # callbacks already execute in a worker, so prefer the synchronous
+            # backing stores and avoid bouncing through the event loop into the
+            # same executor. Focused compatibility doubles may expose only the
+            # async facade; truly bare object.__new__ runners expose neither.
+            async_session_store = getattr(self, "async_session_store", None)
+            session_store = getattr(self, "session_store", None)
+            if session_store is None:
+                session_store = getattr(async_session_store, "_store", None)
+            if session_store is not None:
+                sess_entry = await asyncio.to_thread(
+                    session_store.get_or_create_session, source
+                )
+            elif async_session_store is not None:
+                sess_entry = await async_session_store.get_or_create_session(source)
+            else:
+                sess_entry = None
+            old_was_auto_reset = bool(getattr(sess_entry, "was_auto_reset", False))
+            gateway_loop = asyncio.get_running_loop()
+
+            async def _await_durable(result_value):
+                return await result_value
+
+            def _call_durable(target, method_name, *args):
+                if target is None:
+                    return
+                result_value = getattr(target, method_name)(*args)
+                if inspect.isawaitable(result_value):
+                    # Async-only compatibility facades still need to participate
+                    # in apply/compensation. Production facades are unwrapped to
+                    # their sync stores above, so this cannot self-deadlock by
+                    # scheduling another to_thread operation on the same pool.
+                    asyncio.run_coroutine_threadsafe(
+                        _await_durable(result_value), gateway_loop
+                    ).result()
+
+            def _write_gateway_state(model, override):
+                async_db = getattr(self, "_session_db", None)
+                sess_db = getattr(async_db, "_db", None)
+                if sess_entry is not None:
+                    _call_durable(
+                        sess_db if sess_db is not None else async_db,
+                        "update_session_model",
+                        sess_entry.session_id,
+                        model,
+                    )
+                _call_durable(
+                    session_store if session_store is not None else async_session_store,
+                    "set_model_override",
+                    session_key,
+                    override or {},
+                )
+
+            def _apply_gateway_state():
+                # Consume before storing the new override so next-turn cleanup
+                # cannot erase it (#48031).
+                if sess_entry is not None:
+                    sess_entry.was_auto_reset = False
+                _write_gateway_state(result.new_model, new_override)
+
+            def _restore_gateway_state():
+                if sess_entry is not None:
+                    sess_entry.was_auto_reset = old_was_auto_reset
+                _write_gateway_state(current_model, old_override)
+
+            def _apply_gateway_persistence():
+                _apply_gateway_state()
+                if not hasattr(self, "_pending_model_notes"):
+                    self._pending_model_notes = {}
+                self._pending_model_notes[session_key] = (
+                    f"[Note: model was just switched from {current_model} to {result.new_model} "
+                    f"via {result.provider_label or result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+                self._session_model_overrides[session_key] = new_override
+                if persist_global:
+                    from hermes_cli.config import save_config
+                    cfg = copy.deepcopy(old_cfg)
+                    model_cfg = cfg.get("model")
+                    if not isinstance(model_cfg, dict):
+                        model_cfg = {}
+                        cfg["model"] = model_cfg
+                    model_cfg.update(default=result.new_model, provider=result.target_provider)
+                    if result.base_url:
+                        model_cfg["base_url"] = result.base_url
+                    if str(result.target_provider or "").strip().lower() != "custom":
+                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
+                    save_config(cfg)
+
+            def _compensate_gateway_persistence():
+                _restore_gateway_state()
+                if old_override is None:
+                    self._session_model_overrides.pop(session_key, None)
+                else:
+                    self._session_model_overrides[session_key] = old_override
+                if old_note is None:
+                    getattr(self, "_pending_model_notes", {}).pop(session_key, None)
+                else:
+                    self._pending_model_notes[session_key] = old_note
+                if persist_global:
+                    from hermes_cli.config import save_config
+                    save_config(old_cfg)
+
+            durable_mutations = (DurableMutation(
+                _apply_gateway_persistence,
+                _compensate_gateway_persistence,
+                "gateway DB/session/config persistence",
+            ),)
             # If there's a cached agent, update it in-place
             cached_entry = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -1815,12 +1937,16 @@ class GatewaySlashCommandsMixin:
 
             if cached_entry and cached_entry[0] is not None:
                 try:
-                    cached_entry[0].switch_model(
+                    await asyncio.to_thread(cached_entry[0].switch_model,
                         new_model=result.new_model,
                         new_provider=result.target_provider,
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
+                        messages=tuple(
+                            getattr(cached_entry[0], "conversation_history", ()) or ()
+                        ),
+                        durable_mutations=durable_mutations,
                     )
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
@@ -1837,96 +1963,25 @@ class GatewaySlashCommandsMixin:
                             f"staying on {current_model}."
                         ),
                     )
-
-            # Persist the new model to the session DB so the dashboard
-            # shows the updated model (#34850).
-            _sess_db = getattr(self, "_session_db", None)
-            if _sess_db is not None:
+            else:
                 try:
-                    _sess_entry = await self.async_session_store.get_or_create_session(source)
-                    # If this session was auto-reset, consume the flag so the
-                    # next regular message's cleanup does not wipe the model
-                    # override just stored below (Closes #48031).
-                    if getattr(_sess_entry, "was_auto_reset", False):
-                        _sess_entry.was_auto_reset = False
-                    await _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model
-                    )
+                    await asyncio.to_thread(_apply_gateway_persistence)
                 except Exception as exc:
-                    logger.debug(
-                        "Failed to persist model switch to DB: %s", exc
+                    try:
+                        await asyncio.to_thread(_compensate_gateway_persistence)
+                    except Exception as compensation_exc:
+                        logger.error(
+                            "Uncached gateway switch compensation failed: %s",
+                            type(compensation_exc).__name__,
+                        )
+                    return t(
+                        "gateway.model.error_prefix",
+                        error=f"Model switch was not persisted ({exc}); staying on {current_model}.",
                     )
-
-            # Store a note to prepend to the next user message so the model
-            # knows about the switch (avoids system messages mid-history).
-            if not hasattr(self, "_pending_model_notes"):
-                self._pending_model_notes = {}
-            self._pending_model_notes[session_key] = (
-                f"[Note: model was just switched from {current_model} to {result.new_model} "
-                f"via {result.provider_label or result.target_provider}. "
-                f"Adjust your self-identification accordingly.]"
-            )
-
-            # Store session override so next agent creation uses the new model
-            self._session_model_overrides[session_key] = {
-                "model": result.new_model,
-                "provider": result.target_provider,
-                "api_key": result.api_key,
-                "base_url": result.base_url,
-                "api_mode": result.api_mode,
-            }
-
-            # Write-through the non-secret parts (model/provider/base_url) to
-            # the session store so the override survives a gateway restart.
-            # api_key/api_mode are never persisted — they are re-resolved via
-            # runtime provider resolution on rehydration.
-            try:
-                await self.async_session_store.set_model_override(
-                    session_key,
-                    self._session_model_overrides[session_key],
-                )
-            except Exception:
-                logger.debug(
-                    "Failed to persist session model override", exc_info=True
-                )
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
             self._evict_cached_agent(session_key)
-
-            # Persist to config (default) unless --session opted out
-            if persist_global:
-                try:
-                    if config_path.exists():
-                        with open(config_path, encoding="utf-8") as f:
-                            cfg = yaml.safe_load(f) or {}
-                    else:
-                        cfg = {}
-                    # Coerce scalar/None ``model:`` into a dict before mutation —
-                    # otherwise ``cfg.setdefault("model", {})`` returns the existing
-                    # scalar and the next assignment raises
-                    # ``TypeError: 'str' object does not support item assignment``.
-                    # Reproduces when ``config.yaml`` has ``model: <name>`` (flat
-                    # string) instead of the proper nested ``model: {default: ...}``.
-                    raw_model = cfg.get("model")
-                    if isinstance(raw_model, dict):
-                        model_cfg = raw_model
-                    elif isinstance(raw_model, str) and raw_model.strip():
-                        model_cfg = {"default": raw_model.strip()}
-                        cfg["model"] = model_cfg
-                    else:
-                        model_cfg = {}
-                        cfg["model"] = model_cfg
-                    model_cfg["default"] = result.new_model
-                    model_cfg["provider"] = result.target_provider
-                    if result.base_url:
-                        model_cfg["base_url"] = result.base_url
-                    if str(result.target_provider or "").strip().lower() != "custom":
-                        clear_model_endpoint_credentials(model_cfg, clear_base_url=True)
-                    from hermes_cli.config import save_config
-                    save_config(cfg)
-                except Exception as e:
-                    logger.warning("Failed to persist model switch: %s", e)
 
             # Build confirmation message with full metadata
             provider_label = result.provider_label or result.target_provider

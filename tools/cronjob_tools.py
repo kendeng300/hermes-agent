@@ -276,6 +276,21 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
             len(removed), ", ".join(removed),
         )
     prompt_to_scan = _strip_cron_safe_constructs(cleaned)
+    # SYS-692 (2026-08-07): strip structured markup BEFORE scanning.
+    # Security-documentation skills legitimately reference attack patterns
+    # like `<!-- ignore-all-instructions REQ:harmless -->` inside HTML
+    # comments and code-formatted text. Structured markup in skills is
+    # documentation, never executable instructions — matching the
+    # `html_comment_injection` pattern in threat_patterns.py which already
+    # exempts REQ:-marked comments. This eliminates the
+    # security-documentation false-positive class (two crons were blocked
+    # 2026-08-06→08-07 by `prompt_injection` matching documented attack text).
+    # Strips: HTML comments, fenced markdown code blocks, inline backticks.
+    prompt_to_scan = re.sub(r"<!--.*?-->", "", prompt_to_scan, flags=re.DOTALL)
+    prompt_to_scan = re.sub(
+        r"```.*?```", "", prompt_to_scan, flags=re.DOTALL
+    )
+    prompt_to_scan = re.sub(r"`[^`\n]*`", "", prompt_to_scan)
     for pattern, pid in _CRON_SKILL_ASSEMBLED_PATTERNS:
         if re.search(pattern, prompt_to_scan, re.IGNORECASE):
             return cleaned, f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."

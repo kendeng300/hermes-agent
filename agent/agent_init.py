@@ -308,6 +308,7 @@ def init_agent(
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
+    initial_conversation_history: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
     user_id_alt: str = None,
@@ -609,6 +610,9 @@ def init_agent(
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
+    # Resume callers provide restored history before prompt-profile activation
+    # so identity and admission cover the transcript the model will receive.
+    agent.conversation_history = list(initial_conversation_history or [])
     agent._force_ascii_payload = False
     
     # Anthropic prompt caching: auto-enabled for Claude models on native
@@ -2115,6 +2119,15 @@ def init_agent(
             "anthropic_base_url": agent._anthropic_base_url,
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
+
+    # SYS-2977: registered routes use the exact same fail-closed profile
+    # render/admission transaction on fresh construction and session resume.
+    from agent.prompt_profiles.transaction import activate_initial_profile
+    activate_initial_profile(
+        agent,
+        messages=tuple(getattr(agent, "conversation_history", ()) or ()),
+        tools=tuple(getattr(agent, "tools", ()) or ()),
+    )
 
 
 

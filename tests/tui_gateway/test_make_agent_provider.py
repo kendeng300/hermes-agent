@@ -430,6 +430,8 @@ def test_apply_model_switch_does_not_leak_process_env():
         def switch_model(self, **kw):
             self.model = kw["new_model"]
             self.provider = kw["new_provider"]
+            for mutation in kw.get("durable_mutations", ()):
+                mutation.apply()
 
     env_keys = (
         "HERMES_MODEL",

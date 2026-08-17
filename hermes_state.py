@@ -729,6 +729,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
+    system_prompt_sha256 TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -2437,12 +2438,59 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def get_model_switch_state(self, session_id: str) -> Dict[str, Any]:
+        """Return the authoritative generation/transaction identity for switching."""
+        row = self._conn.execute(
+            "SELECT model, model_config FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            return {"generation": 0, "transaction_id": None}
+        raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[1]
+        try:
+            config = json.loads(raw) if isinstance(raw, str) and raw else {}
+        except (TypeError, json.JSONDecodeError):
+            raise ValueError("SWITCH_STATE_AMBIGUOUS")
+        if not isinstance(config, dict):
+            raise ValueError("SWITCH_STATE_AMBIGUOUS")
+        generation = config.get("_switch_generation", 0)
+        if not isinstance(generation, int) or generation < 0:
+            raise ValueError("SWITCH_STATE_AMBIGUOUS")
+        return {
+            "generation": generation,
+            "transaction_id": config.get("_switch_transaction_id"),
+            "provider": config.get("provider"),
+            "model": row["model"] if isinstance(row, sqlite3.Row) else row[0],
+        }
+
+    def compare_and_swap_model_switch(
+        self, session_id: str, *, expected_generation: int, generation: int,
+        transaction_id: str, provider: str, model: str,
+    ) -> bool:
+        """Atomically publish a model switch; SQLite is the linearization point."""
+        changed = False
+
+        def _do(conn):
+            nonlocal changed
+            cursor = conn.execute(
+                "UPDATE sessions SET model = ?, model_config = json_set("
+                "COALESCE(model_config, '{}'), '$.provider', ?, '$._switch_generation', ?, "
+                "'$._switch_transaction_id', ?) WHERE id = ? AND "
+                "COALESCE(json_extract(COALESCE(model_config, '{}'), '$._switch_generation'), 0) = ?",
+                (model, provider, generation, transaction_id, session_id, expected_generation),
+            )
+            changed = cursor.rowcount == 1
+
+        self._execute_write(_do)
+        return changed
+
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
+        import hashlib
+        digest = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET system_prompt = ? WHERE id = ?",
-                (system_prompt, session_id),
+                "UPDATE sessions SET system_prompt = ?, system_prompt_sha256 = ? WHERE id = ?",
+                (system_prompt, digest, session_id),
             )
         self._execute_write(_do)
 
@@ -2484,7 +2532,8 @@ class SessionDB:
                    billing_provider = ?,
                    billing_base_url = ?,
                    billing_mode = COALESCE(?, billing_mode),
-                   system_prompt = NULL
+                   system_prompt = NULL,
+                   system_prompt_sha256 = NULL
                    WHERE id = ?""",
                 (provider, base_url, billing_mode, session_id),
             )

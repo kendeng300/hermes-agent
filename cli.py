@@ -7871,20 +7871,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "base_url": self.base_url,
             "api_mode": self.api_mode,
         }
-        self.model = result.new_model
-        self.provider = result.target_provider
-        self.requested_provider = result.target_provider
-        # Always overwrite explicit overrides so stale credentials from the
-        # previous provider (e.g. Ollama api_key/base_url) don't leak into
-        # the new provider's credential resolution on the next turn.
-        self._explicit_api_key = result.api_key
-        self._explicit_base_url = result.base_url
-        if result.api_key:
-            self.api_key = result.api_key
-        if result.base_url:
-            self.base_url = result.base_url
-        if result.api_mode:
-            self.api_mode = result.api_mode
+        from agent.prompt_profiles.transaction import DurableMutation
+
+        def _apply_cli_switch():
+            self.model = result.new_model
+            self.provider = result.target_provider
+            self.requested_provider = result.target_provider
+            self._explicit_api_key = result.api_key
+            self._explicit_base_url = result.base_url
+            if result.api_key:
+                self.api_key = result.api_key
+            if result.base_url:
+                self.base_url = result.base_url
+            if result.api_mode:
+                self.api_mode = result.api_mode
+            if persist_global:
+                save_config_value("model.default", result.new_model)
+                if result.provider_changed:
+                    save_config_value("model.provider", result.target_provider)
+
+        def _compensate_cli_switch():
+            for _k, _v in _cli_snapshot.items():
+                setattr(self, _k, _v)
+            if persist_global:
+                save_config_value("model.default", _cli_snapshot["model"])
+                save_config_value("model.provider", _cli_snapshot["provider"])
+
+        _durable = (DurableMutation(
+            _apply_cli_switch, _compensate_cli_switch, "CLI model/config persistence"
+        ),)
 
         if self.agent is not None:
             try:
@@ -7894,6 +7909,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    messages=tuple(self.conversation_history or ()),
+                    durable_mutations=_durable,
                 )
             except Exception as exc:
                 # The agent rolled itself back to the old working model/client.
@@ -7906,6 +7923,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     f"  ⚠ Model switch to {result.new_model} failed ({exc}); "
                     f"staying on {old_model}."
                 )
+                return
+        else:
+            try:
+                _apply_cli_switch()
+            except Exception as exc:
+                try:
+                    _compensate_cli_switch()
+                except Exception as compensation_exc:
+                    logger.error("CLI switch compensation failed: %s", type(compensation_exc).__name__)
+                _cprint(f"  ⚠ Model switch was not persisted ({exc}); staying on {old_model}.")
                 return
 
         self._pending_model_switch_note = (
@@ -7951,9 +7978,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if result.warning_message:
             _cprint(f"    ⚠ {result.warning_message}")
         if persist_global:
-            save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
             _cprint("    Saved to config.yaml (--global)")
         else:
             _cprint("    (session only — add --global to persist)")
@@ -8178,20 +8202,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             "base_url": self.base_url,
             "api_mode": self.api_mode,
         }
-        self.model = result.new_model
-        self.provider = result.target_provider
-        self.requested_provider = result.target_provider
-        # Always overwrite explicit overrides so stale credentials from the
-        # previous provider (e.g. Ollama api_key/base_url) don't leak into
-        # the new provider's credential resolution on the next turn.
-        self._explicit_api_key = result.api_key
-        self._explicit_base_url = result.base_url
-        if result.api_key:
-            self.api_key = result.api_key
-        if result.base_url:
-            self.base_url = result.base_url
-        if result.api_mode:
-            self.api_mode = result.api_mode
+        from agent.prompt_profiles.transaction import DurableMutation
+
+        def _apply_cli_switch():
+            self.model = result.new_model
+            self.provider = result.target_provider
+            self.requested_provider = result.target_provider
+            self._explicit_api_key = result.api_key
+            self._explicit_base_url = result.base_url
+            if result.api_key:
+                self.api_key = result.api_key
+            if result.base_url:
+                self.base_url = result.base_url
+            if result.api_mode:
+                self.api_mode = result.api_mode
+            if persist_global:
+                save_config_value("model.default", result.new_model)
+                if result.provider_changed:
+                    save_config_value("model.provider", result.target_provider)
+
+        def _compensate_cli_switch():
+            for _k, _v in _cli_snapshot.items():
+                setattr(self, _k, _v)
+            if persist_global:
+                save_config_value("model.default", _cli_snapshot["model"])
+                save_config_value("model.provider", _cli_snapshot["provider"])
+
+        _durable = (DurableMutation(
+            _apply_cli_switch, _compensate_cli_switch, "CLI model/config persistence"
+        ),)
 
         # Apply to running agent (in-place swap)
         if self.agent is not None:
@@ -8202,6 +8241,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     api_key=result.api_key,
                     base_url=result.base_url,
                     api_mode=result.api_mode,
+                    messages=tuple(self.conversation_history or ()),
+                    durable_mutations=_durable,
                 )
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
@@ -8263,9 +8304,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Persistence
         if persist_global:
-            save_config_value("model.default", result.new_model)
-            if result.provider_changed:
-                save_config_value("model.provider", result.target_provider)
             _cprint("    Saved to config.yaml")
         else:
             _cprint("    (session only — add --global to persist)")

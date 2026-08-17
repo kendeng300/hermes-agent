@@ -27,6 +27,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
+from agent.redact import redact_sensitive_text
 from tui_gateway import git_probe
 from tui_gateway.transport import (
     StdioTransport,
@@ -1358,6 +1359,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 # id — pass it through so the upgrade continues that session
                 # instead of starting a fresh one under the same key.
                 kw = {"session_db": session_db}
+                kw["initial_conversation_history"] = list(current.get("history") or ())
                 if resume_sid := current.get("resume_session_id"):
                     kw["session_id"] = resume_sid
                 kw["platform_override"] = _session_source(current)
@@ -2370,7 +2372,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     return config
 
 
-def _persist_live_session_runtime(session: dict | None) -> None:
+def _persist_live_session_runtime(session: dict | None, *, strict: bool = False) -> None:
     """Persist active session runtime so future resumes restore the same footer."""
     if not session:
         return
@@ -2400,10 +2402,12 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         elif model and hasattr(db, "update_session_model"):
             db.update_session_model(session_key, model)
     except Exception:
+        if strict:
+            raise
         logger.debug("failed to persist live session runtime", exc_info=True)
 
 
-def _persist_live_session_system_prompt(session: dict | None) -> None:
+def _persist_live_session_system_prompt(session: dict | None, *, strict: bool = False) -> None:
     """Refresh the stored system prompt after a live runtime identity change."""
     if not session:
         return
@@ -2421,7 +2425,27 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
         agent._cached_system_prompt = prompt
         db.update_system_prompt(getattr(agent, "session_id", None) or session_key, prompt)
     except Exception:
+        if strict:
+            raise
         logger.debug("failed to persist live session system prompt", exc_info=True)
+
+
+def _redact_switch_error_text(text: str) -> str:
+    """Redact credentials from model-switch error text before logging/display.
+
+    The canonical redactor handles full-length secret values, but API errors
+    may also carry the credential FIELD NAME (``apiKey=``, ``api_key=``,
+    ``token=``, ``secret=``) even when the value is a masked/partial fragment.
+    Strip those segments entirely so neither the log nor the user-visible
+    error exposes credential-shaped text.
+    """
+    import re as _re
+
+    redacted = redact_sensitive_text(text, force=True)
+    field_pattern = _re.compile(
+        r"(?i)(api[_-]?key|apikey|token|secret|password|bearer)\s*=\s*[^\s,;)]+"
+    )
+    return field_pattern.sub("«redacted:credential»", redacted)
 
 
 def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
@@ -2951,6 +2975,54 @@ def _apply_model_switch(
             }
 
     if agent:
+        from agent.prompt_profiles.transaction import DurableMutation
+
+        old_override = copy.deepcopy(session.get("model_override"))
+        old_history = copy.deepcopy(session.get("history", []))
+        old_history_version = session.get("history_version", 0)
+        old_cfg = _load_cfg().get("model", {})
+        old_cfg = copy.deepcopy(old_cfg if isinstance(old_cfg, dict) else {})
+        runtime_db = getattr(agent, "_session_db", None) or _get_db()
+        old_row = runtime_db.get_session(session.get("session_key")) if runtime_db else None
+
+        def _apply_tui_persistence():
+            if pin_session_override:
+                session["model_override"] = {
+                    "model": result.new_model, "provider": result.target_provider,
+                    "base_url": result.base_url, "api_key": result.api_key,
+                    "api_mode": result.api_mode,
+                }
+            _persist_live_session_runtime(session, strict=True)
+            _persist_live_session_system_prompt(session, strict=True)
+            if persist_global:
+                _persist_model_switch(result)
+
+        def _compensate_tui_persistence():
+            session["model_override"] = old_override
+            session["history"] = copy.deepcopy(old_history)
+            session["history_version"] = old_history_version
+            if runtime_db is not None and old_row:
+                raw = old_row.get("model_config")
+                if hasattr(runtime_db, "update_session_meta"):
+                    runtime_db.update_session_meta(
+                        session.get("session_key"), raw, old_row.get("model")
+                    )
+                if hasattr(runtime_db, "update_system_prompt"):
+                    runtime_db.update_system_prompt(
+                        getattr(agent, "session_id", None) or session.get("session_key"),
+                        old_row.get("system_prompt") or "",
+                    )
+            if persist_global:
+                from cli import save_config_value
+                save_config_value("model.default", old_cfg.get("default"))
+                save_config_value("model.provider", old_cfg.get("provider"))
+                save_config_value("model.base_url", old_cfg.get("base_url"))
+
+        durable_mutations = (DurableMutation(
+            _apply_tui_persistence,
+            _compensate_tui_persistence,
+            "TUI session/config persistence",
+        ),)
         try:
             agent.switch_model(
                 new_model=result.new_model,
@@ -2958,6 +3030,8 @@ def _apply_model_switch(
                 api_key=result.api_key,
                 base_url=result.base_url,
                 api_mode=result.api_mode,
+                messages=tuple(session.get("history", ()) or ()),
+                durable_mutations=durable_mutations,
             )
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
@@ -2967,17 +3041,19 @@ def _apply_model_switch(
             # otherwise leave the session pinned to a broken model and kill the
             # conversation on the next turn (#50163).  A failed switch is a
             # no-op; surface a clean error to the client.
-            logger.warning("In-place model switch failed for TUI agent: %s", exc)
+            redacted = _redact_switch_error_text(str(exc))
+            logger.warning("In-place model switch failed for TUI agent: %s", redacted)
             raise ValueError(
-                f"Model switch to {result.new_model} failed ({exc}); "
+                f"Model switch to {result.new_model} failed ({redacted}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
-        _restart_slash_worker(sid, session)
-        _persist_live_session_runtime(session)
-        _persist_live_session_system_prompt(session)
+        # The history marker is deliberately after the transaction returns:
+        # no compensable/CAS failure can leave an orphan row claiming a switch
+        # that did not become authoritative.
         _append_model_switch_marker(
             session, model=result.new_model, provider=result.target_provider
         )
+        _restart_slash_worker(sid, session)
         _emit("session.info", sid, _session_info(agent, session))
 
     # Record the switch as a PER-SESSION override so a later rebuild of THIS
@@ -2993,7 +3069,7 @@ def _apply_model_switch(
     # contamination bug). agent.switch_model() above already mutated the right
     # agent in place; the override dict makes that choice survive a rebuild
     # without touching shared process state.
-    if pin_session_override and isinstance(session, dict):
+    if not agent and pin_session_override and isinstance(session, dict):
         session["model_override"] = {
             "model": result.new_model,
             "provider": result.target_provider,
@@ -3001,7 +3077,7 @@ def _apply_model_switch(
             "api_key": result.api_key,
             "api_mode": result.api_mode,
         }
-    if persist_global:
+    if not agent and persist_global:
         _persist_model_switch(result)
     return {
         "value": result.new_model,
@@ -4492,6 +4568,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    initial_conversation_history: list[dict] | None = None,
 ):
     from run_agent import AIAgent
 
@@ -4643,6 +4720,7 @@ def _make_agent(
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
+        initial_conversation_history=initial_conversation_history,
         **_agent_cbs(sid),
     )
 
@@ -5832,6 +5910,7 @@ def _(rid, params: dict) -> dict:
                 session_id=target,
                 session_db=db,
                 platform_override=source,
+                initial_conversation_history=history,
                 **stored_runtime_overrides,
             )
         finally:
@@ -8102,6 +8181,7 @@ def _(rid, params: dict) -> dict:
                 new_key,
                 session_id=new_key,
                 platform_override=source,
+                initial_conversation_history=list(history),
             )
         finally:
             _clear_session_context(tokens)

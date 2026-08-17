@@ -1769,7 +1769,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
-def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
+def _switch_model_runtime(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
     """Switch the model/provider in-place for a live agent.
 
     Called by the /model command handlers (CLI and gateway) after
@@ -2150,6 +2150,91 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "Failed to persist billing route after model switch",
                 exc_info=True,
             )
+
+
+def switch_model(
+    agent, new_model, new_provider, api_key='', base_url='', api_mode='', *,
+    messages=None, durable_mutations=(), requested_output_tokens=None,
+):
+    """Prepare and atomically apply a live model/profile switch.
+
+    CLI, gateway, and TUI converge here through ``AIAgent.switch_model``. The
+    shared transaction performs profile admission before mutation and wraps the
+    complete established runtime swap in one compensation boundary.
+    """
+    import copy
+
+    from agent.prompt_profiles.transaction import commit_model_switch, prepare_model_switch
+
+    # Build the complete candidate runtime on an isolated agent/compressor
+    # clone.  Client construction (and every provider-specific validation it
+    # entails) therefore finishes before commit is allowed to touch the live
+    # runtime.  The normal runtime helper remains the single source of truth
+    # for constructing all provider variants.
+    candidate_runtime = {}
+
+    def _build_candidate_client():
+        candidate = copy.copy(agent)
+        candidate._transport_cache = dict(getattr(agent, "_transport_cache", {}) or {})
+        candidate._client_kwargs = dict(getattr(agent, "_client_kwargs", {}) or {})
+        candidate._primary_runtime = dict(getattr(agent, "_primary_runtime", {}) or {})
+        candidate._fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
+        compressor = getattr(agent, "context_compressor", None)
+        # The candidate must always own this attribute.  Bare compatibility
+        # agents (notably the MiniMax credential-guard fixture) legitimately
+        # have no compressor, and _switch_model_runtime() does not necessarily
+        # create one before the staged snapshot is captured.
+        candidate.context_compressor = (
+            copy.copy(compressor) if compressor is not None else None
+        )
+        candidate._session_db = None
+        candidate.session_id = None
+        _switch_model_runtime(
+            candidate, new_model, new_provider, api_key, base_url, api_mode
+        )
+        snapshot = capture_model_switch_snapshot(candidate)
+        candidate_runtime.update(snapshot.runtime)
+        candidate_runtime["context_compressor"] = candidate.context_compressor
+        return getattr(candidate, "client", None)
+
+    from agent.prompt_profiles.transaction import capture_model_switch_snapshot
+
+    prepared = prepare_model_switch(
+        agent,
+        model=new_model,
+        provider=new_provider,
+        api_key=api_key,
+        base_url=base_url,
+        api_mode=api_mode,
+        messages=tuple(
+            messages if messages is not None
+            else (getattr(agent, "conversation_history", ()) or ())
+        ),
+        tools=tuple(getattr(agent, "tools", ()) or ()),
+        # Bare compatibility agents used by existing callers do not own the
+        # system-prompt lifecycle. Full AIAgent instances always expose this
+        # flag and therefore take the fail-closed profile path.
+        enforce_profile=hasattr(agent, "load_soul_identity"),
+        candidate_client_factory=_build_candidate_client,
+        runtime_updates=candidate_runtime,
+        durable_mutations=durable_mutations,
+        requested_output_tokens=max(
+            value for value in (
+                requested_output_tokens,
+                getattr(agent, "max_tokens", None),
+                getattr(getattr(agent, "context_compressor", None), "max_tokens", None),
+                getattr(agent, "_ephemeral_max_output_tokens", None),
+                0,
+            ) if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        ),
+    )
+    result = commit_model_switch(agent, prepared)
+    # A successful model/provider switch is the documented recovery path for a
+    # latched stale-stream breaker.  Reset only after the complete transaction
+    # (including durable mutations) commits; a failed prepare/commit therefore
+    # leaves the old provider's streak intact.
+    agent._consecutive_stale_streams = 0
+    return result
 
 
 def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,

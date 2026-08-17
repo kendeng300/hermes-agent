@@ -17,6 +17,8 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import logging
 import os
 import random
@@ -319,6 +321,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
                     stored_state = "empty"
                 else:
                     stored_prompt = raw_prompt
+                    agent._persisted_system_prompt_sha256 = session_row.get("system_prompt_sha256")
                     stored_state = "present"
         except Exception as exc:
             logger.warning(
@@ -425,7 +428,15 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted Model/Provider lines are stale."""
+    """Require route plus complete canonical profile identity for reuse."""
+    trusted_digest = getattr(agent, "_persisted_system_prompt_sha256", None)
+    identity = getattr(agent, "_prompt_profile", None)
+    if isinstance(identity, (tuple, list)) and len(identity) >= 6:
+        if not isinstance(trusted_digest, str) or len(trusted_digest) != 64:
+            return False
+        actual_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(str(trusted_digest), actual_digest):
+            return False
 
     def line_value(label: str) -> str:
         prefix = f"{label}:"
@@ -444,6 +455,18 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     current_provider = str(getattr(agent, "provider", "") or "").strip()
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
+
+    if isinstance(identity, (tuple, list)) and len(identity) >= 6:
+        expected = {
+            "Profile-ID": str(identity[2]),
+            "Canonical-Core-SHA256": str(identity[3]),
+            "Adapter-SHA256": str(identity[4]),
+            "Stable-Render-SHA256": str(identity[5]),
+        }
+        if len(identity) >= 7:
+            expected["Full-Prompt-SHA256"] = str(identity[6])
+        if any(line_value(label) != value for label, value in expected.items()):
+            return False
 
     return True
 

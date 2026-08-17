@@ -42,12 +42,12 @@ def _make_fake_agent():
     ["codex_responses", "anthropic_messages", "chat_completions", ""],
 )
 def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
-    """Switching to provider=moa must force api_mode=chat_completions.
+    """A failed staged MoA switch must leave the live runtime unchanged.
 
-    No matter what transport the resolver/aggregator implies for the preset,
-    the outer agent.api_mode must end up chat_completions so the conversation
-    loop dispatches through the MoAClient chat.completions facade rather than
-    .responses.create against the moa://local placeholder.
+    These compatibility agents intentionally fail late in candidate
+    preparation.  The transactional switch contract stages the MoA facade and
+    chat-completions mode on an isolated candidate, so preparation failure must
+    no longer expose the old partial-mutation behavior on the live agent.
     """
     from agent import agent_runtime_helpers as arh
 
@@ -57,6 +57,7 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
     monkeypatch.setattr(arh, "load_pool", lambda *a, **k: None, raising=False)
 
     agent = _make_fake_agent()
+    old = (agent.provider, agent.model, agent.base_url, agent.api_mode, agent.client)
     try:
         arh.switch_model(
             agent,
@@ -67,18 +68,7 @@ def test_switch_to_moa_pins_chat_completions(monkeypatch, incoming_api_mode):
             api_mode=incoming_api_mode,
         )
     except Exception:
-        # switch_model does post-swap work (compressor, pool, runtime) that may
-        # raise against a fake agent. The runtime-field swap — including the
-        # api_mode pin in the moa branch — happens before any of that, so the
-        # invariant we care about is already set even if a later step blew up.
+        # Expected for this deliberately incomplete compatibility agent.
         pass
 
-    assert agent.provider == "moa"
-    assert agent.base_url == "moa://local"
-    assert agent.api_mode == "chat_completions", (
-        f"MoA switch left api_mode={agent.api_mode!r}; the primary call would "
-        "dispatch .responses.create / anthropic_messages against moa://local "
-        "instead of MoAClient.chat.completions (issue #54259)."
-    )
-    # The MoAClient facade should be installed as the client.
-    assert type(agent.client).__name__ == "MoAClient"
+    assert (agent.provider, agent.model, agent.base_url, agent.api_mode, agent.client) == old

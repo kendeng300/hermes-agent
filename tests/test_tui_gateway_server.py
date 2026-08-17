@@ -3539,8 +3539,10 @@ def test_config_set_model_requires_confirmation_for_expensive_model(monkeypatch)
         api_key = "sk-or"
         switched = False
 
-        def switch_model(self, **_kwargs):
+        def switch_model(self, **kwargs):
             self.switched = True
+            for mutation in kwargs.get("durable_mutations", ()):
+                mutation.apply()
 
     result = types.SimpleNamespace(
         success=True,
@@ -3607,6 +3609,8 @@ def test_config_set_model_global_persists(monkeypatch):
         api_key = "sk-old"
 
         def switch_model(self, **kwargs):
+            for mutation in kwargs.get("durable_mutations", ()):
+                mutation.apply()
             return None
 
     result = types.SimpleNamespace(
@@ -3757,7 +3761,9 @@ def test_config_set_model_does_not_leak_inference_provider_env(monkeypatch):
         base_url = ""
         api_key = "sk-or"
 
-        def switch_model(self, **_kwargs):
+        def switch_model(self, **kwargs):
+            for mutation in kwargs.get("durable_mutations", ()):
+                mutation.apply()
             return None
 
     result = types.SimpleNamespace(
@@ -3817,7 +3823,9 @@ def test_config_set_model_records_per_session_override_not_env(monkeypatch):
         base_url = ""
         api_key = "sk-or"
 
-        def switch_model(self, **_kwargs):
+        def switch_model(self, **kwargs):
+            for mutation in kwargs.get("durable_mutations", ()):
+                mutation.apply()
             return None
 
     result = types.SimpleNamespace(
@@ -3887,6 +3895,8 @@ def test_config_set_model_switches_agent_without_touching_env(monkeypatch):
         def switch_model(self, **kwargs):
             self.model = kwargs["new_model"]
             self.provider = kwargs["new_provider"]
+            for mutation in kwargs.get("durable_mutations", ()):
+                mutation.apply()
 
         def _build_system_prompt(self, _system_message=None):
             return f"Model: {self.model}\nProvider: {self.provider}"
@@ -6690,7 +6700,11 @@ def test_session_most_recent_handles_db_unavailable(monkeypatch):
 # ── verification.status ──────────────────────────────────────────────
 
 
-def test_verification_status_returns_recorded_evidence(tmp_path):
+def test_verification_status_returns_recorded_evidence(monkeypatch, tmp_path):
+    # The mechanical runner intentionally places basetemp below ~/.hermes/tmp.
+    # Isolate this marker-only project from that ancestor repository so the
+    # fixture exercises its own package.json/pnpm contract in every runner.
+    monkeypatch.setattr("agent.coding_context._git_root", lambda _cwd: None)
     home = tmp_path / ".hermes"
     home.mkdir()
     token = set_hermes_home_override(home)
