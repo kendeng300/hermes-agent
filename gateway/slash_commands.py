@@ -16,6 +16,7 @@ call time (run.py fully loaded by then), avoiding an import cycle.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
 import dataclasses
 import hashlib
@@ -39,6 +40,7 @@ from gateway.session import (
     SessionSource,
     build_session_key,
     is_shared_multi_user_session,
+    sanitize_model_override,
 )
 from hermes_cli.config import atomic_config_write, cfg_get, clear_model_endpoint_credentials
 from utils import (
@@ -54,6 +56,204 @@ logger = logging.getLogger("gateway.run")
 # past this the reset proceeds and the cleanup is left to finish (or leak) in
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
+_MODEL_PREFLIGHT_DEADLINE_S = 20.0
+_MODEL_EXECUTOR_POLL_S = 0.01
+
+
+class DurableAwaitableContractError(RuntimeError):
+    """A durable callback returned an awaitable the worker cannot own safely."""
+
+
+class DurableWorkerCleanupError(RuntimeError):
+    """A worker-owned durable coroutine could not be cleaned up completely."""
+
+    def __init__(
+        self,
+        failures,
+        *,
+        main_error=None,
+        main_traceback=None,
+        loop_contexts=(),
+    ):
+        self.failures = tuple(
+            (phase, type(exc).__name__) for phase, exc in failures
+        )
+        self.main_error = main_error
+        self.main_traceback = main_traceback
+        self.loop_contexts = tuple(loop_contexts)
+        details = "; ".join(
+            f"{phase}: {error_type}" for phase, error_type in self.failures
+        )
+        super().__init__(f"durable worker cleanup failed ({details})")
+
+
+class GatewayExecutorUnavailable(RuntimeError):
+    """The runner-owned executor cannot admit new gateway work."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _GatewayBlockingOutcome:
+    """Tagged result that separates callable failures from executor failures."""
+
+    value: Any = None
+    error: BaseException | None = None
+    traceback: Any = None
+
+
+def _complete_worker_owned_durable_result(result_value: Any) -> None:
+    """Complete only a true coroutine on the transaction worker.
+
+    Futures and Tasks are bound to their creating loop; moving them here is
+    invalid, while synchronously waiting on the gateway loop can deadlock when
+    that coroutine needs the same executor.  True coroutines receive a private
+    loop whose task, async-generator, and default-executor lifecycles are owned
+    and synchronously drained here.  Custom awaitables have no mechanically
+    knowable ownership contract.  Production facades are unwrapped to
+    synchronous stores before this seam, so unsupported values fail the switch
+    transaction before authority commit.
+    """
+    if inspect.iscoroutine(result_value):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            result_value.close()
+            raise DurableAwaitableContractError(
+                "durable coroutine completion requires a worker without a running loop"
+            )
+
+        loop = None
+        loop_bound = False
+        main_task = None
+        main_error = None
+        main_traceback = None
+        cleanup_failures = []
+        loop_contexts = []
+        try:
+            loop = asyncio.new_event_loop()
+            previous_exception_handler = loop.get_exception_handler()
+
+            def _capture_loop_exception(handler_loop, context):
+                captured = dict(context)
+                loop_contexts.append(captured)
+                exception = captured.get("exception")
+                if not isinstance(exception, BaseException):
+                    exception = RuntimeError(
+                        str(captured.get("message") or "private loop exception")
+                    )
+                if not isinstance(exception, asyncio.CancelledError):
+                    cleanup_failures.append(("loop exception", exception))
+                try:
+                    if previous_exception_handler is not None:
+                        previous_exception_handler(handler_loop, context)
+                    else:
+                        handler_loop.default_exception_handler(context)
+                except BaseException as exc:
+                    cleanup_failures.append(("loop exception handler", exc))
+
+            loop.set_exception_handler(_capture_loop_exception)
+            asyncio.set_event_loop(loop)
+            loop_bound = True
+            try:
+                main_task = loop.create_task(result_value)
+            except BaseException:
+                result_value.close()
+                raise
+            try:
+                loop.run_until_complete(main_task)
+            except BaseException as exc:
+                main_error = exc
+                main_traceback = exc.__traceback__
+        except BaseException as exc:
+            if main_error is None:
+                if main_task is None:
+                    result_value.close()
+                main_error = exc
+                main_traceback = exc.__traceback__
+        finally:
+            if loop is not None:
+                # A cleanup phase must never prevent the later phases from
+                # reclaiming their independent authority surfaces.
+                try:
+                    pending = tuple(
+                        task for task in asyncio.all_tasks(loop)
+                        if not task.done()
+                    )
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        results = loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                        for result in results:
+                            if (
+                                isinstance(result, BaseException)
+                                and not isinstance(result, asyncio.CancelledError)
+                            ):
+                                cleanup_failures.append(("pending task", result))
+                except BaseException as exc:
+                    cleanup_failures.append(("pending tasks", exc))
+
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except BaseException as exc:
+                    cleanup_failures.append(("async generators", exc))
+
+                executor = getattr(loop, "_default_executor", None)
+                loop._default_executor = None
+                loop._executor_shutdown_called = True
+                if executor is not None:
+                    try:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    except BaseException as exc:
+                        cleanup_failures.append(("default executor", exc))
+
+                if loop_bound:
+                    try:
+                        asyncio.set_event_loop(None)
+                    except BaseException as exc:
+                        cleanup_failures.append(("current loop", exc))
+                try:
+                    loop.close()
+                except BaseException as exc:
+                    cleanup_failures.append(("event loop", exc))
+
+        cleanup_error = (
+            DurableWorkerCleanupError(
+                cleanup_failures,
+                main_error=main_error,
+                main_traceback=main_traceback,
+                loop_contexts=loop_contexts,
+            )
+            if cleanup_failures
+            else None
+        )
+        if cleanup_error is not None:
+            if main_error is not None:
+                logger.error(
+                    "Durable coroutine cleanup failed after its main outcome",
+                    exc_info=(
+                        type(main_error),
+                        main_error,
+                        main_traceback,
+                    ),
+                )
+                raise cleanup_error from main_error.with_traceback(main_traceback)
+            raise cleanup_error
+        if main_error is not None:
+            raise main_error.with_traceback(main_traceback)
+        return
+    if isinstance(result_value, asyncio.Future):
+        owner = result_value.get_loop()
+        state = "running" if owner.is_running() else "stopped"
+        raise DurableAwaitableContractError(
+            f"durable callback returned a loop-bound Future/Task ({state} owner)"
+        )
+    if inspect.isawaitable(result_value):
+        raise DurableAwaitableContractError(
+            "durable callback returned an unsupported custom awaitable"
+        )
 
 
 def _model_switch_skew_guard() -> Optional[str]:
@@ -89,6 +289,172 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+
+    async def _run_model_blocking(
+        self,
+        func,
+        /,
+        *args,
+        _deadline_seconds: Optional[float] = _MODEL_PREFLIGHT_DEADLINE_S,
+        **kwargs,
+    ):
+        """Run model-command blocking work only on the runner-owned executor.
+
+        The tagged outcome keeps an exception raised *by* ``func`` distinct
+        from failure to acquire or submit to the gateway executor.  The latter
+        is a lifecycle/admission failure and must abort a model switch without
+        falling back to asyncio's process-global default executor.  Polling the
+        concurrent Future directly avoids the run_in_executor/wrap_future
+        delivery bridge while keeping the event loop responsive.  The default
+        20-second deadline bounds queued admission and result acceptance;
+        running work is drained, while mutation callers pass no deadline.
+        """
+        submit_owned = getattr(self, "_submit_in_executor_with_context", None)
+        if not callable(submit_owned):
+            raise GatewayExecutorUnavailable(
+                "gateway-owned executor submit helper is unavailable"
+            )
+
+        def _invoke() -> _GatewayBlockingOutcome:
+            try:
+                return _GatewayBlockingOutcome(value=func(*args, **kwargs))
+            except BaseException as exc:
+                return _GatewayBlockingOutcome(
+                    error=exc,
+                    traceback=exc.__traceback__,
+                )
+
+        try:
+            future = submit_owned(_invoke)
+        except Exception as exc:
+            raise GatewayExecutorUnavailable(
+                "gateway-owned executor rejected model-command work"
+            ) from exc
+
+        if not isinstance(future, concurrent.futures.Future):
+            raise GatewayExecutorUnavailable(
+                "gateway-owned executor returned an invalid submission"
+            )
+
+        absolute_deadline = (
+            time.monotonic() + _deadline_seconds
+            if _deadline_seconds is not None
+            else None
+        )
+        cancellation_requested = False
+        deadline_expired = False
+        while not future.done():
+            if (
+                absolute_deadline is not None
+                and time.monotonic() >= absolute_deadline
+            ):
+                # Completion wins the boundary race.  Otherwise cancel queued
+                # work; a running callable cannot be abandoned and is drained
+                # before the stable not-applied result is returned.
+                if future.done():
+                    break
+                deadline_expired = True
+                absolute_deadline = None
+                if future.cancel():
+                    raise GatewayExecutorUnavailable(
+                        "gateway-owned model-command work exceeded its deadline"
+                    )
+            try:
+                await asyncio.sleep(_MODEL_EXECUTOR_POLL_S)
+            except asyncio.CancelledError:
+                if future.done():
+                    cancellation_requested = True
+                    break
+                if future.cancel():
+                    raise
+                # The callable is running.  Repeated cancellation is deferred
+                # while it drains so no worker can mutate authority after this
+                # coroutine returns.
+                cancellation_requested = True
+
+        try:
+            outcome = future.result()
+        except BaseException as exc:
+            if cancellation_requested:
+                raise asyncio.CancelledError() from exc
+            if isinstance(exc, concurrent.futures.CancelledError):
+                raise GatewayExecutorUnavailable(
+                    "gateway-owned model-command work was cancelled before start"
+                ) from exc
+            if isinstance(exc, Exception):
+                # Callable exceptions are returned inside the tagged outcome.
+                # An ordinary exception raised by Future.result() therefore
+                # belongs to the executor/context transport boundary.
+                raise GatewayExecutorUnavailable(
+                    "gateway-owned executor failed to deliver model-command work"
+                ) from exc
+            raise
+
+        # Once cancellation has been recorded, draining/consuming the worker
+        # is cleanup only.  Cancellation is terminal and wins over a coincident
+        # deadline, invalid outcome, or callable error.
+        if cancellation_requested:
+            cause = (
+                outcome.error
+                if isinstance(outcome, _GatewayBlockingOutcome)
+                else None
+            )
+            raise asyncio.CancelledError() from cause
+        if deadline_expired:
+            raise GatewayExecutorUnavailable(
+                "gateway-owned model-command work exceeded its deadline"
+            )
+
+        if not isinstance(outcome, _GatewayBlockingOutcome):
+            raise GatewayExecutorUnavailable(
+                "gateway-owned executor returned an invalid model-command outcome"
+            )
+        if outcome.error is not None:
+            raise outcome.error.with_traceback(outcome.traceback)
+        return outcome.value
+
+    async def _run_model_transaction_barrier(self, transaction):
+        """Defer outer cancellation through a complete model transaction."""
+        task = asyncio.create_task(transaction)
+        cancellation_requested = False
+        transaction_failure = None
+        transaction_result = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done() and task.cancelled():
+                    raise
+                cancellation_requested = True
+            except BaseException as exc:
+                transaction_failure = exc
+                break
+        if transaction_failure is None and task.done() and not task.cancelled():
+            try:
+                transaction_result = task.result()
+            except BaseException as exc:
+                transaction_failure = exc
+        if cancellation_requested:
+            if transaction_failure is not None:
+                logger.error(
+                    "Model transaction failed while outer cancellation was deferred",
+                    exc_info=(
+                        type(transaction_failure),
+                        transaction_failure,
+                        transaction_failure.__traceback__,
+                    ),
+                )
+            raise asyncio.CancelledError() from transaction_failure
+        if transaction_failure is not None:
+            raise transaction_failure.with_traceback(transaction_failure.__traceback__)
+        return transaction_result
+
+    @staticmethod
+    def _model_executor_unavailable_message() -> str:
+        return t(
+            "gateway.model.error_prefix",
+            error="Gateway executor unavailable; model switch was not applied.",
+        )
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1401,6 +1767,29 @@ class GatewaySlashCommandsMixin:
         )
 
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
+        """Enter the routed profile for the complete /model transaction.
+
+        The dispatch-level scope protects multiplexed traffic, but this method
+        is also a public compatibility entry point and is used by the
+        single-profile gateway.  Scoping here binds config, session state,
+        SOUL admission, persistence, and compensation to one profile.
+        """
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+
+        resolver = getattr(self, "_resolve_profile_home_for_source", None)
+        try:
+            profile_home = resolver(event.source) if resolver else get_hermes_home()
+        except Exception:
+            profile_home = get_hermes_home()
+        with _profile_runtime_scope(profile_home):
+            return await GatewaySlashCommandsMixin._handle_model_command_scoped(
+                self, event,
+            )
+
+    async def _handle_model_command_scoped(
+        self, event: MessageEvent,
+    ) -> Optional[str]:
         """Handle /model command — switch model.
 
         Supports:
@@ -1411,7 +1800,8 @@ class GatewaySlashCommandsMixin:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import _load_gateway_config
+        from hermes_constants import get_hermes_home
         import yaml
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_flags,
@@ -1448,7 +1838,6 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
-        config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
             if cfg:
@@ -1472,7 +1861,12 @@ class GatewaySlashCommandsMixin:
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
-        source = await asyncio.to_thread(self._normalize_source_for_session_key, source)
+        try:
+            source = await self._run_model_blocking(
+                self._normalize_source_for_session_key, source,
+            )
+        except GatewayExecutorUnavailable:
+            return self._model_executor_unavailable_message()
         session_key = self._session_key_for_source(source)
         override = self._session_model_overrides.get(session_key, {})
         if override:
@@ -1495,7 +1889,7 @@ class GatewaySlashCommandsMixin:
                     # Offload blocking provider-listing (can fall through to a
                     # synchronous urllib HTTP fetch on a stale cache) off the
                     # event loop so the gateway doesn't freeze. See #41289.
-                    providers = await asyncio.to_thread(
+                    providers = await self._run_model_blocking(
                         list_picker_providers,
                         current_provider=current_provider,
                         current_base_url=current_base_url,
@@ -1505,6 +1899,8 @@ class GatewaySlashCommandsMixin:
                         max_models=50,
                         include_moa=True,
                     )
+                except GatewayExecutorUnavailable:
+                    return self._model_executor_unavailable_message()
                 except Exception:
                     providers = []
 
@@ -1518,7 +1914,7 @@ class GatewaySlashCommandsMixin:
                     _cur_base_url = current_base_url
                     _cur_api_key = current_api_key
 
-                    async def _on_model_selected(
+                    async def _on_model_selected_scoped(
                         _chat_id: str, model_id: str, provider_slug: str
                     ) -> str:
                         """Perform the model switch and return confirmation text."""
@@ -1529,18 +1925,21 @@ class GatewaySlashCommandsMixin:
                         # can fall through to a synchronous models.dev HTTP fetch
                         # (requests.get, 15s timeout) on a cold/expired cache,
                         # which freezes the gateway otherwise. See #20525, #41289.
-                        result = await asyncio.to_thread(
-                            _switch_model,
-                            raw_input=model_id,
-                            current_provider=_cur_provider,
-                            current_model=_cur_model,
-                            current_base_url=_cur_base_url,
-                            current_api_key=_cur_api_key,
-                            is_global=persist_global,
-                            explicit_provider=provider_slug,
-                            user_providers=user_provs,
-                            custom_providers=custom_provs,
-                        )
+                        try:
+                            result = await _self._run_model_blocking(
+                                _switch_model,
+                                raw_input=model_id,
+                                current_provider=_cur_provider,
+                                current_model=_cur_model,
+                                current_base_url=_cur_base_url,
+                                current_api_key=_cur_api_key,
+                                is_global=persist_global,
+                                explicit_provider=provider_slug,
+                                user_providers=user_provs,
+                                custom_providers=custom_provs,
+                            )
+                        except GatewayExecutorUnavailable:
+                            return _self._model_executor_unavailable_message()
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
 
@@ -1560,7 +1959,231 @@ class GatewaySlashCommandsMixin:
                         except Exception as exc:
                             logger.debug("preflight-compression switch warning failed: %s", exc)
 
-                        # Update cached agent in-place
+                        from agent.prompt_profiles.transaction import DurableMutation
+
+                        # Resolve the real synchronous backing store before any
+                        # authority mutation.  A bare async facade or missing
+                        # store cannot provide an atomic picker transaction.
+                        session_store = getattr(_self, "session_store", None)
+                        if session_store is None:
+                            return _self._model_executor_unavailable_message()
+                        try:
+                            sess_entry = await _self._run_model_blocking(
+                                session_store.get_or_create_session,
+                                event.source,
+                            )
+                            old_cfg = copy.deepcopy(
+                                await _self._run_model_blocking(
+                                    _load_gateway_config,
+                                )
+                            )
+                            if not isinstance(old_cfg, dict):
+                                raise TypeError("gateway config is not a mapping")
+                        except GatewayExecutorUnavailable:
+                            return _self._model_executor_unavailable_message()
+                        except Exception as exc:
+                            return t(
+                                "gateway.model.error_prefix",
+                                error=(
+                                    "Unable to prepare model switch state "
+                                    f"({exc}); model switch was not applied."
+                                ),
+                            )
+
+                        async_db = getattr(_self, "_session_db", None)
+                        session_db = getattr(async_db, "_db", None)
+                        if session_db is None:
+                            session_db = async_db
+                        if session_db is None:
+                            session_db = getattr(session_store, "_db", None)
+                        old_override = copy.deepcopy(
+                            _self._session_model_overrides.get(_session_key)
+                        )
+                        note_missing = object()
+                        notes_mapping_missing = not hasattr(
+                            _self, "_pending_model_notes"
+                        )
+                        raw_old_note = getattr(
+                            _self, "_pending_model_notes", {}
+                        ).get(_session_key, note_missing)
+                        old_note = (
+                            note_missing
+                            if raw_old_note is note_missing
+                            else copy.deepcopy(raw_old_note)
+                        )
+                        old_session_model = getattr(sess_entry, "model", None)
+                        old_effective_model = (
+                            (old_override or {}).get("model")
+                            or old_session_model
+                            or _cur_model
+                        )
+                        new_override = {
+                            "model": result.new_model,
+                            "provider": result.target_provider,
+                            "api_key": result.api_key,
+                            "base_url": result.base_url,
+                            "api_mode": result.api_mode,
+                        }
+                        persisted_new_override = sanitize_model_override(new_override)
+                        persisted_old_override = sanitize_model_override(old_override)
+                        mutation_state = {"applied": False, "attempted": []}
+                        new_note = (
+                            f"[Note: model was just switched from {old_effective_model} "
+                            f"to {result.new_model} via "
+                            f"{result.provider_label or result.target_provider}. "
+                            "Adjust your self-identification accordingly.]"
+                        )
+
+                        new_cfg = copy.deepcopy(old_cfg)
+                        if persist_global:
+                            raw_model = new_cfg.get("model")
+                            if isinstance(raw_model, dict):
+                                model_cfg = raw_model
+                            elif isinstance(raw_model, str) and raw_model.strip():
+                                model_cfg = {"default": raw_model.strip()}
+                                new_cfg["model"] = model_cfg
+                            else:
+                                model_cfg = {}
+                                new_cfg["model"] = model_cfg
+                            model_cfg["default"] = result.new_model
+                            model_cfg["provider"] = result.target_provider
+                            if result.base_url:
+                                model_cfg["base_url"] = result.base_url
+                            if str(result.target_provider or "").strip().lower() != "custom":
+                                clear_model_endpoint_credentials(
+                                    model_cfg, clear_base_url=True
+                                )
+
+                        def _complete_durable_call(target, method_name, *call_args):
+                            if target is None:
+                                return
+                            value = getattr(target, method_name)(*call_args)
+                            _complete_worker_owned_durable_result(value)
+
+                        def _apply_picker_state():
+                            # Dirty from the first attempted authority write;
+                            # only a complete compensation may clear this.
+                            mutation_state["applied"] = True
+                            if sess_entry is not None and session_db is not None:
+                                mutation_state["attempted"].append("session_db")
+                                _complete_durable_call(
+                                    session_db,
+                                    "update_session_model",
+                                    sess_entry.session_id,
+                                    result.new_model,
+                                )
+                            if sess_entry is not None:
+                                mutation_state["attempted"].append("session_entry")
+                                sess_entry.model = result.new_model
+                            mutation_state["attempted"].append("session_store")
+                            _complete_durable_call(
+                                session_store,
+                                "set_model_override",
+                                _session_key,
+                                persisted_new_override,
+                            )
+                            mutation_state["attempted"].append("pending_note")
+                            if not hasattr(_self, "_pending_model_notes"):
+                                _self._pending_model_notes = {}
+                            _self._pending_model_notes[_session_key] = new_note
+                            mutation_state["attempted"].append("memory_override")
+                            _self._session_model_overrides[_session_key] = new_override
+                            if persist_global:
+                                from hermes_cli.config import save_config
+                                mutation_state["attempted"].append("config")
+                                save_config(new_cfg)
+
+                        def _compensate_picker_state():
+                            failures = []
+
+                            def _restore(label, callback):
+                                try:
+                                    callback()
+                                except Exception as exc:
+                                    failures.append(f"{label}: {type(exc).__name__}")
+
+                            for surface in reversed(
+                                tuple(mutation_state["attempted"])
+                            ):
+                                if surface == "config":
+                                    from hermes_cli.config import save_config
+                                    _restore("config", lambda: save_config(old_cfg))
+                                elif surface == "memory_override":
+                                    def _restore_memory_override():
+                                        if old_override is None:
+                                            _self._session_model_overrides.pop(
+                                                _session_key, None
+                                            )
+                                        else:
+                                            _self._session_model_overrides[
+                                                _session_key
+                                            ] = old_override
+                                    _restore(
+                                        "memory override",
+                                        _restore_memory_override,
+                                    )
+                                elif surface == "pending_note":
+                                    def _restore_pending_note():
+                                        if old_note is note_missing:
+                                            notes = getattr(
+                                                _self, "_pending_model_notes", {}
+                                            )
+                                            notes.pop(_session_key, None)
+                                            if notes_mapping_missing and not notes:
+                                                delattr(
+                                                    _self, "_pending_model_notes"
+                                                )
+                                        else:
+                                            _self._pending_model_notes[
+                                                _session_key
+                                            ] = old_note
+                                    _restore("pending note", _restore_pending_note)
+                                elif surface == "session_store":
+                                    _restore(
+                                        "session override",
+                                        lambda: _complete_durable_call(
+                                            session_store,
+                                            "set_model_override",
+                                            _session_key,
+                                            persisted_old_override or None,
+                                        ),
+                                    )
+                                elif surface == "session_entry":
+                                    _restore(
+                                        "session entry",
+                                        lambda: setattr(
+                                            sess_entry,
+                                            "model",
+                                            old_session_model,
+                                        ),
+                                    )
+                                elif surface == "session_db":
+                                    _restore(
+                                        "session model",
+                                        lambda: _complete_durable_call(
+                                            session_db,
+                                            "update_session_model",
+                                            sess_entry.session_id,
+                                            old_session_model,
+                                        ),
+                                    )
+                            if failures:
+                                raise RuntimeError(
+                                    "picker compensation incomplete: "
+                                    + "; ".join(failures)
+                                )
+                            mutation_state["attempted"].clear()
+                            mutation_state["applied"] = False
+
+                        picker_mutation = DurableMutation(
+                            _apply_picker_state,
+                            _compensate_picker_state,
+                            "gateway picker DB/session/config persistence",
+                        )
+
+                        # Update cached agent in-place.  Its model transaction
+                        # owns the exact same durable mutation, so a late agent
+                        # failure compensates every picker authority surface.
                         cached_entry = None
                         _cache_lock = getattr(_self, "_agent_cache_lock", None)
                         _cache = getattr(_self, "_agent_cache", None)
@@ -1568,118 +2191,115 @@ class GatewaySlashCommandsMixin:
                             with _cache_lock:
                                 cached_entry = _cache.get(_session_key)
                         if cached_entry and cached_entry[0] is not None:
+                            cached_agent = cached_entry[0]
+                            version_missing = object()
+                            old_profile_version = getattr(
+                                cached_agent,
+                                "_prompt_profile_state_version",
+                                version_missing,
+                            )
                             try:
-                                cached_entry[0].switch_model(
+                                await _self._run_model_blocking(
+                                    cached_agent.switch_model,
+                                    _deadline_seconds=None,
                                     new_model=result.new_model,
                                     new_provider=result.target_provider,
                                     api_key=result.api_key,
                                     base_url=result.base_url,
                                     api_mode=result.api_mode,
                                     messages=tuple(
-                                        getattr(cached_entry[0], "conversation_history", ()) or ()
+                                        getattr(cached_agent, "conversation_history", ()) or ()
                                     ),
+                                    durable_mutations=(picker_mutation,),
                                 )
+                            except GatewayExecutorUnavailable:
+                                return _self._model_executor_unavailable_message()
                             except Exception as exc:
-                                # The in-place swap rolled the agent back to the
-                                # OLD working model/client and re-raised.  Abort
-                                # the rest of the commit: do NOT persist the
-                                # failed model to the DB, do NOT set a session
-                                # override pointing at the broken model, and do
-                                # NOT evict the working cached agent.  Otherwise
-                                # the next message rebuilds a dead agent from the
-                                # broken override and the conversation is lost
-                                # (#50163).  A failed switch must be a no-op.
+                                new_profile_version = getattr(
+                                    cached_agent,
+                                    "_prompt_profile_state_version",
+                                    version_missing,
+                                )
                                 logger.warning(
                                     "Picker model switch failed for cached agent: %s", exc
                                 )
+                                if mutation_state["applied"]:
+                                    _self._evict_cached_agent(_session_key)
+                                    if (
+                                        old_profile_version is not version_missing
+                                        and new_profile_version is not version_missing
+                                        and new_profile_version != old_profile_version
+                                    ):
+                                        return t(
+                                            "gateway.model.error_prefix",
+                                            error=(
+                                                f"Model switch to {result.new_model} committed, "
+                                                f"but cleanup is pending ({exc})."
+                                            ),
+                                        )
+                                    return t(
+                                        "gateway.model.error_prefix",
+                                        error=(
+                                            f"Model switch outcome for {result.new_model} "
+                                            f"is ambiguous; recovery is required ({exc})."
+                                        ),
+                                    )
                                 return t(
                                     "gateway.model.error_prefix",
                                     error=(
                                         f"Model switch to {result.new_model} failed ({exc}); "
-                                        f"staying on {_cur_model}."
+                                        f"staying on {old_effective_model}."
+                                    ),
+                                )
+                            if not mutation_state["applied"]:
+                                return t(
+                                    "gateway.model.error_prefix",
+                                    error=(
+                                        "Cached agent did not commit picker durable "
+                                        "state; model switch was not applied."
+                                    ),
+                                )
+                        else:
+                            def _apply_uncached_picker_transaction():
+                                try:
+                                    picker_mutation.apply()
+                                except BaseException as original:
+                                    try:
+                                        picker_mutation.compensate()
+                                    except Exception as compensation_exc:
+                                        raise RuntimeError(
+                                            "picker apply and compensation failed"
+                                        ) from compensation_exc
+                                    raise original
+
+                            try:
+                                await _self._run_model_blocking(
+                                    _apply_uncached_picker_transaction,
+                                    _deadline_seconds=None,
+                                )
+                            except GatewayExecutorUnavailable:
+                                return _self._model_executor_unavailable_message()
+                            except Exception as exc:
+                                if mutation_state["applied"]:
+                                    _self._evict_cached_agent(_session_key)
+                                    return t(
+                                        "gateway.model.error_prefix",
+                                        error=(
+                                            f"Model switch outcome for {result.new_model} "
+                                            f"is ambiguous; recovery is required ({exc})."
+                                        ),
+                                    )
+                                return t(
+                                    "gateway.model.error_prefix",
+                                    error=(
+                                        f"Model switch to {result.new_model} failed "
+                                        f"({exc}); staying on {old_effective_model}."
                                     ),
                                 )
 
-                        # Persist the new model to the session DB so the
-                        # dashboard shows the updated model (#34850).
-                        _sess_db = getattr(_self, "_session_db", None)
-                        if _sess_db is not None:
-                            try:
-                                _sess_entry = await _self.async_session_store.get_or_create_session(
-                                    event.source
-                                )
-                                await _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
-                                )
-
-                        # Store model note + session override
-                        if not hasattr(_self, "_pending_model_notes"):
-                            _self._pending_model_notes = {}
-                        _self._pending_model_notes[_session_key] = (
-                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
-                            f"via {result.provider_label or result.target_provider}. "
-                            f"Adjust your self-identification accordingly.]"
-                        )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
-
-                        # Write-through the non-secret parts to the session
-                        # store so the picked model survives a gateway restart
-                        # (api_key is never persisted).
-                        try:
-                            await _self.async_session_store.set_model_override(
-                                _session_key,
-                                _self._session_model_overrides[_session_key],
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Failed to persist session model override",
-                                exc_info=True,
-                            )
-
-                        # Evict cached agent so the next turn creates a fresh
-                        # agent from the override rather than relying on the
-                        # stale cache signature to trigger a rebuild.
+                        # Evict and report success only after the transaction is
+                        # durably committed across every picker authority.
                         _self._evict_cached_agent(_session_key)
-
-                        # Persist to config (default) unless --session opted out,
-                        # mirroring the text /model command path above so a picked
-                        # model survives across sessions like a typed one (#49066).
-                        if persist_global:
-                            try:
-                                if config_path.exists():
-                                    with open(config_path, encoding="utf-8") as f:
-                                        _persist_cfg = yaml.safe_load(f) or {}
-                                else:
-                                    _persist_cfg = {}
-                                _raw_model = _persist_cfg.get("model")
-                                if isinstance(_raw_model, dict):
-                                    _persist_model_cfg = _raw_model
-                                elif isinstance(_raw_model, str) and _raw_model.strip():
-                                    _persist_model_cfg = {"default": _raw_model.strip()}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                else:
-                                    _persist_model_cfg = {}
-                                    _persist_cfg["model"] = _persist_model_cfg
-                                _persist_model_cfg["default"] = result.new_model
-                                _persist_model_cfg["provider"] = result.target_provider
-                                if result.base_url:
-                                    _persist_model_cfg["base_url"] = result.base_url
-                                if str(result.target_provider or "").strip().lower() != "custom":
-                                    clear_model_endpoint_credentials(_persist_model_cfg, clear_base_url=True)
-                                from hermes_cli.config import save_config
-                                save_config(_persist_cfg)
-                            except Exception as e:
-                                logger.warning("Failed to persist model switch: %s", e)
 
                         # Build confirmation text
                         plabel = result.provider_label or result.target_provider
@@ -1720,6 +2340,41 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.session_only_hint"))
                         return "\n".join(lines)
 
+                    async def _on_model_selected(
+                        _chat_id: str, model_id: str, provider_slug: str
+                    ) -> str:
+                        # Picker callbacks run after the original `/model`
+                        # dispatch has returned, so they cannot inherit its
+                        # ContextVar token.  Re-enter the routed profile for the
+                        # complete deferred switch instead of falling back to
+                        # the gateway process's default HERMES_HOME.
+                        from gateway.run import _profile_runtime_scope
+
+                        selected_home = _self._resolve_profile_home_for_source(
+                            event.source
+                        )
+                        with _profile_runtime_scope(selected_home):
+                            picker_locks = getattr(
+                                _self, "_model_picker_locks", None
+                            )
+                            if picker_locks is None:
+                                picker_locks = {}
+                                _self._model_picker_locks = picker_locks
+                            picker_lock = picker_locks.get(_session_key)
+                            if picker_lock is None:
+                                picker_lock = asyncio.Lock()
+                                picker_locks[_session_key] = picker_lock
+
+                            async def _run_serialized_picker_switch():
+                                async with picker_lock:
+                                    return await _on_model_selected_scoped(
+                                        _chat_id, model_id, provider_slug
+                                    )
+
+                            return await _self._run_model_transaction_barrier(
+                                _run_serialized_picker_switch()
+                            )
+
                     metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     result = await adapter.send_model_picker(
                         chat_id=source.chat_id,
@@ -1740,7 +2395,7 @@ class GatewaySlashCommandsMixin:
             try:
                 # Offload blocking provider-listing off the event loop so the
                 # gateway doesn't freeze on a stale-cache HTTP fetch. See #41289.
-                providers = await asyncio.to_thread(
+                providers = await self._run_model_blocking(
                     list_authenticated_providers,
                     current_provider=current_provider,
                     current_base_url=current_base_url,
@@ -1759,6 +2414,8 @@ class GatewaySlashCommandsMixin:
                     elif p.get("api_url"):
                         lines.append(f"  `{p['api_url']}`")
                     lines.append("")
+            except GatewayExecutorUnavailable:
+                return self._model_executor_unavailable_message()
             except Exception:
                 pass
 
@@ -1775,18 +2432,21 @@ class GatewaySlashCommandsMixin:
         # through to a synchronous models.dev HTTP fetch (requests.get, 15s
         # timeout) on a cold/expired cache, which freezes the gateway
         # otherwise. See #20525, #41289.
-        result = await asyncio.to_thread(
-            _switch_model,
-            raw_input=model_input,
-            current_provider=current_provider,
-            current_model=current_model,
-            current_base_url=current_base_url,
-            current_api_key=current_api_key,
-            is_global=persist_global,
-            explicit_provider=explicit_provider,
-            user_providers=user_provs,
-            custom_providers=custom_provs,
-        )
+        try:
+            result = await self._run_model_blocking(
+                _switch_model,
+                raw_input=model_input,
+                current_provider=current_provider,
+                current_model=current_model,
+                current_base_url=current_base_url,
+                current_api_key=current_api_key,
+                is_global=persist_global,
+                explicit_provider=explicit_provider,
+                user_providers=user_provs,
+                custom_providers=custom_provs,
+            )
+        except GatewayExecutorUnavailable:
+            return self._model_executor_unavailable_message()
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
@@ -1828,32 +2488,54 @@ class GatewaySlashCommandsMixin:
             session_store = getattr(self, "session_store", None)
             if session_store is None:
                 session_store = getattr(async_session_store, "_store", None)
-            if session_store is not None:
-                sess_entry = await asyncio.to_thread(
-                    session_store.get_or_create_session, source
-                )
-            elif async_session_store is not None:
-                sess_entry = await async_session_store.get_or_create_session(source)
-            else:
-                sess_entry = None
+
+            # Resolve the cached agent before routing lookup.  A cached agent
+            # already carries the authoritative post-compression session ID;
+            # asking ``get_or_create_session`` to rediscover that route can
+            # enter stale-session recovery (and rewrite the routing index)
+            # while a switch transaction is in progress.  Reuse the public,
+            # lock-held ID lookup when possible and fall back to ordinary
+            # routing only when the cache and store do not agree.
+            cached_entry = None
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached_entry = _cache.get(session_key)
+            cached_agent = (
+                cached_entry[0]
+                if cached_entry and cached_entry[0] is not None
+                else None
+            )
+            cached_session_id = getattr(cached_agent, "session_id", None)
+
+            sess_entry = None
+            lookup_by_session_id = getattr(
+                session_store, "lookup_by_session_id", None
+            )
+            if cached_session_id and callable(lookup_by_session_id):
+                try:
+                    sess_entry = await self._run_model_blocking(
+                        lookup_by_session_id, cached_session_id
+                    )
+                except GatewayExecutorUnavailable:
+                    return self._model_executor_unavailable_message()
+            if sess_entry is None:
+                if session_store is not None:
+                    try:
+                        sess_entry = await self._run_model_blocking(
+                            session_store.get_or_create_session, source
+                        )
+                    except GatewayExecutorUnavailable:
+                        return self._model_executor_unavailable_message()
+                elif async_session_store is not None:
+                    sess_entry = await async_session_store.get_or_create_session(source)
             old_was_auto_reset = bool(getattr(sess_entry, "was_auto_reset", False))
-            gateway_loop = asyncio.get_running_loop()
-
-            async def _await_durable(result_value):
-                return await result_value
-
             def _call_durable(target, method_name, *args):
                 if target is None:
                     return
                 result_value = getattr(target, method_name)(*args)
-                if inspect.isawaitable(result_value):
-                    # Async-only compatibility facades still need to participate
-                    # in apply/compensation. Production facades are unwrapped to
-                    # their sync stores above, so this cannot self-deadlock by
-                    # scheduling another to_thread operation on the same pool.
-                    asyncio.run_coroutine_threadsafe(
-                        _await_durable(result_value), gateway_loop
-                    ).result()
+                _complete_worker_owned_durable_result(result_value)
 
             def _write_gateway_state(model, override):
                 async_db = getattr(self, "_session_db", None)
@@ -1927,27 +2609,23 @@ class GatewaySlashCommandsMixin:
                 _compensate_gateway_persistence,
                 "gateway DB/session/config persistence",
             ),)
-            # If there's a cached agent, update it in-place
-            cached_entry = None
-            _cache_lock = getattr(self, "_agent_cache_lock", None)
-            _cache = getattr(self, "_agent_cache", None)
-            if _cache_lock and _cache is not None:
-                with _cache_lock:
-                    cached_entry = _cache.get(session_key)
-
-            if cached_entry and cached_entry[0] is not None:
+            # If there's a cached agent, update it in-place.
+            if cached_agent is not None:
                 try:
-                    await asyncio.to_thread(cached_entry[0].switch_model,
+                    await self._run_model_blocking(cached_agent.switch_model,
+                        _deadline_seconds=None,
                         new_model=result.new_model,
                         new_provider=result.target_provider,
                         api_key=result.api_key,
                         base_url=result.base_url,
                         api_mode=result.api_mode,
                         messages=tuple(
-                            getattr(cached_entry[0], "conversation_history", ()) or ()
+                            getattr(cached_agent, "conversation_history", ()) or ()
                         ),
                         durable_mutations=durable_mutations,
                     )
+                except GatewayExecutorUnavailable:
+                    return self._model_executor_unavailable_message()
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
                     # model/client and re-raised.  Abort the commit: skip DB
@@ -1964,16 +2642,27 @@ class GatewaySlashCommandsMixin:
                         ),
                     )
             else:
-                try:
-                    await asyncio.to_thread(_apply_gateway_persistence)
-                except Exception as exc:
+                def _apply_uncached_transaction():
                     try:
-                        await asyncio.to_thread(_compensate_gateway_persistence)
-                    except Exception as compensation_exc:
-                        logger.error(
-                            "Uncached gateway switch compensation failed: %s",
-                            type(compensation_exc).__name__,
-                        )
+                        _apply_gateway_persistence()
+                    except BaseException:
+                        try:
+                            _compensate_gateway_persistence()
+                        except Exception as compensation_exc:
+                            logger.error(
+                                "Uncached gateway switch compensation failed: %s",
+                                type(compensation_exc).__name__,
+                            )
+                        raise
+
+                try:
+                    await self._run_model_blocking(
+                        _apply_uncached_transaction,
+                        _deadline_seconds=None,
+                    )
+                except GatewayExecutorUnavailable:
+                    return self._model_executor_unavailable_message()
+                except Exception as exc:
                     return t(
                         "gateway.model.error_prefix",
                         error=f"Model switch was not persisted ({exc}); staying on {current_model}.",
@@ -2046,7 +2735,7 @@ class GatewaySlashCommandsMixin:
         try:
             from hermes_cli.model_cost_guard import expensive_model_warning
 
-            _cost_warning = await asyncio.to_thread(
+            _cost_warning = await self._run_model_blocking(
                 expensive_model_warning,
                 result.new_model,
                 provider=result.target_provider,
@@ -2054,8 +2743,19 @@ class GatewaySlashCommandsMixin:
                 api_key=result.api_key or current_api_key or "",
                 model_info=result.model_info,
             )
-        except Exception:
-            _cost_warning = None
+        except GatewayExecutorUnavailable:
+            return self._model_executor_unavailable_message()
+        except Exception as exc:
+            logger.warning(
+                "Model cost admission failed; refusing switch: %s",
+                type(exc).__name__,
+            )
+            return t(
+                "gateway.model.error_prefix",
+                error=(
+                    "Unable to evaluate model cost; model switch was not applied."
+                ),
+            )
         if _cost_warning is not None:
             async def _on_cost_confirm(choice: str) -> str:
                 if choice == "cancel":
@@ -2066,7 +2766,9 @@ class GatewaySlashCommandsMixin:
                 # "once" and "always" both proceed — there is no persistent
                 # opt-out for the cost guard (each expensive switch should be
                 # an explicit decision).
-                return await _finish_switch()
+                return await self._run_model_transaction_barrier(
+                    _finish_switch()
+                )
 
             _p = self._typed_command_prefix_for(event.source.platform)
             return await self._request_slash_confirm(
@@ -2081,7 +2783,7 @@ class GatewaySlashCommandsMixin:
                 handler=_on_cost_confirm,
             )
 
-        return await _finish_switch()
+        return await self._run_model_transaction_barrier(_finish_switch())
 
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.

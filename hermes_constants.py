@@ -387,7 +387,9 @@ def _heal_managed_node_windows() -> bool:
         return False
 
     try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
+        from hermes_temp import current_temp_authority
+        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("bootstrap") as owned_tmp:
+            tmp_dir = owned_tmp.path
             tmp_path = Path(tmp_dir)
             zip_path = tmp_path / zip_name
             zip_path.write_bytes(zip_bytes)
@@ -742,7 +744,7 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
         seen.add(key)
         if not _is_profile_home(candidate, profile_home):
             return candidate
-    return "/tmp"
+    raise RuntimeError("unable to determine a private real user home")
 
 
 def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:

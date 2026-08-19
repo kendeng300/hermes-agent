@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import logging
 import os
-import tempfile
 import uuid
 import threading
 from datetime import datetime
@@ -38,6 +37,7 @@ from pathlib import Path
 from typing import Any, Optional, Tuple
 
 from agent.model_metadata import estimate_request_tokens_rough
+from hermes_temp import current_temp_authority
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,60 @@ COMPACTION_STATUS_MARKER = "Compacting context"
 COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
+
+
+def _continuation_model_config(agent: Any, parent_session_id: str) -> dict[str, Any]:
+    """Copy the parent's durable model-switch authority into a rotated child.
+
+    A compression rotation changes only the session identifier.  The new row
+    therefore has to begin at the exact model-switch generation that governed
+    the parent; resetting it to generation zero makes the next ``/model`` CAS
+    conflict with the still-live agent.  Validate the authority before copying
+    it so a corrupt or stale parent can never silently manufacture a child.
+    """
+    initial = getattr(agent, "_session_init_model_config", None)
+    if initial is None:
+        config: dict[str, Any] = {}
+    elif isinstance(initial, dict):
+        config = dict(initial)
+    else:
+        raise RuntimeError("SWITCH_STATE_AMBIGUOUS")
+
+    reader = getattr(getattr(agent, "_session_db", None), "get_model_switch_state", None)
+    if not callable(reader):
+        raise RuntimeError("SWITCH_STATE_AMBIGUOUS")
+    state = reader(parent_session_id)
+    if not isinstance(state, dict) or set(state) != {
+        "generation", "transaction_id", "provider", "model",
+    }:
+        raise RuntimeError("SWITCH_STATE_AMBIGUOUS")
+    generation = state.get("generation")
+    transaction_id = state.get("transaction_id")
+    provider = state.get("provider")
+    model = state.get("model")
+    malformed = (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+        or (model is not None and model != getattr(agent, "model", None))
+    )
+    if generation == 0:
+        malformed = malformed or transaction_id is not None or provider is not None
+    else:
+        malformed = malformed or any(
+            not isinstance(value, str) or not value
+            for value in (transaction_id, provider, model)
+        ) or provider != getattr(agent, "provider", None)
+    if malformed:
+        raise RuntimeError("SWITCH_STATE_AMBIGUOUS")
+    config["_switch_generation"] = generation
+    if generation:
+        config["provider"] = provider
+        config["_switch_transaction_id"] = transaction_id
+    else:
+        config.pop("provider", None)
+        config.pop("_switch_transaction_id", None)
+    return config
 
 
 def _compression_lock_holder(agent: Any) -> str:
@@ -800,11 +854,14 @@ def compress_context(
                         pass
                     agent._session_db_created = False
                     try:
+                        continuation_model_config = _continuation_model_config(
+                            agent, old_session_id
+                        )
                         agent._session_db.create_session(
                             session_id=agent.session_id,
                             source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                             model=agent.model,
-                            model_config=agent._session_init_model_config,
+                            model_config=continuation_model_config,
                             parent_session_id=old_session_id,
                         )
                     except Exception as _cs_err:
@@ -1242,23 +1299,22 @@ def try_shrink_image_parts_in_messages(
                 "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
                 "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/bmp": ".bmp",
             }.get(mime, ".jpg")
-            tmp = tempfile.NamedTemporaryFile(
-                prefix="hermes_shrink_", suffix=suffix, delete=False,
-            )
+            authority = current_temp_authority()
+            descriptor, owned_tmp = authority.mkstemp("image-shrink", suffix=suffix)
             try:
-                tmp.write(raw)
-                tmp.close()
+                with os.fdopen(descriptor, "wb") as tmp:
+                    tmp.write(raw)
                 resized = _resize_image_for_vision(
-                    Path(tmp.name),
+                    owned_tmp.path,
                     mime_type=mime,
                     max_base64_bytes=target_bytes,
                     max_dimension=max_dimension,
                 )
             finally:
                 try:
-                    Path(tmp.name).unlink(missing_ok=True)
-                except Exception:
-                    pass
+                    owned_tmp.cleanup()
+                finally:
+                    authority.close()
             if not resized:
                 # Resize returned nothing — Pillow couldn't help.
                 return None, True

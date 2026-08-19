@@ -52,6 +52,7 @@ class ManagedModalEnvironment(BaseModalExecutionEnvironment):
         persistent_filesystem: bool = True,
         task_id: str = "default",
     ):
+        self._bind_backend_temp_home("/root")
         super().__init__(cwd=cwd, timeout=timeout)
 
         self._guard_unsupported_credential_passthrough()

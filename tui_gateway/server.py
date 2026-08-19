@@ -9739,7 +9739,9 @@ def _(rid, params: dict) -> dict:
     if not raw_path and not raw_b64:
         return _err(rid, 4015, "path or content_base64 required")
 
-    with tempfile.TemporaryDirectory(prefix="pdf_attach_") as td:
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("pdf-attach") as owned_tmp:
+        td = owned_tmp.path
         td_path = Path(td)
         if raw_b64:
             pdf_bytes = _decode_attach_base64(raw_b64, mime_prefix="application/pdf")

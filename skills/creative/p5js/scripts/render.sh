@@ -47,7 +47,9 @@ done
 
 TOTAL_FRAMES=$((FPS * DURATION))
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FRAME_DIR=$(mktemp -d)
+HERMES_AGENT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+. "$HERMES_AGENT_ROOT/scripts/lib/temp-authority.sh"
+hermes_temp_dir FRAME_DIR p5js-frames
 
 echo "=== p5.js Render Pipeline ==="
 echo "Input:      $INPUT"

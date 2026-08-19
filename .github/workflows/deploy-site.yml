@@ -117,7 +117,15 @@ jobs:
           fi
 
           if [ -n "$SKILLS_INDEX_RUN_ID" ]; then
-            tmpdir="$(mktemp -d)"
+            case "${RUNNER_TEMP:?}" in /*) ;; *) exit 125 ;; esac
+            case "$RUNNER_TEMP/" in /tmp/*|/var/tmp/*|/dev/shm/*|/private/tmp/*|/private/var/tmp/*) exit 125 ;; esac
+            test -d "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP" && test -O "$RUNNER_TEMP"
+            test -z "$(find "$RUNNER_TEMP" -prune -perm /022 -print)" || exit 125
+            export HERMES_HOME="$RUNNER_TEMP/hermes-deploy-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            test ! -e "$HERMES_HOME" && mkdir -m 700 "$HERMES_HOME" || exit 125
+            . scripts/lib/temp-authority.sh
+            hermes_temp_authority_init || exit 125
+            hermes_temp_dir tmpdir skills-index || exit 125
             echo "Downloading skills-index artifact from run $SKILLS_INDEX_RUN_ID"
             if gh run download "$SKILLS_INDEX_RUN_ID" --name skills-index --dir "$tmpdir"; then
               candidate="$(find "$tmpdir" -name skills-index.json -type f | head -n 1 || true)"

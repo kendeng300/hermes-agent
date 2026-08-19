@@ -668,7 +668,9 @@ def _transcribe_command_stt(
     model = model_override or config.get("model") or ""
 
     try:
-        with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-") as tmpdir:
+        from hermes_temp import current_temp_authority
+        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("command-stt") as owned_tmp:
+            tmpdir = owned_tmp.path
             output_path = Path(tmpdir) / f"transcript.{output_format}"
             placeholders = {
                 "input_path": str(audio.resolve()),
@@ -1220,7 +1222,9 @@ def _transcribe_local_command(file_path: str, model_name: str) -> Dict[str, Any]
     normalized_model = _normalize_local_command_model(model_name)
 
     try:
-        with tempfile.TemporaryDirectory(prefix="hermes-local-stt-") as output_dir:
+        from hermes_temp import current_temp_authority
+        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("local-stt") as owned_tmp:
+            output_dir = owned_tmp.path
             prepared_input, prep_error = _prepare_local_audio(file_path, output_dir)
             if prep_error:
                 return {"success": False, "transcript": "", "error": prep_error}

@@ -1,5 +1,5 @@
 import json
-import tempfile
+import os
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,37 @@ from agent.verification_stop import (
     build_verify_on_stop_nudge,
     verify_on_stop_enabled,
 )
+from hermes_temp import current_temp_authority, resolve_temp_authority
+
+
+_TEMP_BINDING_KEYS = (
+    "HERMES_TEMP_ROOT",
+    "HERMES_TEMP_ROOT_IDENTITY",
+    "HERMES_TEMP_SCOPE",
+    "HERMES_TEMP_MANIFEST_SHA256",
+    "HERMES_TEMP_AUTHORITY_VERSION",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+)
+
+
+def _bind_test_home(monkeypatch, home: Path) -> Path:
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.chmod(0o700)
+    for name in _TEMP_BINDING_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    authority = resolve_temp_authority(
+        scope="test",
+        run_nonce=os.environ["HERMES_TEMP_RUN_NONCE"],
+    )
+    try:
+        for name, value in authority.child_environment().items():
+            monkeypatch.setenv(name, value)
+    finally:
+        authority.close()
+    return home
 
 
 def _node_project(root: Path) -> None:
@@ -25,6 +56,21 @@ def _node_project(root: Path) -> None:
 def _make_project(root: Path) -> None:
     root.mkdir()
     _node_project(root)
+
+
+def _authority_script(purpose: str):
+    authority = current_temp_authority()
+    try:
+        descriptor, owned = authority.mkstemp(purpose, suffix=".py")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write("print('ok')\n")
+        except BaseException:
+            owned.cleanup()
+            raise
+    finally:
+        authority.close()
+    return owned
 
 
 @pytest.fixture
@@ -151,7 +197,7 @@ def test_verify_on_stop_default_path_through_load_config(tmp_path, clear_verify_
     # resolves through load_config() + DEFAULT_CONFIG. The default is now the
     # surface-aware "auto" sentinel. This is the path the unit-level tests above
     # cannot exercise.
-    clear_verify_env.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(clear_verify_env, tmp_path / ".hermes")
 
     from hermes_cli.config import load_config
 
@@ -168,7 +214,7 @@ def test_verify_on_stop_default_path_through_load_config(tmp_path, clear_verify_
 
 
 def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
 
@@ -184,7 +230,7 @@ def test_no_nudge_after_fresh_pass(tmp_path, monkeypatch):
 
 
 def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     project_a = tmp_path / "a"
     project_b = tmp_path / "b"
     _make_project(project_a)
@@ -211,7 +257,7 @@ def test_nudge_checks_all_edited_workspaces(tmp_path, monkeypatch):
 
 
 def test_nudge_after_unverified_edit_with_known_command(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
     mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
@@ -226,7 +272,7 @@ def test_nudge_after_unverified_edit_with_known_command(tmp_path, monkeypatch):
 
 
 def test_nudge_includes_failed_output_summary(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
 
@@ -247,29 +293,25 @@ def test_nudge_includes_failed_output_summary(tmp_path, monkeypatch):
 
 
 def test_no_suite_nudge_requests_temp_script(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     changed = str(tmp_path / "src" / "app.ts")
 
     nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
 
     assert nudge is not None
-    assert tempfile.gettempdir() in nudge
+    assert os.environ["HERMES_TEMP_ROOT"] in nudge
     assert "ad-hoc verification" in nudge
     assert "suite green" in nudge
     assert "creative UI/visual work" in nudge
 
 
 def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     project = tmp_path / "project"
     project.mkdir()
     (project / "package.json").write_text("{}", encoding="utf-8")
-    real_temp = tmp_path / "real-temp"
-    real_temp.mkdir()
-    linked_temp = tmp_path / "linked-temp"
-    linked_temp.symlink_to(real_temp, target_is_directory=True)
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(linked_temp))
+    unrelated_temp = tmp_path / "unrelated-temp"
+    unrelated_temp.mkdir()
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(unrelated_temp))
 
     nudge = build_verify_on_stop_nudge(
         session_id="s1",
@@ -277,12 +319,12 @@ def test_no_suite_nudge_uses_canonical_temp_dir(tmp_path, monkeypatch):
     )
 
     assert nudge is not None
-    assert str(real_temp) in nudge
-    assert str(linked_temp) not in nudge
+    assert os.environ["HERMES_TEMP_ROOT"] in nudge
+    assert str(unrelated_temp) not in nudge
 
 
 def test_verify_guidance_can_be_disabled(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
 
@@ -298,11 +340,10 @@ def test_verify_guidance_can_be_disabled(tmp_path, monkeypatch):
 
 
 def test_ad_hoc_pass_satisfies_no_suite_stop_loop(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     changed = str(tmp_path / "src" / "app.ts")
-    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-stop-{tmp_path.name}.py"
-    script.write_text("print('ok')\n", encoding="utf-8")
+    owned = _authority_script("hermes-ad-hoc-stop")
+    script = owned.path
     try:
         record_terminal_result(
             command=f"python {script}",
@@ -312,13 +353,13 @@ def test_ad_hoc_pass_satisfies_no_suite_stop_loop(tmp_path, monkeypatch):
             output="ok",
         )
     finally:
-        script.unlink(missing_ok=True)
+        owned.cleanup()
 
     assert build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed]) is None
 
 
 def test_nudge_attempts_are_bounded(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     changed = str(tmp_path / "src" / "app.ts")
     mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
@@ -351,7 +392,7 @@ def test_nudge_attempts_are_bounded(tmp_path, monkeypatch):
     ],
 )
 def test_doc_only_edit_does_not_nudge(tmp_path, monkeypatch, doc_name):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     changed = str(tmp_path / doc_name)
     mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[changed])
@@ -361,7 +402,7 @@ def test_doc_only_edit_does_not_nudge(tmp_path, monkeypatch, doc_name):
 
 
 def test_mixed_doc_and_code_edit_still_nudges(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
     doc = str(tmp_path / "README.md")
     code = str(tmp_path / "src" / "app.ts")

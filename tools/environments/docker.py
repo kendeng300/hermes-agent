@@ -599,6 +599,7 @@ class DockerEnvironment(BaseEnvironment):
     ):
         if cwd == "~":
             cwd = "/root"
+        self._bind_backend_temp_home("/root")
         super().__init__(cwd=cwd, timeout=timeout)
         self._persistent = persistent_filesystem
         self._persist_across_processes = persist_across_processes

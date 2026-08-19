@@ -216,8 +216,11 @@ def _install_uv(target: Path) -> None:
 
 def _install_uv_posix(env: dict[str, str]) -> None:
     """Download + sh the POSIX installer (two-stage to avoid curl|sh pitfalls)."""
-    with tempfile.NamedTemporaryFile(suffix=".sh", delete=False) as f:
-        installer_path = f.name
+    from hermes_temp import current_temp_authority
+    temp_authority = current_temp_authority()
+    descriptor, owned_installer = temp_authority.mkstemp("uv-installer", ".sh")
+    os.close(descriptor)
+    installer_path = str(owned_installer.path)
 
     try:
         subprocess.run(
@@ -233,9 +236,9 @@ def _install_uv_posix(env: dict[str, str]) -> None:
         )
     finally:
         try:
-            os.unlink(installer_path)
-        except OSError:
-            pass
+            owned_installer.cleanup()
+        finally:
+            temp_authority.close()
 
 
 def _install_uv_windows(env: dict[str, str]) -> None:

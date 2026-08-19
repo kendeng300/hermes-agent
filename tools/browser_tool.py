@@ -1368,18 +1368,16 @@ def _allow_private_urls() -> bool:
 def _socket_safe_tmpdir() -> str:
     """Return a short temp directory path suitable for Unix domain sockets.
 
-    macOS sets ``TMPDIR`` to ``/var/folders/xx/.../T/`` (~51 chars).  When we
-    append ``agent-browser-hermes_…`` the resulting socket path exceeds the
-    104-byte macOS limit for ``AF_UNIX`` addresses, causing agent-browser to
-    fail with "Failed to create socket directory" or silent screenshot failures.
-
-    Linux ``tempfile.gettempdir()`` already returns ``/tmp``, so this is a
-    no-op there.  On macOS we bypass ``TMPDIR`` and use ``/tmp`` directly
-    (symlink to ``/private/tmp``, sticky-bit protected, always available).
+    The identity-bound Hermes authority is used on every platform. Roots too
+    long for the AF_UNIX budget fail closed instead of falling back to a shared
+    system temporary directory.
     """
-    if sys.platform == "darwin":
-        return "/tmp"
-    return tempfile.gettempdir()
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority:
+        root = str(temp_authority.root)
+    if len(os.fsencode(root)) > 72:
+        raise RuntimeError("Hermes temporary authority root is too long for browser sockets")
+    return root
 
 
 # Track active sessions per "session key".

@@ -2911,14 +2911,12 @@ def _temp_home_in_service_definition(definition: str) -> str | None:
     ``<key>HERMES_HOME</key><string>...</string>`` pairs.
     """
     import re
-    import tempfile
 
     candidates = re.findall(r'HERMES_HOME=([^"\n]+)', definition)
     candidates += re.findall(
         r"<key>HERMES_HOME</key>\s*<string>(.*?)</string>", definition, flags=re.S
     )
     temp_roots = {
-        Path(tempfile.gettempdir()).resolve(),
         Path("/tmp"),
         Path("/var/tmp"),
         Path("/private/tmp"),

@@ -302,13 +302,27 @@ class BaseEnvironment(ABC):
     _snapshot_timeout: int = 30
 
     def get_temp_dir(self) -> str:
-        """Return the backend temp directory used for session artifacts.
+        """Return the backend-owned temporary authority or fail closed."""
+        temp_dir = getattr(self, "_backend_temp_dir", None)
+        if not isinstance(temp_dir, str) or not temp_dir.startswith("/"):
+            raise RuntimeError("remote backend temporary authority is not bound")
+        return temp_dir
 
-        Most sandboxed backends use ``/tmp`` inside the target environment.
-        LocalEnvironment overrides this on platforms like Termux where ``/tmp``
-        may be missing and ``TMPDIR`` is the portable writable location.
-        """
-        return "/tmp"
+    def _bind_backend_temp_home(self, home: str) -> None:
+        """Bind session scratch to an exact remote ``$HOME/.hermes/tmp``."""
+        home = str(home or "").rstrip("/")
+        if (
+            not home.startswith("/")
+            or home == "/"
+            or any(part in {"", ".", ".."} for part in home.split("/")[1:])
+        ):
+            raise RuntimeError("remote backend HOME is not an exact absolute path")
+        self._backend_home = home
+        self._backend_temp_dir = f"{home}/.hermes/tmp"
+        self._backend_temp_identity = None
+        if hasattr(self, "_session_id"):
+            self._snapshot_path = f"{self._backend_temp_dir}/hermes-snap-{self._session_id}.sh"
+            self._cwd_file = f"{self._backend_temp_dir}/hermes-cwd-{self._session_id}.txt"
 
     def __init__(self, cwd: str, timeout: int, env: dict = None):
         self.cwd = cwd
@@ -394,8 +408,32 @@ class BaseEnvironment(ABC):
         # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
         # with ``$BASHPID`` left outside the quotes so it still expands.
         _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        _temp_dir = shlex.quote(self.get_temp_dir())
+        _expected_home = getattr(self, "_backend_home", None)
+        _authority_bootstrap = ""
+        if _expected_home is not None:
+            _authority_bootstrap = (
+                f"test \"$HOME\" = {shlex.quote(_expected_home)} || exit 125\n"
+                f"__hermes_p={shlex.quote(_expected_home)}\n"
+                f"while [ \"$__hermes_p\" != / ]; do "
+                f"test ! -L \"$__hermes_p\" || exit 125; "
+                f"__hermes_p=${{__hermes_p%/*}}; "
+                f"[ -n \"$__hermes_p\" ] || __hermes_p=/; done\n"
+                f"test -O {shlex.quote(_expected_home)} || exit 125\n"
+                f"test -z \"$(find {shlex.quote(_expected_home)} -prune -perm /022 -print)\" || exit 125\n"
+                f"install -d -m 700 {shlex.quote(_expected_home + '/.hermes')} || exit 125\n"
+                f"test ! -L {shlex.quote(_expected_home + '/.hermes')} || exit 125\n"
+                f"install -d -m 700 {_temp_dir} || exit 125\n"
+                f"chmod 700 {shlex.quote(_expected_home + '/.hermes')} {_temp_dir} || exit 125\n"
+                f"test -O {shlex.quote(_expected_home + '/.hermes')} && "
+                f"test -O {_temp_dir} && test ! -L {_temp_dir} || exit 125\n"
+                f"test \"$(find {_temp_dir} -prune -user \"$(id -un)\" -perm 0700 -print)\" = {_temp_dir} || exit 125\n"
+                f"export TMPDIR={_temp_dir} TEMP={_temp_dir} TMP={_temp_dir}\n"
+                f"__hermes_temp_identity=$(stat -Lc '%d:%i' {_temp_dir}) || exit 125\n"
+            )
         bootstrap = (
             f"umask 077\n"
+            f"{_authority_bootstrap}"
             f"export -p > {_snap_tmp}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
@@ -421,6 +459,9 @@ class BaseEnvironment(ABC):
             f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"pwd -P > {_quoted_cwd_file} 2>/dev/null || true\n"
+            f"[ -z \"${{__hermes_temp_identity:-}}\" ] || "
+            f"printf '\\n__HERMES_TEMP_IDENTITY__%s__HERMES_TEMP_IDENTITY__\\n' "
+            f"\"$__hermes_temp_identity\"\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
         try:
@@ -430,6 +471,22 @@ class BaseEnvironment(ABC):
                 raise RuntimeError(
                     f"snapshot bootstrap failed with exit code {result.get('returncode')}"
                 )
+            if _expected_home is not None:
+                marker = "__HERMES_TEMP_IDENTITY__"
+                output = str(result.get("output", ""))
+                first = output.find(marker)
+                second = output.find(marker, first + len(marker)) if first >= 0 else -1
+                identity = output[first + len(marker):second].strip() if second >= 0 else ""
+                pieces = identity.split(":")
+                third = output.find(marker, second + len(marker)) if second >= 0 else -1
+                if third >= 0 or len(pieces) != 2 or not all(piece.isdigit() for piece in pieces):
+                    raise RuntimeError("remote temporary authority identity receipt is missing")
+                self._backend_temp_identity = identity
+                line_start = output.rfind("\n", 0, first)
+                line_end = output.find("\n", second + len(marker))
+                result["output"] = output[:max(0, line_start)] + (
+                    output[line_end + 1:] if line_end >= 0 else ""
+                )
             self._snapshot_ready = True
             self._update_cwd(result)
             logger.info(
@@ -438,6 +495,9 @@ class BaseEnvironment(ABC):
                 self.cwd,
             )
         except Exception as exc:
+            if _expected_home is not None:
+                self._snapshot_ready = False
+                raise RuntimeError("remote temporary authority bootstrap failed") from exc
             logger.warning(
                 "init_session failed (session=%s): %s — "
                 "falling back to bash -l per command",
@@ -482,6 +542,25 @@ class BaseEnvironment(ABC):
         _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
 
         parts = []
+        expected_home = getattr(self, "_backend_home", None)
+        if expected_home is not None:
+            identity = getattr(self, "_backend_temp_identity", None)
+            if not isinstance(identity, str) or not identity:
+                raise RuntimeError("remote temporary authority identity is not bound")
+            temp_dir = shlex.quote(self.get_temp_dir())
+            parts.append(
+                f"test \"$HOME\" = {shlex.quote(expected_home)} || exit 125; "
+                f"__hermes_p={shlex.quote(expected_home)}; "
+                f"while [ \"$__hermes_p\" != / ]; do "
+                f"test ! -L \"$__hermes_p\" || exit 125; "
+                f"__hermes_p=${{__hermes_p%/*}}; "
+                f"[ -n \"$__hermes_p\" ] || __hermes_p=/; done; "
+                f"test -O {shlex.quote(expected_home)} || exit 125; "
+                f"test -z \"$(find {shlex.quote(expected_home)} -prune -perm /022 -print)\" || exit 125; "
+                f"test -O {temp_dir} && test ! -L {temp_dir} || exit 125; "
+                f"test \"$(find {temp_dir} -prune -user \"$(id -un)\" -perm 0700 -print)\" = {temp_dir} || exit 125; "
+                f"test \"$(stat -Lc '%d:%i' {temp_dir})\" = {shlex.quote(identity)} || exit 125"
+            )
 
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain

@@ -983,14 +983,16 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
         # both the shell-injection surface and a symlink/TOCTOU race on
         # multi-user machines. The manual hint stays the upstream one-liner
         # since that's what the docs/README teach.
-        import tempfile as _tempfile
+        from hermes_temp import current_temp_authority
 
         install_url = (
             "https://raw.githubusercontent.com/trycua/cua/main/"
             "libs/cua-driver/scripts/install.sh"
         )
         manual_hint = f'/bin/bash -c "$(curl -fsSL {install_url})"'
-        fd, script_path = _tempfile.mkstemp(prefix="cua-driver-install-", suffix=".sh")
+        installer_authority = current_temp_authority()
+        fd, owned_installer = installer_authority.mkstemp("cua-installer", ".sh")
+        script_path = str(owned_installer.path)
         os.close(fd)
         try:
             dl = subprocess.run(
@@ -1000,9 +1002,9 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
         except (subprocess.TimeoutExpired, OSError) as e:
             _print_warning(f"    cua-driver installer download failed: {e}")
             try:
-                os.remove(script_path)
-            except OSError:
-                pass
+                owned_installer.cleanup()
+            finally:
+                installer_authority.close()
             return False
         if dl.returncode != 0:
             _print_warning(
@@ -1010,9 +1012,9 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
                 f"{(dl.stderr or '').strip()[:200]}"
             )
             try:
-                os.remove(script_path)
-            except OSError:
-                pass
+                owned_installer.cleanup()
+            finally:
+                installer_authority.close()
             return False
         install_cmd = ["/bin/bash", script_path]
     use_shell = False
@@ -1134,9 +1136,9 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
     finally:
         if script_path:
             try:
-                os.remove(script_path)
-            except OSError:
-                pass
+                owned_installer.cleanup()
+            finally:
+                installer_authority.close()
 
 
 def _run_post_setup(post_setup_key: str):

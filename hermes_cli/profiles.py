@@ -1918,7 +1918,9 @@ def export_profile(name: str, output_path: str) -> Path:
         # The default profile IS ~/.hermes itself — its parent is ~/ and its
         # directory name is ".hermes", not "default".  We stage a clean copy
         # under a temp dir so the archive contains ``default/...``.
-        with tempfile.TemporaryDirectory() as tmpdir:
+        from hermes_temp import current_temp_authority
+        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("profile-export") as owned_tmp:
+            tmpdir = owned_tmp.path
             staged = Path(tmpdir) / "default"
             shutil.copytree(
                 profile_dir,
@@ -1930,7 +1932,9 @@ def export_profile(name: str, output_path: str) -> Path:
             return Path(result)
 
     # Named profiles — stage a filtered copy to exclude credentials
-    with tempfile.TemporaryDirectory() as tmpdir:
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("profile-export") as owned_tmp:
+        tmpdir = owned_tmp.path
         staged = Path(tmpdir) / canon
         _CREDENTIAL_FILES = {"auth.json", ".env"}
         shutil.copytree(
@@ -2063,7 +2067,9 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
     profiles_root = _get_profiles_root()
     profiles_root.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="hermes_profile_import_") as tmpdir:
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("profile-import") as owned_tmp:
+        tmpdir = owned_tmp.path
         staging_root = Path(tmpdir)
         _safe_extract_profile_archive(archive, staging_root)
 

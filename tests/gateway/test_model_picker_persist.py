@@ -18,7 +18,10 @@ callback and assert ``config.yaml`` is (or isn't) updated — exercising the exa
 closure the PR changed, against a real temp ``HERMES_HOME``.
 """
 
+import asyncio
 import types
+import threading
+from unittest.mock import AsyncMock, Mock, call
 
 import yaml
 import pytest
@@ -51,8 +54,41 @@ def _make_runner(adapter):
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
     runner._session_model_overrides = {}
+    runner._pending_model_notes = {}
     runner._running_agents = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    entry = types.SimpleNamespace(
+        session_id="picker-session", model="old-model"
+    )
+    session_db = types.SimpleNamespace(update_session_model=AsyncMock())
+    session_store = types.SimpleNamespace(
+        get_or_create_session=Mock(return_value=entry),
+        set_model_override=AsyncMock(),
+    )
+    runner.session_store = session_store
+    runner._session_db = types.SimpleNamespace(_db=session_db)
+    runner._test_session_entry = entry
+    runner._test_session_db = session_db
+    runner._test_session_store = session_store
+    runner._test_evicted = []
+
+    def _evict(session_key):
+        runner._test_evicted.append(session_key)
+        with runner._agent_cache_lock:
+            runner._agent_cache.pop(session_key, None)
+
+    runner._evict_cached_agent = _evict
     return runner
+
+
+def _shutdown_runner(runner):
+    executor = getattr(runner, "_executor", None)
+    threads = tuple(getattr(executor, "_threads", ()))
+    runner._shutdown_executor()
+    for thread in threads:
+        thread.join(timeout=1)
+    assert all(not thread.is_alive() for thread in threads)
 
 
 def _make_event(text):
@@ -63,13 +99,13 @@ def _make_event(text):
     )
 
 
-def _fake_switch_result():
+def _fake_switch_result(new_model="gpt-5.5"):
     """A successful ModelSwitchResult that bypasses real provider resolution."""
     from hermes_cli.model_switch import ModelSwitchResult
 
     return ModelSwitchResult(
         success=True,
-        new_model="gpt-5.5",
+        new_model=new_model,
         target_provider="openrouter",
         provider_changed=True,
         api_key="sk-test",
@@ -93,6 +129,11 @@ def _setup_isolated_home(tmp_path, monkeypatch, model_yaml_value):
     )
 
     monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_resolve_profile_home_for_source",
+        lambda _runner, _source: hermes_home,
+    )
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     # The picker-setup path calls list_picker_providers, which otherwise hits
     # the network (OpenRouter model catalog). Stub it to a minimal list — these
@@ -161,7 +202,11 @@ async def test_picker_tap_persists_by_default(tmp_path, monkeypatch, seed_model)
     adapter = _FakePickerAdapter()
     cfg_path = _setup_isolated_home(tmp_path, monkeypatch, seed_model)
 
-    confirmation = await _drive_picker(_make_runner(adapter), _make_event("/model"))
+    runner = _make_runner(adapter)
+    try:
+        confirmation = await _drive_picker(runner, _make_event("/model"))
+    finally:
+        _shutdown_runner(runner)
 
     assert confirmation is not None
     assert "gpt-5.5" in confirmation
@@ -174,6 +219,9 @@ async def test_picker_tap_persists_by_default(tmp_path, monkeypatch, seed_model)
     assert "base_url" not in written["model"]
     assert "api_key" not in written["model"]
     assert "api_mode" not in written["model"]
+    persisted = runner._test_session_store.set_model_override.await_args.args[1]
+    assert "api_key" not in persisted
+    assert "api_mode" not in persisted
 
 
 @pytest.mark.asyncio
@@ -187,7 +235,10 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     )
     runner = _make_runner(adapter)
 
-    confirmation = await _drive_picker(runner, _make_event("/model --session"))
+    try:
+        confirmation = await _drive_picker(runner, _make_event("/model --session"))
+    finally:
+        _shutdown_runner(runner)
 
     assert confirmation is not None
     assert "gpt-5.5" in confirmation
@@ -201,3 +252,266 @@ async def test_picker_tap_session_flag_does_not_persist(tmp_path, monkeypatch):
     written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     assert written["model"]["default"] == "old-model"
     assert written["model"]["provider"] == "openai-codex"
+
+
+@pytest.mark.asyncio
+async def test_picker_apply_failure_compensates_every_authority(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    runner = _make_runner(adapter)
+    store_calls = []
+    config_before = cfg_path.read_bytes()
+    config_save_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.config.save_config",
+        lambda config: config_save_calls.append(config),
+    )
+
+    async def _fail_new_override(_session_key, override):
+        store_calls.append(override)
+        if len(store_calls) == 1:
+            raise RuntimeError("injected store apply failure")
+
+    runner._test_session_store.set_model_override.side_effect = _fail_new_override
+    try:
+        result = await _drive_picker(runner, _make_event("/model"))
+    finally:
+        _shutdown_runner(runner)
+
+    assert "failed" in result.lower()
+    assert runner._session_model_overrides == {}
+    assert runner._pending_model_notes == {}
+    assert runner._test_evicted == []
+    assert runner._test_session_db.update_session_model.await_args_list == [
+        call("picker-session", "gpt-5.5"),
+        call("picker-session", "old-model"),
+    ]
+    assert store_calls[-1] is None
+    assert config_save_calls == []
+    assert cfg_path.read_bytes() == config_before
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"] == {
+        "default": "old-model", "provider": "openrouter",
+    }
+
+
+@pytest.mark.asyncio
+async def test_uncached_picker_failed_compensation_is_ambiguous_and_evicts(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    runner = _make_runner(adapter)
+
+    async def _reject_apply_and_compensation(_session_key, _override):
+        raise RuntimeError("injected persistent store failure")
+
+    runner._test_session_store.set_model_override.side_effect = (
+        _reject_apply_and_compensation
+    )
+    try:
+        result = await _drive_picker(runner, _make_event("/model"))
+    finally:
+        _shutdown_runner(runner)
+
+    session_key = runner._session_key_for_source(_make_event("/model").source)
+    assert "ambiguous" in result
+    assert "recovery is required" in result
+    assert "staying on old-model" not in result
+    assert runner._test_evicted == [session_key]
+
+
+@pytest.mark.asyncio
+async def test_picker_late_cached_failure_compensates_old_state(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    runner = _make_runner(adapter)
+    source = _make_event("/model").source
+    session_key = runner._session_key_for_source(source)
+    old_override = {"model": "old-model", "provider": "openrouter"}
+    runner._session_model_overrides[session_key] = dict(old_override)
+    runner._pending_model_notes[session_key] = "old-note"
+    assert runner._resolve_profile_home_for_source(source) == cfg_path.parent
+
+    class _LateFailingAgent:
+        conversation_history = [{"role": "user", "content": "resume"}]
+
+        def switch_model(self, **kwargs):
+            mutation = kwargs["durable_mutations"][0]
+            mutation.apply()
+            mutation.compensate()
+            raise RuntimeError("late cached failure")
+
+    runner._agent_cache[session_key] = (_LateFailingAgent(),)
+    try:
+        result = await _drive_picker(runner, _make_event("/model"))
+    finally:
+        _shutdown_runner(runner)
+
+    assert "late cached failure" in result
+    assert runner._session_model_overrides[session_key] == old_override
+    assert runner._pending_model_notes[session_key] == "old-note"
+    assert runner._test_evicted == []
+    assert runner._test_session_db.update_session_model.await_args_list == [
+        call("picker-session", "gpt-5.5"),
+        call("picker-session", "old-model"),
+    ]
+    persisted_calls = runner._test_session_store.set_model_override.await_args_list
+    assert persisted_calls[-1] == call(session_key, old_override)
+    assert "api_key" not in persisted_calls[0].args[1]
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"] == {
+        "default": "old-model", "provider": "openrouter",
+    }
+
+
+@pytest.mark.asyncio
+async def test_picker_post_cas_failure_reports_new_committed_and_evicts(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    runner = _make_runner(adapter)
+    source = _make_event("/model").source
+    session_key = runner._session_key_for_source(source)
+
+    class _PostCasFailingAgent:
+        conversation_history = []
+        _prompt_profile_state_version = 4
+
+        def switch_model(self, **kwargs):
+            kwargs["durable_mutations"][0].apply()
+            self._prompt_profile_state_version = 5
+            raise RuntimeError("post-CAS cleanup failure")
+
+    runner._agent_cache[session_key] = (_PostCasFailingAgent(),)
+    try:
+        result = await _drive_picker(runner, _make_event("/model"))
+    finally:
+        _shutdown_runner(runner)
+
+    assert "gpt-5.5 committed" in result
+    assert "cleanup is pending" in result
+    assert "staying on old-model" not in result
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-5.5"
+    assert runner._test_session_entry.model == "gpt-5.5"
+    assert runner._test_evicted == [session_key]
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "gpt-5.5"
+
+
+@pytest.mark.asyncio
+async def test_picker_rollback_incomplete_reports_ambiguous_and_evicts(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    runner = _make_runner(adapter)
+    source = _make_event("/model").source
+    session_key = runner._session_key_for_source(source)
+
+    class _RollbackIncompleteAgent:
+        conversation_history = []
+        _prompt_profile_state_version = 8
+
+        def switch_model(self, **kwargs):
+            kwargs["durable_mutations"][0].apply()
+            raise RuntimeError("ROLLBACK_INCOMPLETE")
+
+    runner._agent_cache[session_key] = (_RollbackIncompleteAgent(),)
+    try:
+        result = await _drive_picker(runner, _make_event("/model"))
+    finally:
+        _shutdown_runner(runner)
+
+    assert "ambiguous" in result
+    assert "recovery is required" in result
+    assert "staying on old-model" not in result
+    assert runner._test_evicted == [session_key]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_picker_failure_rolls_back_to_first_coherent_winner(
+    tmp_path, monkeypatch,
+):
+    adapter = _FakePickerAdapter()
+    cfg_path = _setup_isolated_home(
+        tmp_path,
+        monkeypatch,
+        {"default": "old-model", "provider": "openrouter"},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **kwargs: _fake_switch_result(kwargs["raw_input"]),
+    )
+    runner = _make_runner(adapter)
+    runner._test_session_db.update_session_model = Mock()
+    runner._session_db._db = runner._test_session_db
+    runner._test_session_store.set_model_override = Mock()
+    first_apply_entered = threading.Event()
+    release_first_apply = threading.Event()
+    db_models = []
+    persisted_models = []
+
+    def _update_session_model(_session_id, model):
+        db_models.append(model)
+        if model == "model-a" and db_models.count("model-a") == 1:
+            first_apply_entered.set()
+            release_first_apply.wait(timeout=2)
+
+    def _set_model_override(_session_key, override):
+        model = (override or {}).get("model")
+        persisted_models.append(model)
+        if model == "model-b":
+            raise RuntimeError("injected second picker failure")
+
+    runner._test_session_db.update_session_model.side_effect = _update_session_model
+    runner._test_session_store.set_model_override.side_effect = _set_model_override
+    try:
+        assert await runner._handle_model_command(_make_event("/model")) is None
+        callback = adapter.captured_callback
+        first = asyncio.create_task(callback("12345", "model-a", "openrouter"))
+        while not first_apply_entered.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(callback("12345", "model-b", "openrouter"))
+        await asyncio.sleep(0.02)
+        assert "model-b" not in db_models
+        release_first_apply.set()
+        first_result, second_result = await asyncio.gather(first, second)
+    finally:
+        release_first_apply.set()
+        _shutdown_runner(runner)
+
+    session_key = runner._session_key_for_source(_make_event("/model").source)
+    assert "model-a" in first_result
+    assert "staying on model-a" in second_result
+    assert runner._session_model_overrides[session_key]["model"] == "model-a"
+    assert runner._test_session_entry.model == "model-a"
+    assert db_models == ["model-a", "model-b", "model-a"]
+    assert persisted_models == ["model-a", "model-b", "model-a"]
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"]["default"] == "model-a"

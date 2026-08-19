@@ -7,9 +7,10 @@ it as a normal push instead of a silent message — mirroring the existing
 final-text path in ``gateway/platforms/base.py``.
 """
 
+import asyncio
 import json
 import os
-import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -69,17 +70,22 @@ def _fake_tts_call(monkeypatch, audio_bytes=b"\x00" * 32):
 @pytest.mark.asyncio
 async def test_voice_reply_marks_metadata_notify_true_for_dm(monkeypatch, tmp_path):
     """Final voice reply with no thread metadata gets a fresh notify=True dict."""
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     _fake_tts_call(monkeypatch)
 
     send_voice = AsyncMock()
     runner = _runner_with_adapter(send_voice)
     event = _make_event()
 
-    await runner._send_voice_reply(event, "Hello there.")
+    try:
+        await asyncio.wait_for(runner._send_voice_reply(event, "Hello there."), timeout=2)
+    finally:
+        runner._shutdown_executor()
 
     send_voice.assert_awaited_once()
     kwargs = send_voice.await_args.kwargs
+    audio_path = Path(kwargs["audio_path"])
+    assert audio_path.is_relative_to(Path(os.environ["HERMES_TEMP_ROOT"]))
+    assert not audio_path.exists()
     assert kwargs["metadata"] is not None, "metadata must be set so notify flag reaches adapter"
     assert kwargs["metadata"].get("notify") is True
 
@@ -87,7 +93,6 @@ async def test_voice_reply_marks_metadata_notify_true_for_dm(monkeypatch, tmp_pa
 @pytest.mark.asyncio
 async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monkeypatch, tmp_path):
     """When thread metadata exists (Telegram DM-topic), notify=True is added without mutating the source dict."""
-    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
     _fake_tts_call(monkeypatch)
 
     send_voice = AsyncMock()
@@ -100,7 +105,10 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
     assert source_meta_snapshot is not None
     snapshot_copy = dict(source_meta_snapshot)
 
-    await runner._send_voice_reply(event, "Hello there.")
+    try:
+        await asyncio.wait_for(runner._send_voice_reply(event, "Hello there."), timeout=2)
+    finally:
+        runner._shutdown_executor()
 
     send_voice.assert_awaited_once()
     kwargs = send_voice.await_args.kwargs

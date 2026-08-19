@@ -133,7 +133,15 @@ jobs:
 
           if [ -n "$FINDINGS" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "$FINDINGS" > /tmp/findings.md
+            case "${RUNNER_TEMP:?}" in /*) ;; *) exit 125 ;; esac
+            case "$RUNNER_TEMP/" in /tmp/*|/var/tmp/*|/dev/shm/*|/private/tmp/*|/private/var/tmp/*) exit 125 ;; esac
+            test -d "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP" && test -O "$RUNNER_TEMP"
+            test -z "$(find "$RUNNER_TEMP" -prune -perm /022 -print)" || exit 125
+            export HERMES_HOME="$RUNNER_TEMP/hermes-supply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-scan"
+            test ! -e "$HERMES_HOME" && mkdir -m 700 "$HERMES_HOME" || exit 125
+            . scripts/lib/temp-authority.sh
+            hermes_temp_authority_init || exit 125
+            (umask 077; set -o noclobber; printf '%s\n' "$FINDINGS" > "$HERMES_TEMP_ROOT/findings.md")
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
@@ -143,11 +151,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          export HERMES_HOME="$RUNNER_TEMP/hermes-supply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-scan"
+          . scripts/lib/temp-authority.sh
+          hermes_temp_authority_init || exit 125
+          test -f "$HERMES_TEMP_ROOT/findings.md" && test ! -L "$HERMES_TEMP_ROOT/findings.md" && test -O "$HERMES_TEMP_ROOT/findings.md" || exit 125
           BODY="## 🚨 CRITICAL Supply Chain Risk Detected
 
           This PR contains a pattern that has been used in real supply chain attacks. A maintainer must review the flagged code carefully before merging.
 
-          $(cat /tmp/findings.md)
+          $(cat "$HERMES_TEMP_ROOT/findings.md")
 
           ---
           *Scanner only fires on high-signal indicators: .pth files, base64+exec/eval combos, subprocess with encoded commands, or install-hook files. Low-signal warnings were removed intentionally — if you're seeing this comment, the finding is worth inspecting.*"
@@ -193,7 +205,15 @@ jobs:
 
           if [ -n "$UNBOUNDED" ]; then
             echo "found=true" >> "$GITHUB_OUTPUT"
-            echo "$UNBOUNDED" > /tmp/unbounded.txt
+            case "${RUNNER_TEMP:?}" in /*) ;; *) exit 125 ;; esac
+            case "$RUNNER_TEMP/" in /tmp/*|/var/tmp/*|/dev/shm/*|/private/tmp/*|/private/var/tmp/*) exit 125 ;; esac
+            test -d "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP" && test -O "$RUNNER_TEMP"
+            test -z "$(find "$RUNNER_TEMP" -prune -perm /022 -print)" || exit 125
+            export HERMES_HOME="$RUNNER_TEMP/hermes-supply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-bounds"
+            test ! -e "$HERMES_HOME" && mkdir -m 700 "$HERMES_HOME" || exit 125
+            . scripts/lib/temp-authority.sh
+            hermes_temp_authority_init || exit 125
+            (umask 077; set -o noclobber; printf '%s\n' "$UNBOUNDED" > "$HERMES_TEMP_ROOT/unbounded.txt")
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
           fi
@@ -203,13 +223,17 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          export HERMES_HOME="$RUNNER_TEMP/hermes-supply-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-bounds"
+          . scripts/lib/temp-authority.sh
+          hermes_temp_authority_init || exit 125
+          test -f "$HERMES_TEMP_ROOT/unbounded.txt" && test ! -L "$HERMES_TEMP_ROOT/unbounded.txt" && test -O "$HERMES_TEMP_ROOT/unbounded.txt" || exit 125
           BODY="## ⚠️ Unbounded PyPI Dependency Detected
 
           This PR adds PyPI dependencies without a \`<next_major\` upper bound. Per our [supply chain policy](../blob/main/CONTRIBUTING.md#dependency-pinning-policy-supply-chain-hardening), all PyPI deps must be pinned as \`>=floor,<next_major\`.
 
           **Unbounded specs found:**
           \`\`\`
-          $(cat /tmp/unbounded.txt)
+          $(cat "$HERMES_TEMP_ROOT/unbounded.txt")
           \`\`\`
 
           **Fix:** Add an upper bound, e.g. \`"package>=1.2.0,<2"\`

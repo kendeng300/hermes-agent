@@ -342,86 +342,96 @@ class FileSyncManager:
         except Exception:
             file_mapping = []
 
-        with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
-            self._bulk_download_fn(Path(tf.name))
-
-            # Defensive size cap: a misbehaving sandbox could produce an
-            # arbitrarily large tar. Refuse to extract if it exceeds the cap.
+        from hermes_temp import current_temp_authority
+        with current_temp_authority() as temp_authority:
+            tar_fd, owned_tar = temp_authority.mkstemp("sync-download", ".tar")
+            os.close(tar_fd)
             try:
-                tar_size = os.path.getsize(tf.name)
-            except OSError:
-                tar_size = 0
-            if tar_size > _SYNC_BACK_MAX_BYTES:
-                logger.warning(
-                    "sync_back: remote tar is %d bytes (cap %d) — skipping extraction",
-                    tar_size, _SYNC_BACK_MAX_BYTES,
-                )
-                return
+                self._bulk_download_fn(owned_tar.path)
 
-            with tempfile.TemporaryDirectory(prefix="hermes-sync-back-") as staging:
-                with tarfile.open(tf.name) as tar:
-                    tar.extractall(staging, filter="data")
+                # Defensive size cap: a misbehaving sandbox could produce an
+                # arbitrarily large tar. Refuse to extract if it exceeds the cap.
+                try:
+                    tar_size = owned_tar.path.stat().st_size
+                except OSError:
+                    tar_size = 0
+                if tar_size > _SYNC_BACK_MAX_BYTES:
+                    logger.warning(
+                        "sync_back: remote tar is %d bytes (cap %d) — skipping extraction",
+                        tar_size, _SYNC_BACK_MAX_BYTES,
+                    )
+                    return
 
-                applied = 0
-                upload_only_host_paths = (
-                    self._upload_only_host_paths | _credential_host_paths()
-                )
-                for dirpath, _dirnames, filenames in os.walk(staging):
-                    for fname in filenames:
-                        staged_file = os.path.join(dirpath, fname)
-                        rel = os.path.relpath(staged_file, staging)
-                        remote_path = "/" + rel
+                owned_staging = temp_authority.mkdir("sync-staging")
+                try:
+                    staging = owned_staging.path
+                    with tarfile.open(owned_tar.path) as tar:
+                        tar.extractall(staging, filter="data")
 
-                        pushed_hash = self._pushed_hashes.get(remote_path)
+                    applied = 0
+                    upload_only_host_paths = (
+                        self._upload_only_host_paths | _credential_host_paths()
+                    )
+                    for dirpath, _dirnames, filenames in os.walk(staging):
+                        for fname in filenames:
+                            staged_file = os.path.join(dirpath, fname)
+                            rel = os.path.relpath(staged_file, staging)
+                            remote_path = "/" + rel
 
-                        # Skip hashing for files unchanged from push
-                        if pushed_hash is not None:
-                            remote_hash = _sha256_file(staged_file)
-                            if remote_hash == pushed_hash:
-                                continue
-                        else:
-                            remote_hash = None  # new remote file
+                            pushed_hash = self._pushed_hashes.get(remote_path)
 
-                        # Resolve host path from cached mapping
-                        host_path = self._resolve_host_path(remote_path, file_mapping)
-                        if host_path is None:
-                            host_path = self._infer_host_path(
-                                remote_path,
-                                file_mapping,
-                                upload_only_host_paths=upload_only_host_paths,
-                            )
+                            # Skip hashing for files unchanged from push
+                            if pushed_hash is not None:
+                                remote_hash = _sha256_file(staged_file)
+                                if remote_hash == pushed_hash:
+                                    continue
+                            else:
+                                remote_hash = None  # new remote file
+
+                            # Resolve host path from cached mapping
+                            host_path = self._resolve_host_path(remote_path, file_mapping)
                             if host_path is None:
+                                host_path = self._infer_host_path(
+                                    remote_path,
+                                    file_mapping,
+                                    upload_only_host_paths=upload_only_host_paths,
+                                )
+                                if host_path is None:
+                                    logger.debug(
+                                        "sync_back: skipping %s (no host mapping)",
+                                        remote_path,
+                                    )
+                                    continue
+
+                            if self._is_upload_only_host_path(host_path, upload_only_host_paths):
                                 logger.debug(
-                                    "sync_back: skipping %s (no host mapping)",
+                                    "sync_back: skipping upload-only credential file %s",
                                     remote_path,
                                 )
                                 continue
 
-                        if self._is_upload_only_host_path(host_path, upload_only_host_paths):
-                            logger.debug(
-                                "sync_back: skipping upload-only credential file %s",
-                                remote_path,
-                            )
-                            continue
+                            if os.path.exists(host_path) and pushed_hash is not None:
+                                host_hash = _sha256_file(host_path)
+                                if host_hash != pushed_hash:
+                                    logger.warning(
+                                        "sync_back: conflict on %s — host modified "
+                                        "since push, remote also changed. Applying "
+                                        "remote version (last-write-wins).",
+                                        remote_path,
+                                    )
 
-                        if os.path.exists(host_path) and pushed_hash is not None:
-                            host_hash = _sha256_file(host_path)
-                            if host_hash != pushed_hash:
-                                logger.warning(
-                                    "sync_back: conflict on %s — host modified "
-                                    "since push, remote also changed. Applying "
-                                    "remote version (last-write-wins).",
-                                    remote_path,
-                                )
+                            os.makedirs(os.path.dirname(host_path), exist_ok=True)
+                            shutil.copy2(staged_file, host_path)
+                            applied += 1
 
-                        os.makedirs(os.path.dirname(host_path), exist_ok=True)
-                        shutil.copy2(staged_file, host_path)
-                        applied += 1
-
-                if applied:
-                    logger.info("sync_back: applied %d changed file(s)", applied)
-                else:
-                    logger.debug("sync_back: no remote changes detected")
+                    if applied:
+                        logger.info("sync_back: applied %d changed file(s)", applied)
+                    else:
+                        logger.debug("sync_back: no remote changes detected")
+                finally:
+                    owned_staging.cleanup()
+            finally:
+                owned_tar.cleanup()
 
     def _resolve_host_path(self, remote_path: str,
                            file_mapping: list[tuple[str, str]] | None = None) -> str | None:

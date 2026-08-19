@@ -24,6 +24,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SCRIPT_DIR/lib/temp-authority.sh"
 
 print_help() {
   cat <<'EOF'
@@ -120,7 +121,7 @@ SANDBOX_NAME="${HERMES_DEV_SANDBOX_NAME:-$DEFAULT_SANDBOX_NAME}"
 if [ "$PERSISTENT" = true ]; then
   SANDBOX_ROOT="$PERSISTENT_SANDBOX_ROOT"
 else
-  SANDBOX_ROOT="$(mktemp -d -t hermes-sandbox.XXXXXX)"
+  hermes_temp_dir SANDBOX_ROOT dev-sandbox
 fi
 
 export HERMES_HOME="$SANDBOX_ROOT/hermes-home"

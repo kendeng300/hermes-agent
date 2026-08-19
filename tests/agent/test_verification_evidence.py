@@ -1,6 +1,6 @@
 import json
+import os
 import sqlite3
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,6 +10,38 @@ from agent.verification_evidence import (
     record_terminal_result,
     verification_status,
 )
+from hermes_temp import current_temp_authority, resolve_temp_authority
+
+
+_TEMP_BINDING_KEYS = (
+    "HERMES_TEMP_ROOT",
+    "HERMES_TEMP_ROOT_IDENTITY",
+    "HERMES_TEMP_SCOPE",
+    "HERMES_TEMP_MANIFEST_SHA256",
+    "HERMES_TEMP_AUTHORITY_VERSION",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+)
+
+
+def _bind_test_home(monkeypatch, home: Path) -> Path:
+    """Rebind a complete authority when a test selects another profile."""
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    home.chmod(0o700)
+    for name in _TEMP_BINDING_KEYS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    authority = resolve_temp_authority(
+        scope="test",
+        run_nonce=os.environ["HERMES_TEMP_RUN_NONCE"],
+    )
+    try:
+        for name, value in authority.child_environment().items():
+            monkeypatch.setenv(name, value)
+    finally:
+        authority.close()
+    return home
 
 
 def _node_project(root: Path) -> None:
@@ -26,8 +58,23 @@ def _python_project(root: Path) -> None:
     (root / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
 
 
+def _authority_script(purpose: str):
+    authority = current_temp_authority()
+    try:
+        descriptor, owned = authority.mkstemp(purpose, suffix=".py")
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write("print('ok')\n")
+        except BaseException:
+            owned.cleanup()
+            raise
+    finally:
+        authority.close()
+    return owned
+
+
 def test_classifies_targeted_project_verify_command(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     evidence = classify_verification_command(
@@ -46,7 +93,7 @@ def test_classifies_targeted_project_verify_command(tmp_path, monkeypatch):
 
 
 def test_classifies_python_module_pytest_as_detected_pytest(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _python_project(tmp_path)
 
     evidence = classify_verification_command(
@@ -65,7 +112,7 @@ def test_classifies_python_module_pytest_as_detected_pytest(tmp_path, monkeypatc
 
 
 def test_records_passed_then_marks_stale_after_edit(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     event = record_terminal_result(
@@ -91,7 +138,7 @@ def test_records_passed_then_marks_stale_after_edit(tmp_path, monkeypatch):
 
 
 def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     lint = classify_verification_command(
@@ -116,7 +163,7 @@ def test_lint_and_typecheck_are_not_reported_as_full_tests(tmp_path, monkeypatch
 
 
 def test_package_script_shorthand_matches_canonical_verify_command(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     evidence = classify_verification_command(
@@ -132,7 +179,7 @@ def test_package_script_shorthand_matches_canonical_verify_command(tmp_path, mon
 
 
 def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     wrapped = classify_verification_command(
@@ -155,7 +202,7 @@ def test_shell_wrappers_match_but_echo_does_not(tmp_path, monkeypatch):
 
 
 def test_uv_run_pytest_matches_detected_pytest(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _python_project(tmp_path)
 
     evidence = classify_verification_command(
@@ -171,10 +218,9 @@ def test_uv_run_pytest_matches_detected_pytest(tmp_path, monkeypatch):
 
 
 def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
-    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name}.py"
-    script.write_text("print('ok')\n", encoding="utf-8")
+    owned = _authority_script("hermes-ad-hoc")
+    script = owned.path
     try:
         evidence = classify_verification_command(
             f"python {script}",
@@ -184,7 +230,7 @@ def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, m
             output="ok",
         )
     finally:
-        script.unlink(missing_ok=True)
+        owned.cleanup()
 
     assert evidence is not None
     assert evidence.canonical_command == "ad-hoc verification script"
@@ -194,10 +240,9 @@ def test_temp_script_records_ad_hoc_evidence_without_canonical_suite(tmp_path, m
 
 
 def test_unprefixed_temp_script_is_not_ad_hoc_evidence(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
-    script = Path(tempfile.gettempdir()) / f"random-check-{tmp_path.name}.py"
-    script.write_text("print('ok')\n", encoding="utf-8")
+    owned = _authority_script("random-check")
+    script = owned.path
     try:
         evidence = classify_verification_command(
             f"python {script}",
@@ -207,16 +252,15 @@ def test_unprefixed_temp_script_is_not_ad_hoc_evidence(tmp_path, monkeypatch):
             output="ok",
         )
     finally:
-        script.unlink(missing_ok=True)
+        owned.cleanup()
 
     assert evidence is None
 
 
 def test_temp_script_does_not_replace_detected_suite(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     _node_project(tmp_path)
-    script = Path(tempfile.gettempdir()) / f"hermes-ad-hoc-{tmp_path.name}.py"
-    script.write_text("print('ok')\n", encoding="utf-8")
+    owned = _authority_script("hermes-ad-hoc")
+    script = owned.path
     try:
         evidence = classify_verification_command(
             f"python {script}",
@@ -226,13 +270,13 @@ def test_temp_script_does_not_replace_detected_suite(tmp_path, monkeypatch):
             output="ok",
         )
     finally:
-        script.unlink(missing_ok=True)
+        owned.cleanup()
 
     assert evidence is None
 
 
 def test_non_temp_script_is_not_ad_hoc_evidence(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     (tmp_path / "package.json").write_text("{}", encoding="utf-8")
     script = tmp_path / "scripts" / "repro.py"
     script.parent.mkdir()
@@ -250,14 +294,14 @@ def test_non_temp_script_is_not_ad_hoc_evidence(tmp_path, monkeypatch):
 
 
 def test_status_is_unverified_without_evidence(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     assert verification_status(session_id="s1", cwd=tmp_path)["status"] == "unverified"
 
 
 def test_edit_without_prior_evidence_stays_unverified(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
 
     mark_workspace_edited(
@@ -272,9 +316,12 @@ def test_edit_without_prior_evidence_stays_unverified(tmp_path, monkeypatch):
 
 
 def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _bind_test_home(monkeypatch, tmp_path / ".hermes")
     _node_project(tmp_path)
-    target = tmp_path / "src" / "app.ts"
+    # JSON exercises the real file-tool write seam with its in-process
+    # syntax check.  The evidence contract under test must not depend on a
+    # host-installed TypeScript LSP or spawn a language server.
+    target = tmp_path / "src" / "app.json"
     target.parent.mkdir()
 
     record_terminal_result(
@@ -290,7 +337,7 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
     result = json.loads(
         write_file_tool(
             str(target),
-            "export const ok = true\n",
+            '{"ok": true}\n',
             task_id="turn",
             session_id="conversation",
         )
@@ -303,7 +350,7 @@ def test_file_tool_stales_evidence_by_session_id_for_absolute_edit(tmp_path, mon
 
 def test_recording_prunes_old_events_but_keeps_latest_state(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    _bind_test_home(monkeypatch, home)
     _node_project(tmp_path)
 
     for index in range(120):
@@ -333,7 +380,7 @@ def test_recording_prunes_old_events_but_keeps_latest_state(tmp_path, monkeypatc
 
 def test_recording_expires_old_current_evidence(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    _bind_test_home(monkeypatch, home)
     _node_project(tmp_path)
 
     record_terminal_result(
@@ -367,7 +414,7 @@ def test_recording_expires_old_current_evidence(tmp_path, monkeypatch):
 
 def test_recording_expires_old_edit_only_state(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    _bind_test_home(monkeypatch, home)
     _node_project(tmp_path)
 
     mark_workspace_edited(

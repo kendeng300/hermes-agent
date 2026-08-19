@@ -1394,7 +1394,9 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
         return False
 
     operand = argv[2]
-    temp_dir = os.path.realpath(tempfile.gettempdir())
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority:
+        temp_dir = os.path.realpath(temp_authority.root)
     basename = os.path.basename(operand)
     if operand != os.path.join(temp_dir, basename):
         return False

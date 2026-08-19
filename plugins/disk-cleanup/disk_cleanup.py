@@ -15,7 +15,7 @@ Rules:
   - chrome-profile→ prompt after 14 days (deep only)
   - >500 MB files → prompt always (deep only)
 
-Scope: strictly HERMES_HOME and /tmp/hermes-*
+Scope: strictly HERMES_HOME.
 Never touches: ~/.hermes/logs/ or any system directory.
 """
 
@@ -64,7 +64,7 @@ def get_log_file() -> Path:
 # ---------------------------------------------------------------------------
 
 def is_safe_path(path: Path) -> bool:
-    """Accept only paths under HERMES_HOME or ``/tmp/hermes-*``.
+    """Accept only paths under HERMES_HOME.
 
     Rejects Windows mounts (``/mnt/c`` etc.) and any system directory.
     """
@@ -73,12 +73,7 @@ def is_safe_path(path: Path) -> bool:
         path.resolve().relative_to(hermes_home)
         return True
     except (ValueError, OSError):
-        pass
-    # Allow /tmp/hermes-* explicitly
-    parts = path.parts
-    if len(parts) >= 3 and parts[1] == "tmp" and parts[2].startswith("hermes-"):
-        return True
-    return False
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -577,8 +572,7 @@ def guess_category(path: Path) -> Optional[str]:
         if top == "cache":
             return "temp"
     except ValueError:
-        # Path isn't under HERMES_HOME (e.g. /tmp/hermes-*) — fall through.
-        pass
+        return None
 
     name = path.name
     if name.startswith(_TEST_PATTERNS):

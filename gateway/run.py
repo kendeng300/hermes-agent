@@ -36,7 +36,6 @@ import shlex
 import site
 import sys
 import signal
-import tempfile
 import threading
 import time
 import sqlite3
@@ -53,6 +52,7 @@ from typing import Callable, Dict, Optional, Any, List, Union
 # gateway is a long-running daemon, so its boot cost matters less than
 # preserving the established test-patch surface.
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from hermes_temp import current_temp_authority
 from agent.async_utils import safe_schedule_threadsafe
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
@@ -8851,6 +8851,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        """Run one inbound dispatch in the routed profile's runtime scope.
+
+        Agent turns already establish this scope in ``_run_agent``.  Slash
+        commands return before that boundary, however, and several of them
+        read or write profile-owned config/session state.  Put the scope at
+        the dispatch boundary when multiplexing is enabled so every command
+        follows the same isolation rule.  Deferred callbacks (model pickers)
+        must still re-enter independently because they run after this context
+        has exited.
+        """
+        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            return await self._handle_message_scoped(event)
+
+        profile_home = self._resolve_profile_home_for_source(event.source)
+        with _profile_runtime_scope(profile_home):
+            return await self._handle_message_scoped(event)
+
+    async def _handle_message_scoped(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
         
@@ -13143,6 +13161,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         import uuid as _uuid
         audio_path = None
         actual_path = None
+        temp_authority = None
+        voice_workspace = None
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -13153,15 +13173,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Telegram's adapter only sends native voice bubbles for OGG/Opus.
             # Other platforms keep the existing MP3 default.
             audio_ext = "ogg" if event.source.platform == Platform.TELEGRAM else "mp3"
-            audio_path = os.path.join(
-                tempfile.gettempdir(), "hermes_voice",
-                f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}",
+            temp_authority = current_temp_authority()
+            voice_workspace = temp_authority.mkdir("voice-reply")
+            audio_path = str(
+                voice_workspace.path
+                / f"tts_reply_{_uuid.uuid4().hex[:12]}.{audio_ext}"
             )
-            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
-            )
+            def _run_tts() -> str:
+                return text_to_speech_tool(text=tts_text, output_path=audio_path)
+
+            # Gateway blocking work belongs to the runner-owned executor.
+            # Using the loop default via asyncio.to_thread leaves pytest-asyncio
+            # (and embedded gateway loops) responsible for a thread it cannot
+            # reliably drain during per-loop teardown.
+            result_json = await self._run_in_executor_with_context(_run_tts)
             try:
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):
@@ -13208,11 +13234,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in {audio_path, actual_path} - {None}:
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            try:
+                if voice_workspace is not None:
+                    voice_workspace.cleanup()
+            finally:
+                if temp_authority is not None:
+                    temp_authority.close()
 
     async def _deliver_media_from_response(
         self,
@@ -15025,6 +15052,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             func,
             *args,
         )
+
+    def _submit_in_executor_with_context(self, func, *args):
+        """Submit owned blocking work without an asyncio Future bridge."""
+        ctx = copy_context()
+        return self._get_executor().submit(ctx.run, func, *args)
 
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
@@ -18150,6 +18182,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
+            # Normalize the persisted transcript before fresh AIAgent
+            # construction. Registered prompt profiles perform context-budget
+            # admission during __init__, so supplying history only later to
+            # run_conversation() admitted an empty payload after cache eviction
+            # or gateway restart.  Build this once and reuse the same normalized
+            # role/tool-preserving list below; agent_init copies it before
+            # profile activation, preserving cache stability and isolation from
+            # later per-turn cleanup.
+            agent_history, observed_group_context = _build_gateway_agent_history(
+                history,
+                channel_prompt=channel_prompt,
+                inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
+            )
+
             turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
 
             # Check agent cache — reuse the AIAgent from the previous message
@@ -18302,6 +18348,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
+                    initial_conversation_history=agent_history,
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),
@@ -18546,17 +18593,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             #      - These must be passed through intact so the API sees valid
             #        assistant→tool sequences (dropping tool_calls causes 500 errors)
             #
-            # Telegram observed group context is handled structurally here:
-            # observed=True transcript rows are withheld from replayable
-            # history and attached to the current addressed message as
-            # API-only context, so persisted history stores only the real
-            # addressed user turn.
-            agent_history, observed_group_context = _build_gateway_agent_history(
-                history,
-                channel_prompt=channel_prompt,
-                inject_timestamps=_message_timestamps_enabled(_load_gateway_config()),
-            )
-
             # FTS write-corruption guard (#50502): when message persistence
             # fails silently through corrupt FTS triggers, the reloaded
             # transcript above is stale/empty even though the SAME cached agent

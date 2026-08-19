@@ -1,9 +1,12 @@
 """Provider-qualified token counters used for hard prompt admission."""
 from __future__ import annotations
 
+import base64
 import importlib
 import hashlib
 import json
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -11,6 +14,86 @@ from typing import Any, Mapping, Sequence
 
 class TokenizerUnavailable(RuntimeError):
     """The reviewed tokenizer or its local assets are unavailable."""
+
+
+_O200K_ASSET = Path(__file__).with_name("assets") / "o200k_base.tiktoken"
+_O200K_ASSET_SIZE = 3_613_922
+_O200K_ASSET_SHA256 = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+_O200K_PATTERN = "|".join((
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"\p{N}{1,3}",
+    r" ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"\s*[\r\n]+",
+    r"\s+(?!\S)",
+    r"\s+",
+))
+_O200K_SPECIAL_TOKENS = {"<|endoftext|>": 199_999, "<|endofprompt|>": 200_018}
+
+
+def _read_o200k_asset() -> bytes:
+    """Read the candidate-owned encoding through one retained descriptor."""
+    path = _O200K_ASSET
+    before = path.lstat()
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or (before.st_mode & 0o444) == 0
+        or before.st_size != _O200K_ASSET_SIZE
+    ):
+        raise ValueError("o200k asset identity is unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or opened.st_size != _O200K_ASSET_SIZE
+        ):
+            raise ValueError("o200k asset changed identity before read")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > _O200K_ASSET_SIZE:
+                raise ValueError("o200k asset exceeds its reviewed size")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    final = path.lstat()
+    if (
+        size != _O200K_ASSET_SIZE
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (opened.st_dev, opened.st_ino, opened.st_size)
+        or (final.st_dev, final.st_ino, final.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+    ):
+        raise ValueError("o200k asset changed while read")
+    payload = b"".join(chunks)
+    if hashlib.sha256(payload).hexdigest() != _O200K_ASSET_SHA256:
+        raise ValueError("o200k asset digest is not approved")
+    return payload
+
+
+def _o200k_mergeable_ranks(payload: bytes) -> dict[bytes, int]:
+    ranks: dict[bytes, int] = {}
+    for raw_line in payload.splitlines():
+        fields = raw_line.split()
+        if len(fields) != 2:
+            raise ValueError("o200k asset has a malformed record")
+        token = base64.b64decode(fields[0], validate=True)
+        rank = int(fields[1])
+        if token in ranks or rank < 0:
+            raise ValueError("o200k asset has a duplicate or invalid rank")
+        ranks[token] = rank
+    if len(ranks) != 199_998 or set(ranks.values()) != set(range(199_998)):
+        raise ValueError("o200k asset rank census is not exact")
+    return ranks
 
 
 @dataclass(frozen=True)
@@ -30,7 +113,13 @@ class OpenAITokenCounter:
     def __init__(self) -> None:
         try:
             import tiktoken
-            self._encoding = tiktoken.get_encoding(self.tokenizer_id)
+            payload = _read_o200k_asset()
+            self._encoding = tiktoken.Encoding(
+                name=self.tokenizer_id,
+                pat_str=_O200K_PATTERN,
+                mergeable_ranks=_o200k_mergeable_ranks(payload),
+                special_tokens=_O200K_SPECIAL_TOKENS,
+            )
             self.tokenizer_version = getattr(tiktoken, "__version__", "unknown")
         except Exception as exc:
             raise TokenizerUnavailable("TOKENIZER_UNAVAILABLE: o200k_base") from exc

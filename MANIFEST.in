@@ -2,6 +2,8 @@ graft skills
 graft optional-skills
 graft optional-mcps
 graft locales
+include scripts/lib/temp-authority.sh
+include agent/prompt_profiles/assets/o200k_base.tiktoken
 # Bundled plugin manifests (plugin.yaml / plugin.yml). Without these the
 # PluginManager scan (hermes_cli/plugins.py) finds zero plugins on installs
 # built from the sdist (e.g. Homebrew, downstream packagers). package-data

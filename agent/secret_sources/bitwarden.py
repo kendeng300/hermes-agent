@@ -52,6 +52,7 @@ from agent.secret_sources._cache import (
     is_valid_env_name as _is_valid_env_name,
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
+from hermes_temp import current_temp_authority
 
 logger = logging.getLogger(__name__)
 
@@ -218,43 +219,53 @@ def install_bws(*, force: bool = False) -> Path:
     asset_url = f"{_BWS_RELEASE_BASE}/{asset_name}"
     checksum_url = f"{_BWS_RELEASE_BASE}/{_BWS_CHECKSUM_NAME}"
 
-    with tempfile.TemporaryDirectory(prefix="hermes-bws-") as tmpdir:
-        tmp = Path(tmpdir)
-        zip_path = tmp / asset_name
-        checksum_path = tmp / _BWS_CHECKSUM_NAME
+    with current_temp_authority() as authority:
+        workspace = authority.mkdir("bitwarden-install")
+        try:
+            tmp = workspace.path
+            zip_path = tmp / asset_name
+            checksum_path = tmp / _BWS_CHECKSUM_NAME
 
-        logger.info("Downloading %s", asset_url)
-        _http_download(asset_url, zip_path)
-        _http_download(checksum_url, checksum_path)
+            logger.info("Downloading %s", asset_url)
+            _http_download(asset_url, zip_path)
+            _http_download(checksum_url, checksum_path)
 
-        expected = _expected_sha256(checksum_path, asset_name)
-        actual = _sha256_file(zip_path)
-        if expected.lower() != actual.lower():
-            raise RuntimeError(
-                f"Checksum mismatch for {asset_name}: "
-                f"expected {expected}, got {actual}"
-            )
+            expected = _expected_sha256(checksum_path, asset_name)
+            actual = _sha256_file(zip_path)
+            if expected.lower() != actual.lower():
+                raise RuntimeError(
+                    f"Checksum mismatch for {asset_name}: "
+                    f"expected {expected}, got {actual}"
+                )
 
-        with zipfile.ZipFile(zip_path) as zf:
-            member = _pick_zip_member(zf, _platform_binary_name())
-            # Zip-slip guard: a malicious archive can carry member names like
-            # ``../../etc/cron.d/x`` or absolute paths.  ``ZipFile.extract``
-            # joins the member onto ``tmp`` without verifying the result stays
-            # inside it, so validate containment before touching the disk.
-            extracted = _safe_extract_member(zf, member, tmp)
+            with zipfile.ZipFile(zip_path) as zf:
+                member = _pick_zip_member(zf, _platform_binary_name())
+                # Zip-slip guard: a malicious archive can carry member names
+                # like ``../../etc/cron.d/x`` or absolute paths.
+                extracted = _safe_extract_member(zf, member, tmp)
 
-        # Move into place atomically.  We write to a sibling tempfile in
-        # the final directory so the rename can't cross filesystems.
-        fd, staged = tempfile.mkstemp(dir=str(bin_dir), prefix=".bws_")
-        os.close(fd)
-        shutil.copy2(extracted, staged)
-        os.chmod(
-            staged,
-            stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-            | stat.S_IRGRP | stat.S_IXGRP
-            | stat.S_IROTH | stat.S_IXOTH,
-        )
-        os.replace(staged, target)
+            # Move into place atomically.  The staging file is deliberately a
+            # sibling of the durable destination so replacement cannot cross
+            # filesystems; this is not an ephemeral-system-temp allocation.
+            fd, staged = tempfile.mkstemp(dir=str(bin_dir), prefix=".bws_")
+            try:
+                os.close(fd)
+                shutil.copy2(extracted, staged)
+                os.chmod(
+                    staged,
+                    stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
+                    | stat.S_IRGRP | stat.S_IXGRP
+                    | stat.S_IROTH | stat.S_IXOTH,
+                )
+                os.replace(staged, target)
+            except BaseException:
+                try:
+                    os.unlink(staged)
+                except OSError:
+                    pass
+                raise
+        finally:
+            workspace.cleanup()
 
     logger.info("Installed bws %s at %s", _BWS_VERSION, target)
     return target

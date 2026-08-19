@@ -46,6 +46,98 @@ BOLD='\033[1m'
 REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
 REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+
+# Standalone installers cannot assume the repository helper exists yet. Build
+# the same private HERMES_HOME/tmp boundary locally and allocate with O_EXCL;
+# never fall back to a host-global temporary directory.
+_installer_temp_init() {
+    case "$HERMES_HOME" in /*) ;; *) echo "HERMES_HOME must be absolute" >&2; return 125 ;; esac
+    case "$HERMES_HOME/" in
+        /tmp/*|/var/tmp/*|/dev/shm/*|/private/tmp/*|/private/var/tmp/*) return 125 ;;
+    esac
+    case "$HERMES_HOME" in *'/../'*|*'/./'*|*'//'*) return 125 ;; esac
+    local cursor="$HERMES_HOME" identity permissions
+    while [ "$cursor" != / ]; do
+        if [ -e "$cursor" ] || [ -L "$cursor" ]; then
+            [ ! -L "$cursor" ] || return 125
+        fi
+        cursor="${cursor%/*}"; [ -n "$cursor" ] || cursor=/
+    done
+    if [ -z "${HERMES_TEMP_ROOT:-}" ] &&
+       [ -n "${HERMES_TEMP_ROOT_IDENTITY:-}${HERMES_TEMP_SCOPE:-}${HERMES_TEMP_RUN_NONCE:-}${HERMES_TEMP_MANIFEST_SHA256:-}${HERMES_TEMP_AUTHORITY_VERSION:-}" ]; then
+        return 125
+    fi
+    if [ -n "${HERMES_TEMP_ROOT:-}" ] && [ "$HERMES_TEMP_ROOT" != "$HERMES_HOME/tmp" ]; then
+        return 125
+    fi
+    if [ -n "${HERMES_TEMP_ROOT:-}" ]; then
+        [[ "${HERMES_TEMP_ROOT_IDENTITY:-}" =~ ^v1:[0-9]+:[0-9]+$ ]] || return 125
+        [ "${HERMES_TEMP_AUTHORITY_VERSION:-}" = 1 ] || return 125
+        case "${HERMES_TEMP_SCOPE:-}" in production|test|ci|remote) ;; *) return 125 ;; esac
+        [[ "${HERMES_TEMP_RUN_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || return 125
+        [ "${TMPDIR:-}" = "$HERMES_TEMP_ROOT" ] && [ "${TEMP:-}" = "$HERMES_TEMP_ROOT" ] && [ "${TMP:-}" = "$HERMES_TEMP_ROOT" ] || return 125
+        if [ "$HERMES_TEMP_SCOPE" = ci ] || [ "$HERMES_TEMP_SCOPE" = remote ]; then
+            [[ "${HERMES_TEMP_MANIFEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || return 125
+        else
+            [ -z "${HERMES_TEMP_MANIFEST_SHA256:-}" ] || return 125
+        fi
+    fi
+    if [ -e "$HERMES_HOME" ]; then
+        [ -d "$HERMES_HOME" ] && [ -O "$HERMES_HOME" ] || return 125
+        permissions="$(stat -Lc '%a' "$HERMES_HOME")" || return 125
+        (( (8#$permissions & 8#022) == 0 )) || return 125
+    else
+        install -d -m 700 "$HERMES_HOME" || return 125
+    fi
+    if [ -e "$HERMES_HOME/tmp" ]; then
+        [ -d "$HERMES_HOME/tmp" ] && [ -O "$HERMES_HOME/tmp" ] || return 125
+        [ "$(stat -Lc '%a' "$HERMES_HOME/tmp")" = 700 ] || return 125
+    else
+        install -d -m 700 "$HERMES_HOME/tmp" || return 125
+    fi
+    identity="$(stat -Lc '%d:%i' "$HERMES_HOME/tmp")" || return 125
+    if [ -n "${HERMES_TEMP_ROOT:-}" ]; then
+        [ "$HERMES_TEMP_ROOT" = "$HERMES_HOME/tmp" ] || return 125
+        [ "${HERMES_TEMP_ROOT_IDENTITY:-}" = "v1:$identity" ] || return 125
+        [ "${HERMES_TEMP_AUTHORITY_VERSION:-}" = 1 ] || return 125
+        [ "${TMPDIR:-}" = "$HERMES_TEMP_ROOT" ] && [ "${TEMP:-}" = "$HERMES_TEMP_ROOT" ] && [ "${TMP:-}" = "$HERMES_TEMP_ROOT" ] || return 125
+        case "${HERMES_TEMP_SCOPE:-}" in production|test|ci|remote) ;; *) return 125 ;; esac
+        [[ "${HERMES_TEMP_RUN_NONCE:-}" =~ ^[0-9a-f]{32}$ ]] || return 125
+        if [ "$HERMES_TEMP_SCOPE" = ci ] || [ "$HERMES_TEMP_SCOPE" = remote ]; then
+            [[ "${HERMES_TEMP_MANIFEST_SHA256:-}" =~ ^[0-9a-f]{64}$ ]] || return 125
+        else
+            [ -z "${HERMES_TEMP_MANIFEST_SHA256:-}" ] || return 125
+        fi
+    else
+        HERMES_TEMP_ROOT="$HERMES_HOME/tmp"
+        HERMES_TEMP_ROOT_IDENTITY="v1:$identity"
+        HERMES_TEMP_SCOPE=production
+        HERMES_TEMP_RUN_NONCE="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || return 125
+        HERMES_TEMP_AUTHORITY_VERSION=1
+    fi
+    export HERMES_TEMP_ROOT HERMES_TEMP_ROOT_IDENTITY HERMES_TEMP_SCOPE
+    export HERMES_TEMP_RUN_NONCE HERMES_TEMP_AUTHORITY_VERSION
+    export TMPDIR="$HERMES_TEMP_ROOT" TEMP="$HERMES_TEMP_ROOT" TMP="$HERMES_TEMP_ROOT"
+}
+
+_installer_temp_file() {
+    local output="$1" purpose="$2" suffix="${3:-}" token path
+    _installer_temp_init || return
+    token="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" || return 125
+    path="$HERMES_TEMP_ROOT/$purpose-$token$suffix"
+    ( set -o noclobber; umask 077; : > "$path" ) 2>/dev/null || return 125
+    chmod 600 "$path" || return 125
+    printf -v "$output" '%s' "$path"
+}
+
+_installer_temp_dir() {
+    local output="$1" purpose="$2" token path
+    _installer_temp_init || return
+    token="$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')" || return 125
+    path="$HERMES_TEMP_ROOT/$purpose-$token"
+    mkdir -m 700 "$path" || return 125
+    printf -v "$output" '%s' "$path"
+}
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
 # explicit directory — if so we never override it.
@@ -571,8 +663,8 @@ install_uv() {
     # `curl | sh` masks curl failures (sh exits 0 on empty stdin)
     # and conflates network errors with installer errors.
     local _uv_install_log _uv_installer
-    _uv_install_log="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-install.$$.log")"
-    _uv_installer="$(mktemp 2>/dev/null || echo "/tmp/hermes-uv-installer.$$.sh")"
+    _installer_temp_file _uv_install_log uv-install .log
+    _installer_temp_file _uv_installer uv-installer .sh
     if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_install_log"; then
         log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
         log_info "curl output:"
@@ -890,7 +982,7 @@ install_node() {
 
     local download_url="${index_url}${tarball_name}"
     local tmp_dir
-    tmp_dir=$(mktemp -d)
+    _installer_temp_dir tmp_dir node-download
 
     log_info "Downloading $tarball_name..."
     if ! curl -fsSL "$download_url" -o "$tmp_dir/$tarball_name"; then
@@ -1461,12 +1553,12 @@ install_deps() {
         log_info "(this resolves + downloads the curated [all] set — first run on a"
         log_info " fresh venv can take 1-5 minutes; uv prints progress below)"
         # Stream uv's progress directly to the user instead of swallowing
-        # it with `2>"$(mktemp)"`.  Two reasons:
+        # it with an ambient command-substitution tempfile. Two reasons:
         #   1. `--extra all --locked` against a fresh venv has to pull
         #      every transitive — silencing stderr makes the install
         #      look frozen for minutes on slow networks. Users see
         #      "Trying tier: hash-verified ..." and assume it's hung.
-        #   2. The previous `2>"$(mktemp)"` substituted the path at
+        #   2. The previous ambient substitution resolved the path at
         #      command-build time but never saved it, so on failure the
         #      uv error message was unreachable — the user just got the
         #      generic "lockfile may be stale" warning.
@@ -1555,7 +1647,7 @@ PY
         _SAFE_SPEC=".[$(IFS=,; echo "${_SAFE_EXTRAS[*]}")]"
     fi
 
-    ALL_INSTALL_LOG=$(mktemp)
+    _installer_temp_file ALL_INSTALL_LOG package-install .log
     local _installed=false
     local _tier_name=""
 
@@ -1880,7 +1972,7 @@ strip_snap_browser_override() {
     grep -Eq '^AGENT_BROWSER_EXECUTABLE_PATH=/snap/' "$env_file" 2>/dev/null || return 0
 
     local tmp
-    tmp="$(mktemp)" || return 0
+    _installer_temp_file tmp env-rewrite .tmp || return 0
     if grep -Ev '^AGENT_BROWSER_EXECUTABLE_PATH=/snap/|^# Hermes Agent browser tools' "$env_file" > "$tmp"; then
         mv "$tmp" "$env_file"
         log_warn "Removed stale Snap browser override (AGENT_BROWSER_EXECUTABLE_PATH=/snap/...) from $env_file"
@@ -2473,7 +2565,7 @@ ensure_browser() {
 
     log_info "Installing agent-browser..."
     local log_file
-    log_file="$(mktemp)"
+    _installer_temp_file log_file browser-install .log
     # Time-boxed (#39219): a stalled npm registry fetch here would otherwise
     # hang the installer with no progress, same class as the desktop build.
     if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \

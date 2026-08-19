@@ -16,7 +16,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import wave
@@ -202,7 +201,7 @@ def detect_audio_environment() -> dict:
                         "Running in WSL -- audio requires PulseAudio bridge.\n"
                         "  1. Set PULSE_SERVER=unix:/mnt/wslg/PulseServer\n"
                         "  2. Create ~/.asoundrc pointing ALSA at PulseAudio\n"
-                        "  3. Verify with: arecord -d 3 /tmp/test.wav && aplay /tmp/test.wav"
+                        "  3. Verify with an output path under $HERMES_TEMP_ROOT"
                     )
     except (FileNotFoundError, PermissionError, OSError):
         pass
@@ -281,8 +280,45 @@ SAMPLE_WIDTH = 2  # bytes per sample (int16)
 SILENCE_RMS_THRESHOLD = 200  # RMS below this = silence (int16 range 0-32767)
 SILENCE_DURATION_SECONDS = 3.0  # Seconds of continuous silence before auto-stop
 
-# Temp directory for voice recordings
-_TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice")
+_voice_owned_lock = threading.Lock()
+_voice_owned_files: Dict[str, tuple[Any, Any, float]] = {}
+
+
+def _allocate_voice_temp_file(suffix: str) -> str:
+    """Allocate and retain custody of one unique voice scratch file."""
+    from hermes_temp import current_temp_authority
+
+    authority = current_temp_authority()
+    owned = None
+    try:
+        descriptor, owned = authority.mkstemp("voice-recording", suffix)
+        os.close(descriptor)
+        path = str(owned.path)
+        with _voice_owned_lock:
+            _voice_owned_files[path] = (owned, authority, time.time())
+        return path
+    except Exception:
+        if owned is not None:
+            try:
+                owned.cleanup()
+            except Exception:
+                pass
+        authority.close()
+        raise
+
+
+def cleanup_voice_temp_file(path: str) -> bool:
+    """Identity-check and reap one file allocated by this process."""
+    with _voice_owned_lock:
+        custody = _voice_owned_files.pop(str(path), None)
+    if custody is None:
+        return False
+    owned, authority, _created = custody
+    try:
+        owned.cleanup()
+    finally:
+        authority.close()
+    return True
 
 
 # ============================================================================
@@ -376,9 +412,7 @@ class TermuxAudioRecorder:
         with self._lock:
             if self._recording:
                 return
-            os.makedirs(_TEMP_DIR, exist_ok=True)
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            self._recording_path = os.path.join(_TEMP_DIR, f"recording_{timestamp}.aac")
+            self._recording_path = _allocate_voice_temp_file(".aac")
 
         command = [
             mic_cmd,
@@ -391,9 +425,13 @@ class TermuxAudioRecorder:
         try:
             subprocess.run(command, capture_output=True, text=True, timeout=15, check=True, stdin=subprocess.DEVNULL)
         except subprocess.CalledProcessError as e:
+            cleanup_voice_temp_file(self._recording_path)
+            self._recording_path = None
             details = (e.stderr or e.stdout or str(e)).strip()
             raise RuntimeError(f"Termux microphone start failed: {details}") from e
         except Exception as e:
+            cleanup_voice_temp_file(self._recording_path)
+            self._recording_path = None
             raise RuntimeError(f"Termux microphone start failed: {e}") from e
 
         with self._lock:
@@ -419,19 +457,16 @@ class TermuxAudioRecorder:
             self._current_rms = 0
 
         self._stop_termux_recording()
-        if not path or not os.path.isfile(path):
+        if not path:
+            return None
+        if not os.path.isfile(path):
+            cleanup_voice_temp_file(path)
             return None
         if time.monotonic() - started_at < 0.3:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            cleanup_voice_temp_file(path)
             return None
         if os.path.getsize(path) <= 0:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+            cleanup_voice_temp_file(path)
             return None
         logger.info("Termux voice recording stopped: %s", path)
         return path
@@ -446,11 +481,8 @@ class TermuxAudioRecorder:
             self._stop_termux_recording()
         except Exception:
             pass
-        if path and os.path.isfile(path):
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        if path:
+            cleanup_voice_temp_file(path)
         logger.info("Termux voice recording cancelled")
 
     def shutdown(self) -> None:
@@ -795,15 +827,16 @@ class AudioRecorder:
 
         Returns the file path.
         """
-        os.makedirs(_TEMP_DIR, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        wav_path = os.path.join(_TEMP_DIR, f"recording_{timestamp}.wav")
-
-        with wave.open(wav_path, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(SAMPLE_WIDTH)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(audio_data.tobytes())
+        wav_path = _allocate_voice_temp_file(".wav")
+        try:
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(SAMPLE_WIDTH)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio_data.tobytes())
+        except Exception:
+            cleanup_voice_temp_file(wav_path)
+            raise
 
         file_size = os.path.getsize(wav_path)
         logger.info("WAV written: %s (%d bytes)", wav_path, file_size)
@@ -956,16 +989,11 @@ def _transcribe_wav_in_chunks(
         return {"success": False, "transcript": "", "error": f"Chunked transcription failed: {e}"}
     finally:
         for chunk_path in chunk_paths:
-            try:
-                if os.path.isfile(chunk_path):
-                    os.unlink(chunk_path)
-            except OSError:
-                pass
+            cleanup_voice_temp_file(chunk_path)
 
 
 def _split_wav_for_transcription(wav_path: str, *, max_file_size: int) -> List[str]:
     """Write WAV chunks small enough to pass the shared STT file-size gate."""
-    os.makedirs(_TEMP_DIR, exist_ok=True)
     chunk_paths: List[str] = []
     header_reserve = 64 * 1024
 
@@ -984,14 +1012,7 @@ def _split_wav_for_transcription(wav_path: str, *, max_file_size: int) -> List[s
                 break
 
             index += 1
-            temp = tempfile.NamedTemporaryFile(
-                prefix=f"{os.path.splitext(os.path.basename(wav_path))[0]}_chunk{index:03d}_",
-                suffix=".wav",
-                dir=_TEMP_DIR,
-                delete=False,
-            )
-            chunk_path = temp.name
-            temp.close()
+            chunk_path = _allocate_voice_temp_file(".wav")
 
             try:
                 with wave.open(chunk_path, "wb") as chunk:
@@ -1002,10 +1023,7 @@ def _split_wav_for_transcription(wav_path: str, *, max_file_size: int) -> List[s
                     chunk.writeframes(frames)
                 chunk_paths.append(chunk_path)
             except Exception:
-                try:
-                    os.unlink(chunk_path)
-                except OSError:
-                    pass
+                cleanup_voice_temp_file(chunk_path)
                 raise
 
     return chunk_paths
@@ -1197,21 +1215,13 @@ def cleanup_temp_recordings(max_age_seconds: int = 3600) -> int:
     Returns:
         Number of files deleted.
     """
-    if not os.path.isdir(_TEMP_DIR):
-        return 0
-
-    deleted = 0
     now = time.time()
-
-    for entry in os.scandir(_TEMP_DIR):
-        if entry.is_file() and entry.name.startswith("recording_") and entry.name.endswith(".wav"):
-            try:
-                age = now - entry.stat().st_mtime
-                if age > max_age_seconds:
-                    os.unlink(entry.path)
-                    deleted += 1
-            except OSError:
-                pass
+    with _voice_owned_lock:
+        paths = [
+            path for path, (_owned, _authority, created) in _voice_owned_files.items()
+            if now - created > max_age_seconds
+        ]
+    deleted = sum(1 for path in paths if cleanup_voice_temp_file(path))
 
     if deleted:
         logger.debug("Cleaned up %d old voice recordings", deleted)

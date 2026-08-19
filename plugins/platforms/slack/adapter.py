@@ -2885,6 +2885,17 @@ class SlackAdapter(BasePlatformAdapter):
 
         # When entering a thread for the first time (no existing session),
         # fetch thread context so the agent understands the conversation.
+        #
+        # Keep the triggering text structurally pristine.  In particular,
+        # ``!reset``/``!model``/``!stop`` have already been normalized to a
+        # leading slash above.  Prepending the backfill to ``text`` changes
+        # byte zero from ``/`` to ``[``, after which MessageEvent.get_command()
+        # treats the command as an ordinary agent prompt even though the event
+        # is tagged COMMAND.  ``channel_context`` is the existing gateway seam
+        # for API-only recovered context; the inbound preprocessor injects it
+        # exactly once for ordinary messages, while slash commands return from
+        # dispatch without ever feeding it to the model.
+        thread_context = ""
         if is_thread_reply and not self._has_active_session_for_thread(
             channel_id=channel_id,
             thread_ts=event_thread_ts,
@@ -2896,8 +2907,6 @@ class SlackAdapter(BasePlatformAdapter):
                 current_ts=ts,
                 team_id=team_id,
             )
-            if thread_context:
-                text = thread_context + text
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -3221,6 +3230,7 @@ class SlackAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=thread_ts if thread_ts != ts else None,
             channel_prompt=_channel_prompt,
+            channel_context=thread_context or None,
             reply_to_text=reply_to_text,
             auto_skill=_auto_skill,
         )

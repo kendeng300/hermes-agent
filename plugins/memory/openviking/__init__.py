@@ -579,7 +579,11 @@ def _zip_directory(dir_path: Path) -> Path:
     from agent.file_safety import raise_if_read_blocked
 
     root = dir_path.resolve()
-    zip_path = Path(tempfile.gettempdir()) / f"openviking_upload_{uuid.uuid4().hex}.zip"
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority:
+        zip_fd, _owned_zip = temp_authority.mkstemp("openviking-upload", ".zip")
+        os.close(zip_fd)
+        zip_path = _owned_zip.path
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
         for file_path in dir_path.rglob("*"):
             if file_path.is_symlink():

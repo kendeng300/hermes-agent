@@ -461,7 +461,9 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
 
     plugins_dir = _plugins_dir()
 
-    with tempfile.TemporaryDirectory() as tmp:
+    from hermes_temp import current_temp_authority
+    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("plugin-clone") as owned_tmp:
+        tmp = owned_tmp.path
         tmp_clone = Path(tmp) / "plugin"
 
         git_exe = _resolve_git_executable()

@@ -14,6 +14,7 @@ These tests pin the typed path:
 """
 
 from types import SimpleNamespace
+import threading
 
 import pytest
 import yaml
@@ -31,6 +32,18 @@ def _make_runner():
     runner._session_model_overrides = {}
     runner._running_agents = {}
     return runner
+
+
+@pytest.fixture
+def owned_runner():
+    runner = _make_runner()
+    yield runner
+    executor = getattr(runner, "_executor", None)
+    threads = tuple(getattr(executor, "_threads", ()))
+    runner._shutdown_executor()
+    for thread in threads:
+        thread.join(timeout=1)
+    assert all(not thread.is_alive() for thread in threads)
 
 
 def _make_event(text):
@@ -93,10 +106,12 @@ def _setup_isolated_home(tmp_path, monkeypatch, *, warn):
 
 
 @pytest.mark.asyncio
-async def test_typed_model_expensive_prompts_instead_of_switching(tmp_path, monkeypatch):
+async def test_typed_model_expensive_prompts_instead_of_switching(
+    tmp_path, monkeypatch, owned_runner,
+):
     """Expensive model typed directly → confirm prompt, no switch applied."""
     _setup_isolated_home(tmp_path, monkeypatch, warn=True)
-    runner = _make_runner()
+    runner = owned_runner
 
     captured = {}
 
@@ -116,10 +131,12 @@ async def test_typed_model_expensive_prompts_instead_of_switching(tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monkeypatch):
+async def test_typed_model_expensive_confirm_once_applies_switch(
+    tmp_path, monkeypatch, owned_runner,
+):
     """Resolving the confirm with "once" applies the switch."""
     _setup_isolated_home(tmp_path, monkeypatch, warn=True)
-    runner = _make_runner()
+    runner = owned_runner
     runner._evict_cached_agent = lambda session_key: None
 
     captured = {}
@@ -142,10 +159,12 @@ async def test_typed_model_expensive_confirm_once_applies_switch(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_typed_model_expensive_cancel_keeps_current_model(tmp_path, monkeypatch):
+async def test_typed_model_expensive_cancel_keeps_current_model(
+    tmp_path, monkeypatch, owned_runner,
+):
     """Resolving the confirm with "cancel" leaves everything unchanged."""
     cfg_path = _setup_isolated_home(tmp_path, monkeypatch, warn=True)
-    runner = _make_runner()
+    runner = owned_runner
 
     captured = {}
 
@@ -167,10 +186,42 @@ async def test_typed_model_expensive_cancel_keeps_current_model(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_typed_model_cheap_switches_without_prompt(tmp_path, monkeypatch):
+async def test_typed_model_cost_admission_error_fails_closed_without_mutation(
+    tmp_path, monkeypatch, owned_runner,
+):
+    """Unexpected cost-guard errors are not equivalent to a cheap model."""
+    cfg_path = _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = owned_runner
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected cost admission failure")
+        ),
+    )
+    evicted = []
+    runner._evict_cached_agent = lambda session_key: evicted.append(session_key)
+
+    result = await runner._handle_model_command(
+        _make_event("/model openai/gpt-5.5-pro --global")
+    )
+
+    assert "cost" in result.lower()
+    assert "not applied" in result.lower()
+    assert runner._session_model_overrides == {}
+    assert evicted == []
+    written = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert written["model"] == {
+        "default": "old-model", "provider": "openrouter",
+    }
+
+
+@pytest.mark.asyncio
+async def test_typed_model_cheap_switches_without_prompt(
+    tmp_path, monkeypatch, owned_runner,
+):
     """No warning → switch applies immediately; confirm primitive never invoked."""
     _setup_isolated_home(tmp_path, monkeypatch, warn=False)
-    runner = _make_runner()
+    runner = owned_runner
     runner._evict_cached_agent = lambda session_key: None
 
     async def _fail_request_slash_confirm(**kwargs):  # pragma: no cover
@@ -187,7 +238,9 @@ async def test_typed_model_cheap_switches_without_prompt(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
+async def test_failed_inplace_swap_aborts_commit(
+    tmp_path, monkeypatch, owned_runner,
+):
     """A failed in-place agent swap must be a no-op, not a dead session.
 
     Regression for #50163: the resolution pipeline succeeds (valid model name)
@@ -198,7 +251,7 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     and the conversation is lost.
     """
     _setup_isolated_home(tmp_path, monkeypatch, warn=False)
-    runner = _make_runner()
+    runner = owned_runner
 
     # Working cached agent whose in-place swap fails (and rolls itself back).
     class _FailingAgent:
@@ -210,8 +263,6 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
             # Mirrors agent_runtime_helpers.switch_model: the real method
             # restores old state then re-raises. We keep model unchanged.
             raise RuntimeError("connection refused: bad base_url")
-
-    import threading
 
     agent = _FailingAgent()
     runner._agent_cache = {}

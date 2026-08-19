@@ -65,16 +65,8 @@ class TeamsPipelineStore:
 
     def _persist(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=str(self.path.parent),
-            delete=False,
-        ) as tmp:
-            json.dump(self._state, tmp, indent=2, sort_keys=True)
-            tmp.flush()
-            tmp_path = Path(tmp.name)
-        tmp_path.replace(self.path)
+        from utils import atomic_json_write
+        atomic_json_write(self.path, self._state, indent=2, sort_keys=True)
 
     def list_subscriptions(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:

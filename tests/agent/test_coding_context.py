@@ -28,7 +28,8 @@ def _git_init(path):
     # _detect_profile_name / _has_code_files), so "a code repo" needs code.
     (Path(path) / "main.py").write_text("print('hi')\n")
     for args in (
-        ["init", "-q", "-b", "main"],
+        ["init", "-q"],
+        ["checkout", "-q", "-B", "main"],
         ["add", "-A"],
         ["commit", "-q", "-m", "init commit"],
     ):
@@ -62,7 +63,12 @@ class TestIsCodingContext:
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", "HOME": str(tmp_path),
         }
         (tmp_path / "notes.md").write_text("# my novel\n")
-        for args in (["init", "-q", "-b", "main"], ["add", "-A"], ["commit", "-q", "-m", "notes"]):
+        for args in (
+            ["init", "-q"],
+            ["checkout", "-q", "-B", "main"],
+            ["add", "-A"],
+            ["commit", "-q", "-m", "notes"],
+        ):
             subprocess.run([shutil.which("git"), "-C", str(tmp_path), *args], check=True, env=env)
 
         assert cc.is_coding_context(platform="cli", cwd=tmp_path, config=cfg) is False

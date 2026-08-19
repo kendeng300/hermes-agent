@@ -1,5 +1,8 @@
 """Regression tests for gateway /model support of config.yaml custom_providers."""
 
+import asyncio
+import threading
+
 import yaml
 import pytest
 
@@ -53,9 +56,19 @@ async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkey
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_resolve_profile_home_for_source",
+        lambda _runner, _source: hermes_home,
+    )
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
 
-    result = await _make_runner()._handle_model_command(_make_event())
+    runner = _make_runner()
+    assert runner._resolve_profile_home_for_source(_make_event().source) == hermes_home
+    try:
+        result = await runner._handle_model_command(_make_event())
+    finally:
+        runner._shutdown_executor()
 
     assert result is not None
     assert "Local (127.0.0.1:4141)" in result
@@ -64,11 +77,10 @@ async def test_handle_model_command_lists_saved_custom_provider(tmp_path, monkey
 
 
 @pytest.mark.asyncio
-async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
+async def test_direct_model_switch_uses_owned_executor(tmp_path, monkeypatch):
     """A direct `/model <name>` switch must route switch_model() through
-    asyncio.to_thread so the blocking models.dev HTTP fetch can't freeze the
-    gateway event loop (#20525)."""
-    import asyncio
+    the runner-owned executor so a models.dev fetch cannot freeze the event
+    loop or depend on the loop's default executor (#20525)."""
 
     from hermes_cli.model_switch import ModelSwitchResult
 
@@ -84,25 +96,35 @@ async def test_direct_model_switch_offloads_to_thread(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_resolve_profile_home_for_source",
+        lambda _runner, _source: hermes_home,
+    )
 
     # Fail the switch so the handler returns before _finish_switch (which needs
     # full runner state) — we only care that the offload happened.
+    offloaded = []
+
     def _fake_switch(**kwargs):
+        offloaded.append(threading.current_thread())
         return ModelSwitchResult(success=False, error_message="nope")
 
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", _fake_switch)
 
-    offloaded = []
-    real_to_thread = asyncio.to_thread
+    monkeypatch.setattr(
+        asyncio,
+        "to_thread",
+        lambda *args, **kwargs: pytest.fail("unexpected default-executor fallback"),
+    )
+    runner = _make_runner()
+    assert runner._resolve_profile_home_for_source(_make_event().source) == hermes_home
+    try:
+        result = await runner._handle_model_command(_make_event("/model gpt-5.4"))
+    finally:
+        runner._shutdown_executor()
 
-    async def _spy_to_thread(func, /, *args, **kwargs):
-        offloaded.append(getattr(func, "__name__", repr(func)))
-        return await real_to_thread(func, *args, **kwargs)
-
-    monkeypatch.setattr(asyncio, "to_thread", _spy_to_thread)
-
-    result = await _make_runner()._handle_model_command(_make_event("/model gpt-5.4"))
-
-    # switch_model was offloaded to a worker thread, not run on the event loop.
-    assert "_fake_switch" in offloaded
+    assert offloaded
+    assert all(t is not threading.main_thread() for t in offloaded)
+    assert all(t.name.startswith("hermes-gateway") for t in offloaded)
     assert result is not None and "nope" in result

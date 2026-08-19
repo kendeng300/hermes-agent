@@ -93,16 +93,24 @@ jobs:
       - name: Export digest
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release'
         run: |
-          mkdir -p /tmp/digests
+          case "${RUNNER_TEMP:?}" in /*) ;; *) exit 125 ;; esac
+          case "$RUNNER_TEMP/" in /tmp/*|/var/tmp/*|/dev/shm/*|/private/tmp/*|/private/var/tmp/*) exit 125 ;; esac
+          test -d "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP" && test -O "$RUNNER_TEMP"
+          test -z "$(find "$RUNNER_TEMP" -prune -perm /022 -print)" || exit 125
+          export HERMES_HOME="$RUNNER_TEMP/hermes-docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.arch }}"
+          test ! -e "$HERMES_HOME" && mkdir -m 700 "$HERMES_HOME" || exit 125
+          . scripts/lib/temp-authority.sh
+          hermes_temp_authority_init || exit 125
+          install -d -m 700 "$HERMES_TEMP_ROOT/digests"
           digest="${{ steps.push.outputs.digest }}"
-          touch "/tmp/digests/${digest#sha256:}"
+          (umask 077; set -o noclobber; : > "$HERMES_TEMP_ROOT/digests/${digest#sha256:}")
 
       - name: Upload digest artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'release'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: digest-${{ matrix.arch }}
-          path: /tmp/digests/*
+          path: ${{ runner.temp }}/hermes-docker-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.arch }}/tmp/digests/*
           if-no-files-found: error
           retention-days: 1
 
@@ -160,10 +168,22 @@ jobs:
     needs: [build]
     timeout-minutes: 10
     steps:
+      - name: Prepare digest authority
+        run: |
+          case "${RUNNER_TEMP:?}" in /*) ;; *) exit 125 ;; esac
+          case "$RUNNER_TEMP/" in /tmp/*|/var/tmp/*|/dev/shm/*|/private/tmp/*|/private/var/tmp/*) exit 125 ;; esac
+          test -d "$RUNNER_TEMP" && test ! -L "$RUNNER_TEMP" && test -O "$RUNNER_TEMP"
+          test -z "$(find "$RUNNER_TEMP" -prune -perm /022 -print)" || exit 125
+          export HERMES_HOME="$RUNNER_TEMP/hermes-docker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-merge"
+          test ! -e "$HERMES_HOME" && mkdir -m 700 "$HERMES_HOME" || exit 125
+          . scripts/lib/temp-authority.sh
+          hermes_temp_authority_init || exit 125
+          mkdir -m 700 "$HERMES_TEMP_ROOT/digests"
+
       - name: Download digests
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          path: /tmp/digests
+          path: ${{ runner.temp }}/hermes-docker-${{ github.run_id }}-${{ github.run_attempt }}-merge/tmp/digests
           pattern: digest-*
           merge-multiple: true
 
@@ -177,7 +197,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Create manifest list and push
-        working-directory: /tmp/digests
+        working-directory: ${{ runner.temp }}/hermes-docker-${{ github.run_id }}-${{ github.run_attempt }}-merge/tmp/digests
         env:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}

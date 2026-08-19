@@ -19,7 +19,6 @@ import os
 import random
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -29,6 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote
 
 import httpx
+from hermes_temp import current_temp_authority
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -160,37 +160,46 @@ def _remux_aac_to_m4a(aac_data: bytes) -> Optional[Tuple[bytes, str]]:
     if not ffmpeg:
         logger.debug("Signal: ffmpeg not found, skipping AAC→M4A remux")
         return None
+    authority = None
+    workspace = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".aac", delete=False) as src:
+        authority = current_temp_authority()
+        workspace = authority.mkdir("signal-audio")
+        src_path = str(workspace.path / "source.aac")
+        dst_path = str(workspace.path / "converted.m4a")
+        descriptor = os.open(
+            src_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb") as src:
             src.write(aac_data)
-            src_path = src.name
-        dst_path = src_path[:-4] + ".m4a"
-        try:
-            proc = subprocess.run(
-                [ffmpeg, "-y", "-loglevel", "error", "-i", src_path,
-                 "-c:a", "copy", "-movflags", "+faststart", dst_path],
-                capture_output=True, timeout=10,
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", src_path,
+             "-c:a", "copy", "-movflags", "+faststart", dst_path],
+            capture_output=True, timeout=10,
+        )
+        if proc.returncode != 0:
+            logger.warning(
+                "Signal: AAC→M4A remux failed (ffmpeg exit %d): %s",
+                proc.returncode, proc.stderr.decode("utf-8", "replace")[:300],
             )
-            if proc.returncode != 0:
-                logger.warning(
-                    "Signal: AAC→M4A remux failed (ffmpeg exit %d): %s",
-                    proc.returncode, proc.stderr.decode("utf-8", "replace")[:300],
-                )
-                return None
-            with open(dst_path, "rb") as f:
-                return f.read(), ".m4a"
-        finally:
-            for p in (src_path, dst_path):
-                try:
-                    os.unlink(p)
-                except OSError:
-                    pass
+            return None
+        with open(dst_path, "rb") as f:
+            return f.read(), ".m4a"
     except subprocess.TimeoutExpired:
         logger.warning("Signal: AAC→M4A remux timed out (>10s)")
         return None
     except Exception:
         logger.exception("Signal: AAC→M4A remux error")
         return None
+    finally:
+        try:
+            if workspace is not None:
+                workspace.cleanup()
+        finally:
+            if authority is not None:
+                authority.close()
 
 
 def _render_mentions(text: str, mentions: list) -> str:

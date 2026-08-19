@@ -43,6 +43,10 @@ dependencies = [
   # user picks that backend. Smaller `dependencies` = smaller blast
   # radius for the next supply-chain attack.
   "openai==2.24.0",
+  # Prompt-profile admission uses the reviewed local o200k vocabulary.  Keep
+  # the constructor itself in the core environment so a clean install cannot
+  # silently fall back to an approximate counter.
+  "tiktoken==0.12.0",
   "certifi==2026.5.20",
   "python-dotenv==1.2.2",
   "fire==0.7.1",
@@ -157,7 +161,7 @@ edge-tts = ["edge-tts==7.2.7"]
 modal = ["modal==1.3.4"]
 daytona = ["daytona==0.155.0"]
 hindsight = ["hindsight-client==0.6.1"]
-dev = ["debugpy==1.8.20", "pytest==9.0.2", "pytest-asyncio==1.3.0", "mcp==1.26.0", "starlette==1.0.1", "ty==0.0.21", "ruff==0.15.10", "setuptools==81.0.0"]  # starlette: CVE-2026-48710; setuptools: latest <82 (torch >=2.11 caps setuptools<82)
+dev = ["debugpy==1.8.20", "pytest==9.0.2", "pytest-asyncio==1.3.0", "pytest-timeout==2.4.0", "pytest-xdist==3.8.0", "mcp==1.26.0", "starlette==1.0.1", "ty==0.0.21", "ruff==0.15.10", "setuptools==81.0.0"]  # starlette: CVE-2026-48710; setuptools: latest <82 (torch >=2.11 caps setuptools<82)
 messaging = ["python-telegram-bot[webhooks]==22.6", "discord.py[voice]==2.7.1", "aiohttp==3.14.1", "brotlicffi==1.2.0.1", "slack-bolt==1.27.0", "slack-sdk==3.40.1", "qrcode==7.4.2"]  # aiohttp 3.14.1: CVE-2026-34513/34518/34519/34520/34525 + 34993(RCE)/47265
 cron = []  # croniter is now a core dependency; this extra kept for back-compat
 slack = ["slack-bolt==1.27.0", "slack-sdk==3.40.1", "aiohttp==3.14.1"]
@@ -310,9 +314,15 @@ hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
 
 [tool.setuptools]
-py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
+py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_temp", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
 
 [tool.setuptools.data-files]
+# Shell TempAuthority used by bundled skill entrypoints. Skills are installed
+# beneath the sysconfig data root, so the helper must be installed at the
+# matching data-root-relative scripts/lib path in wheels as well as source.
+"scripts/lib" = ["scripts/lib/temp-authority.sh"]
+"skills/creative/p5js/scripts" = ["skills/creative/p5js/scripts/render.sh"]
+"optional-skills/productivity/here-now/scripts" = ["optional-skills/productivity/here-now/scripts/drive.sh"]
 # i18n catalogs. locales/ is a bare data directory (no __init__.py), so it is
 # neither a package (packages.find) nor package-data (which attaches to a
 # package). data-files ships it in the wheel; MANIFEST.in `graft locales`
@@ -336,6 +346,7 @@ locales = ["locales/*.yaml"]
 "optional-mcps/n8n" = ["optional-mcps/n8n/manifest.yaml"]
 
 [tool.setuptools.package-data]
+agent = ["prompt_profiles/assets/o200k_base.tiktoken"]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]
 gateway = ["assets/**/*"]
 plugins = [

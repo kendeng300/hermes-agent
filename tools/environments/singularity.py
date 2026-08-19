@@ -174,6 +174,7 @@ class SingularityEnvironment(BaseEnvironment):
         persistent_filesystem: bool = False,
         task_id: str = "default",
     ):
+        self._bind_backend_temp_home("/root")
         super().__init__(cwd=cwd, timeout=timeout)
         self.executable = _ensure_singularity_available()
         self.image = _get_or_build_sif(image, self.executable)

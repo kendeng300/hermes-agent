@@ -900,15 +900,19 @@ class _CuaDriverSession:
         daemon socket can still be momentarily busy.
         """
         import subprocess as _subprocess
-        import tempfile as _tempfile
         import time as _time
         from tools.environments.local import _sanitize_subprocess_env
 
         call_args = dict(args)
         shot_file: Optional[str] = None
+        temp_authority = None
+        owned_shot = None
         if name == "get_window_state" and "screenshot_out_file" not in call_args:
-            fd, shot_file = _tempfile.mkstemp(prefix="cua_shot_", suffix=".png")
+            from hermes_temp import current_temp_authority
+            temp_authority = current_temp_authority()
+            fd, owned_shot = temp_authority.mkstemp("cua-shot", ".png")
             os.close(fd)
+            shot_file = str(owned_shot.path)
             call_args["screenshot_out_file"] = shot_file
 
         cmd = [_CUA_DRIVER_CMD, "call", name, json.dumps(call_args)]
@@ -980,11 +984,11 @@ class _CuaDriverSession:
                     data = f"{summary}\n{tree}" if summary else tree
             return {"data": data, "images": images, "structuredContent": structured, "isError": False}
         finally:
-            if shot_file and os.path.exists(shot_file):
+            if owned_shot is not None:
                 try:
-                    os.remove(shot_file)
-                except OSError:
-                    pass
+                    owned_shot.cleanup()
+                finally:
+                    temp_authority.close()
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
         self._require_started()

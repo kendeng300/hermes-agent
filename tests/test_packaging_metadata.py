@@ -1,6 +1,12 @@
 import ast
+import hashlib
 import re
+import shutil
+import subprocess
+import sys
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -98,6 +104,97 @@ def test_packaging_declared_as_core_dependency():
         "lazy_deps version constraints, requirement parsing) and must be a "
         "declared core dependency, not a transitive — see #40503"
     )
+
+
+def test_tiktoken_asset_is_core_pinned_and_ships_in_wheel_and_sdist(tmp_path):
+    """Clean installs contain tokenizer ranks and skill shell authority."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core = data["project"]["dependencies"]
+    assert "tiktoken==0.12.0" in core
+    assert data["tool"]["setuptools"]["package-data"]["agent"] == [
+        "prompt_profiles/assets/o200k_base.tiktoken"
+    ]
+    assert "include agent/prompt_profiles/assets/o200k_base.tiktoken" in (
+        REPO_ROOT / "MANIFEST.in"
+    ).read_text(encoding="utf-8")
+    data_files = data["tool"]["setuptools"]["data-files"]
+    assert data_files["scripts/lib"] == ["scripts/lib/temp-authority.sh"]
+    assert data_files["skills/creative/p5js/scripts"] == [
+        "skills/creative/p5js/scripts/render.sh"
+    ]
+    assert data_files["optional-skills/productivity/here-now/scripts"] == [
+        "optional-skills/productivity/here-now/scripts/drive.sh"
+    ]
+    assert "include scripts/lib/temp-authority.sh" in (
+        REPO_ROOT / "MANIFEST.in"
+    ).read_text(encoding="utf-8")
+
+    checkout = tmp_path / "checkout"
+    shutil.copytree(
+        REPO_ROOT,
+        checkout,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(
+            ".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"
+        ),
+    )
+    dist = checkout / "dist"
+    command = (
+        "import pathlib,setuptools.build_meta as b;"
+        "d=pathlib.Path('dist');d.mkdir();"
+        "print(b.build_wheel(str(d)));print(b.build_sdist(str(d)))"
+    )
+    inherited_guard = {
+        key: __import__("os").environ[key]
+        for key in (
+            "PYTHONPATH", "TEST034_NETWORK_ATTEMPTS", "TEST034_NETWORK_LOADS",
+            "TEST034_GUARD_CONTEXT", "TEST034_SITE_GUARD_LOADED",
+        )
+        if key in __import__("os").environ
+    }
+    completed = subprocess.run(
+        [sys.executable, "-c", command], cwd=checkout,
+        text=True, capture_output=True, check=False,
+        env={"PATH": __import__("os").environ.get("PATH", ""),
+             "PYTHONNOUSERSITE": "1", "HERMES_TEST_ACTIVE": "1",
+             "HERMES_OFFLINE": "1", "NO_NETWORK": "1", **inherited_guard},
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    wheel, = dist.glob("*.whl")
+    sdist, = dist.glob("*.tar.gz")
+    expected = (REPO_ROOT / "agent/prompt_profiles/assets/o200k_base.tiktoken").read_bytes()
+    expected_sha = hashlib.sha256(expected).hexdigest()
+    expected_shell_files = {
+        "scripts/lib/temp-authority.sh": 0o644,
+        "skills/creative/p5js/scripts/render.sh": 0o755,
+        "optional-skills/productivity/here-now/scripts/drive.sh": 0o755,
+    }
+    with zipfile.ZipFile(wheel) as archive:
+        wheel_payload = archive.read("agent/prompt_profiles/assets/o200k_base.tiktoken")
+        for suffix, expected_mode in expected_shell_files.items():
+            matches = [item for item in archive.infolist() if item.filename.endswith(suffix)]
+            assert len(matches) == 1, (suffix, [item.filename for item in matches])
+            member = matches[0]
+            assert archive.read(member) == (REPO_ROOT / suffix).read_bytes()
+            assert (member.external_attr >> 16) & 0o777 == expected_mode
+    with tarfile.open(sdist, "r:gz") as archive:
+        member = next(
+            item for item in archive.getmembers()
+            if item.name.endswith("/agent/prompt_profiles/assets/o200k_base.tiktoken")
+        )
+        extracted = archive.extractfile(member)
+        assert extracted is not None
+        sdist_payload = extracted.read()
+        for suffix, expected_mode in expected_shell_files.items():
+            matches = [item for item in archive.getmembers() if item.name.endswith(suffix)]
+            assert len(matches) == 1, (suffix, [item.name for item in matches])
+            shell_member = matches[0]
+            extracted_shell = archive.extractfile(shell_member)
+            assert extracted_shell is not None
+            assert extracted_shell.read() == (REPO_ROOT / suffix).read_bytes()
+            assert shell_member.mode & 0o777 == expected_mode
+    assert hashlib.sha256(wheel_payload).hexdigest() == expected_sha
+    assert hashlib.sha256(sdist_payload).hexdigest() == expected_sha
 
 
 def test_faster_whisper_is_not_a_base_dependency():

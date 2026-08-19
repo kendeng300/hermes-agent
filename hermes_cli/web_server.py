@@ -3706,13 +3706,12 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
     temp_path = ""
     try:
         suffix = _audio_extension_for_mime(mime_type)
-        with tempfile.NamedTemporaryFile(
-            prefix="hermes-desktop-voice-",
-            suffix=suffix,
-            delete=False,
-        ) as tmp:
+        from hermes_temp import current_temp_authority
+        temp_authority = current_temp_authority()
+        descriptor, owned_audio = temp_authority.mkstemp("desktop-voice", suffix)
+        with os.fdopen(descriptor, "wb") as tmp:
             tmp.write(audio_bytes)
-            temp_path = tmp.name
+        temp_path = str(owned_audio.path)
 
         from tools.transcription_tools import transcribe_audio
 
@@ -3724,11 +3723,11 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
         _log.exception("Desktop voice transcription failed")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}")
     finally:
-        if temp_path:
+        if temp_path and "owned_audio" in locals():
             try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
+                owned_audio.cleanup()
+            finally:
+                temp_authority.close()
 
     if not result.get("success"):
         raise HTTPException(
@@ -14814,9 +14813,12 @@ def _active_session_file_for_channel(app: "FastAPI", channel: str) -> Path:
     if existing is not None:
         return existing
 
-    fd, raw_path = tempfile.mkstemp(prefix="hermes-pty-active-", suffix=".json")
+    from hermes_temp import current_temp_authority
+    temp_authority = current_temp_authority()
+    fd, owned_session = temp_authority.mkstemp("pty-active-session", ".json")
     os.close(fd)
-    path = Path(raw_path)
+    path = owned_session.path
+    temp_authority.close()
     files[channel] = path
     return path
 

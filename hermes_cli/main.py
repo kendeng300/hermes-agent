@@ -2017,18 +2017,19 @@ def _launch_tui(
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
 
-    import tempfile
-
     env = os.environ.copy()
     try:
         from hermes_cli.config import apply_terminal_config_to_env
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
-    active_session_fd, active_session_file = tempfile.mkstemp(
-        prefix="hermes-tui-active-session-", suffix=".json"
+    from hermes_temp import current_temp_authority
+    temp_authority = current_temp_authority()
+    active_session_fd, owned_active_session = temp_authority.mkstemp(
+        "tui-active-session", ".json"
     )
     os.close(active_session_fd)
+    active_session_file = str(owned_active_session.path)
     env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
     env["HERMES_PYTHON_SRC_ROOT"] = os.environ.get(
         "HERMES_PYTHON_SRC_ROOT", str(PROJECT_ROOT)
@@ -2138,9 +2139,9 @@ def _launch_tui(
             _print_tui_exit_summary(resume_session_id, active_session_file)
     finally:
         try:
-            os.unlink(active_session_file)
-        except OSError:
-            pass
+            owned_active_session.cleanup()
+        finally:
+            temp_authority.close()
         if wt_info:
             try:
                 _cleanup_worktree(wt_info)
@@ -4548,10 +4549,11 @@ def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]
     file parsed cleanly.
     """
     import py_compile
-    import tempfile
+    from hermes_temp import current_temp_authority
 
     root = Path(root)
-    with tempfile.TemporaryDirectory(prefix="hermes-syntax-check-") as tmpdir:
+    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("syntax-check") as owned_tmp:
+        tmpdir = owned_tmp.path
         for relpath in _UPDATE_CRITICAL_FILES:
             path = root / relpath
             if not path.exists():
@@ -6286,7 +6288,10 @@ def _update_via_zip(args):
     )
 
     print("→ Downloading latest version...")
-    tmp_dir = tempfile.mkdtemp(prefix="hermes-update-")
+    from hermes_temp import current_temp_authority
+    temp_authority = current_temp_authority()
+    owned_tmp = temp_authority.mkdir("agent-update")
+    tmp_dir = str(owned_tmp.path)
     try:
         zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
         urlretrieve(zip_url, zip_path)
@@ -6350,7 +6355,10 @@ def _update_via_zip(args):
         print(f"✗ ZIP update failed: {e}")
         sys.exit(1)
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            owned_tmp.cleanup()
+        finally:
+            temp_authority.close()
 
     # Clear stale bytecode after ZIP extraction
     removed = _clear_bytecode_cache(PROJECT_ROOT)
@@ -8073,11 +8081,12 @@ def _install_psutil_android_compat(
     merges and ships in a release. The standalone installer script uses the
     same shared helper and should be removed together.
     """
-    import tempfile
     import urllib.request
+    from hermes_temp import current_temp_authority
     from hermes_cli.psutil_android import PSUTIL_URL, prepare_patched_psutil_sdist
 
-    with tempfile.TemporaryDirectory() as tmp:
+    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("psutil-build") as owned_tmp:
+        tmp = owned_tmp.path
         tmp_path = Path(tmp)
         archive = tmp_path / "psutil.tar.gz"
         urllib.request.urlretrieve(PSUTIL_URL, archive)
@@ -11580,7 +11589,7 @@ def cmd_profile(args):
             sys.exit(1)
 
     elif action == "install":
-        import tempfile
+        from hermes_temp import current_temp_authority
         from hermes_cli.profile_distribution import (
             plan_install,
             install_distribution,
@@ -11591,7 +11600,8 @@ def cmd_profile(args):
             # Preview: stage the distribution into a scratch dir, show the
             # manifest, then do the real install.  The double-stage avoids
             # any side-effects if the user declines.
-            with tempfile.TemporaryDirectory(prefix="hermes_dist_preview_") as tmp:
+            with current_temp_authority() as temp_authority, temp_authority.temporary_directory("profile-preview") as owned_tmp:
+                tmp = owned_tmp.path
                 plan = plan_install(
                     args.source,
                     Path(tmp),

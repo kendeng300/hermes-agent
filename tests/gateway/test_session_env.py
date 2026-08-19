@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import os
 
 import pytest
@@ -358,20 +359,28 @@ async def test_run_in_executor_with_context_propagates_exceptions():
 
 
 @pytest.mark.asyncio
-async def test_run_in_executor_with_context_survives_default_executor_shutdown():
+async def test_run_in_executor_with_context_works_with_closed_default_executor():
     """Gateway agent work should not depend on asyncio's default executor."""
     runner = object.__new__(GatewayRunner)
     loop = asyncio.get_running_loop()
+    original_default_executor = loop._default_executor
+    closed_default_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    closed_default_executor.shutdown(wait=True)
+    loop._default_executor = closed_default_executor
 
-    await loop.run_in_executor(None, lambda: None)
-    await loop.shutdown_default_executor()
-
+    owned_threads = ()
     try:
         result = await runner._run_in_executor_with_context(lambda: "ok")
     finally:
+        executor = getattr(runner, "_executor", None)
+        owned_threads = tuple(getattr(executor, "_threads", ()))
         runner._shutdown_executor()
+        for thread in owned_threads:
+            thread.join(timeout=1)
+        loop._default_executor = original_default_executor
 
     assert result == "ok"
+    assert all(not thread.is_alive() for thread in owned_threads)
 
 
 @pytest.mark.asyncio
@@ -380,7 +389,7 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
 
     _shutdown_executor() means "we're stopping" — the recreate-on-shutdown
     logic exists to survive an *external* teardown of the loop default
-    (test_..._survives_default_executor_shutdown), not to undo our own stop.
+    (test_..._works_with_closed_default_executor), not to undo our own stop.
     """
     runner = object.__new__(GatewayRunner)
 
@@ -393,4 +402,3 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
             await runner._run_in_executor_with_context(lambda: "second")
     finally:
         runner._shutdown_executor()
-

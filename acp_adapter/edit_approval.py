@@ -11,7 +11,6 @@ import asyncio
 import json
 import logging
 import re
-import tempfile
 from concurrent.futures import TimeoutError as FutureTimeout
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
@@ -211,13 +210,17 @@ def should_auto_approve_edit(proposal: EditProposal, policy: str, cwd: str | Non
     if policy == AUTO_APPROVE_SESSION:
         return True
     if policy == AUTO_APPROVE_WORKSPACE:
-        # `/tmp` is the POSIX path but tempfile.gettempdir() is the real one on
-        # every platform: `/private/tmp` on macOS (because `/tmp` is a symlink
-        # and Path.resolve() follows it) and the per-user Temp dir on Windows.
-        tmp_root = Path(tempfile.gettempdir()).resolve(strict=False)
+        # Autonomous edits may use only the authenticated, run-owned temporary
+        # root.  Host-global temp paths are shared authority and are never an
+        # ACP workspace boundary.
+        from hermes_temp import TempAuthorityError, current_temp_authority
+
         try:
-            path.relative_to(tmp_root)
-            return True
+            with current_temp_authority() as authority:
+                path.relative_to(authority.root)
+                return True
+        except TempAuthorityError:
+            return False
         except ValueError:
             pass
         if cwd:

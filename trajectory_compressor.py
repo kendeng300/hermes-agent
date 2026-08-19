@@ -1467,7 +1467,9 @@ def main(
             return
         
         # Create a temporary directory for processing
-        with tempfile.TemporaryDirectory() as temp_dir:
+        from hermes_temp import current_temp_authority
+        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("trajectory-image") as owned_tmp:
+            temp_dir = owned_tmp.path
             temp_input_dir = Path(temp_dir) / "input"
             temp_output_dir = Path(temp_dir) / "output"
             temp_input_dir.mkdir()
@@ -1514,7 +1516,9 @@ def main(
             print(f"\n⚠️  Sampling from directory: will sample {sample_percent}% from each file")
             
             # Create a temp directory with sampled files
-            with tempfile.TemporaryDirectory() as temp_dir:
+            from hermes_temp import current_temp_authority
+            with current_temp_authority() as temp_authority, temp_authority.temporary_directory("trajectory-image") as owned_tmp:
+                temp_dir = owned_tmp.path
                 temp_input_dir = Path(temp_dir) / "input"
                 temp_input_dir.mkdir()
                 

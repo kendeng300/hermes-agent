@@ -2,6 +2,8 @@
 daemons whose Python parent exited without cleaning up."""
 
 import os
+import sys
+from types import ModuleType
 from unittest.mock import patch
 
 import pytest
@@ -394,6 +396,28 @@ class TestReaperIdentityGuard:
     recycled PIDs that would otherwise become an arbitrary same-user DoS.
     """
 
+    @pytest.fixture(autouse=True)
+    def _isolated_psutil_contract(self, monkeypatch):
+        """Provide the exact process/error seam without ambient packages.
+
+        psutil is a pinned production dependency, but this identity unit must
+        also run in the minimal frozen test launcher.  The production function
+        still performs its real import and exercises Process/name/cmdline/env;
+        only the OS process table is replaced.
+        """
+        module = ModuleType("psutil")
+
+        class NoSuchProcess(Exception):
+            pass
+
+        class AccessDenied(Exception):
+            pass
+
+        module.NoSuchProcess = NoSuchProcess
+        module.AccessDenied = AccessDenied
+        module.Process = lambda _pid: None
+        monkeypatch.setitem(sys.modules, "psutil", module)
+
     class _FakeProc:
         def __init__(self, name="agent-browser", cmdline=None, environ=None,
                      raise_environ=False):
@@ -430,8 +454,8 @@ class TestReaperIdentityGuard:
             return _verify_reapable_browser_daemon(
                 daemon_pid, socket_dir, session_name)
 
-    def test_real_daemon_bound_via_cmdline_is_reapable(self):
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+    def test_real_daemon_bound_via_cmdline_is_reapable(self, fake_tmpdir):
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
         proc = self._FakeProc(
             name="agent-browser",
             cmdline=["agent-browser", "open", "--session", "h_sess123456",
@@ -439,8 +463,8 @@ class TestReaperIdentityGuard:
         )
         assert self._run(proc, socket_dir) is True
 
-    def test_daemon_bound_via_environ_is_reapable(self):
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+    def test_daemon_bound_via_environ_is_reapable(self, fake_tmpdir):
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
         proc = self._FakeProc(
             name="agent-browser-linux-x64",
             cmdline=["agent-browser-linux-x64", "daemon"],  # no dir in cmd
@@ -448,31 +472,32 @@ class TestReaperIdentityGuard:
         )
         assert self._run(proc, socket_dir) is True
 
-    def test_planted_pid_for_non_browser_process_is_refused(self):
+    def test_planted_pid_for_non_browser_process_is_refused(self, fake_tmpdir):
         """A planted .pid pointing at e.g. `sleep 600` must NOT be reaped."""
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
         proc = self._FakeProc(name="sleep", cmdline=["/bin/sleep", "600"])
         assert self._run(proc, socket_dir) is False
 
-    def test_recycled_pid_browser_not_bound_to_our_dir_is_refused(self):
+    def test_recycled_pid_browser_not_bound_to_our_dir_is_refused(self, fake_tmpdir):
         """An agent-browser process for a DIFFERENT session must not be reaped.
 
         Models PID reuse / a concurrent unrelated daemon: it looks like
         agent-browser but is bound to another socket dir.
         """
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
+        other_socket_dir = str(fake_tmpdir / "agent-browser-h_OTHER999")
         proc = self._FakeProc(
             name="agent-browser",
             cmdline=["agent-browser", "open", "--session", "h_OTHER999",
-                     "--socket-dir", "/tmp/agent-browser-h_OTHER999"],
+                     "--socket-dir", other_socket_dir],
             environ={"AGENT_BROWSER_SOCKET_DIR":
-                     "/tmp/agent-browser-h_OTHER999"},
+                     other_socket_dir},
         )
         assert self._run(proc, socket_dir) is False
 
-    def test_browser_name_but_environ_denied_and_no_cmdline_bind_refused(self):
+    def test_browser_name_but_environ_denied_and_no_cmdline_bind_refused(self, fake_tmpdir):
         """Looks like browser, cmdline doesn't bind, environ() denied -> refuse."""
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
         proc = self._FakeProc(
             name="agent-browser",
             cmdline=["agent-browser", "daemon"],  # no dir
@@ -480,12 +505,12 @@ class TestReaperIdentityGuard:
         )
         assert self._run(proc, socket_dir) is False
 
-    def test_vanished_process_is_not_reapable(self):
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+    def test_vanished_process_is_not_reapable(self, fake_tmpdir):
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
         assert self._run(None, socket_dir, no_such=True) is False
 
-    def test_access_denied_on_identity_read_refuses(self):
-        socket_dir = "/tmp/agent-browser-h_sess123456"
+    def test_access_denied_on_identity_read_refuses(self, fake_tmpdir):
+        socket_dir = str(fake_tmpdir / "agent-browser-h_sess123456")
         assert self._run(None, socket_dir, access_denied=True) is False
 
     def test_planted_pid_survives_full_reaper_path(self, fake_tmpdir):

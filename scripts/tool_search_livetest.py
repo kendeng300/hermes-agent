@@ -228,7 +228,7 @@ SCENARIOS: List[Dict[str, Any]] = [
         "id": "D_core_plus_deferred",
         "description": "Task uses BOTH a core tool (read_file) and a deferred tool",
         "prompt": (
-            "Read the file at /tmp/livetest/notes.txt (it exists, just read it) "
+            "Read the fixture path supplied for this run (it exists, just read it) "
             "and then post its contents to the #random Slack channel. Tell me you're done."
         ),
         "expected_underlying_tools": ["read_file", "slack_send_message"],
@@ -247,6 +247,8 @@ SCENARIOS: List[Dict[str, Any]] = [
 # Harness
 # ---------------------------------------------------------------------------
 
+_ISOLATED_HOME_OWNERS = {}
+
 
 def setup_isolated_home(enabled: bool) -> Path:
     """Create a fresh ~/.hermes/ for one test, copying minimal credentials.
@@ -254,9 +256,13 @@ def setup_isolated_home(enabled: bool) -> Path:
     Also reads OPENROUTER_API_KEY from the user's real ``~/.hermes/.env`` so
     the agent can authenticate against OpenRouter inside the isolated home.
     """
-    home_dir = Path(tempfile.mkdtemp(prefix="hermes_ts_live_"))
+    from hermes_temp import current_temp_authority
+    temp_authority = current_temp_authority()
+    owned_home = temp_authority.mkdir("tool-search-live")
+    home_dir = owned_home.path
     hermes_home = home_dir / ".hermes"
     hermes_home.mkdir(parents=True)
+    _ISOLATED_HOME_OWNERS[hermes_home] = (owned_home, temp_authority)
 
     if ORIGINAL_AUTH.exists():
         shutil.copy(ORIGINAL_AUTH, hermes_home / "auth.json")
@@ -356,8 +362,15 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
     os.environ["HERMES_HOME"] = str(home)
 
     # Pre-create the test file used by scenario D.
-    Path("/tmp/livetest").mkdir(exist_ok=True)
-    Path("/tmp/livetest/notes.txt").write_text("Hello from the test fixture.\n", encoding="utf-8")
+    fixture_path = home / "livetest" / "notes.txt"
+    fixture_path.parent.mkdir(mode=0o700)
+    fixture_path.write_text("Hello from the test fixture.\n", encoding="utf-8")
+    effective_scenario = dict(scenario)
+    if scenario["id"] == "D_core_plus_deferred":
+        effective_scenario["prompt"] = (
+            f"Read the file at {fixture_path} (it exists, just read it) and then "
+            "post its contents to the #random Slack channel. Tell me you're done."
+        )
 
     n_registered = register_fake_tools()
 
@@ -395,7 +408,7 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
             max_iterations=15,
         )
         result = agent.run_conversation(
-            user_message=scenario["prompt"],
+            user_message=effective_scenario["prompt"],
             system_message=(
                 "You are a test agent. Complete the user's task using available "
                 "tools. Be concise; don't add commentary beyond what's needed."
@@ -424,7 +437,7 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
         "scenario_description": scenario["description"],
         "tool_search_enabled": enabled,
         "model": "anthropic/claude-haiku-4.5 (via openrouter)",
-        "prompt": scenario["prompt"],
+        "prompt": effective_scenario["prompt"],
         "expected_underlying_tools": scenario.get("expected_underlying_tools", []),
         "n_fake_tools_registered": n_registered,
         "elapsed_seconds": round(elapsed, 2),
@@ -440,7 +453,11 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
     out_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
 
     # Cleanup
-    shutil.rmtree(home.parent, ignore_errors=True)
+    owned_home, temp_authority = _ISOLATED_HOME_OWNERS.pop(home)
+    try:
+        owned_home.cleanup()
+    finally:
+        temp_authority.close()
     return record
 
 
