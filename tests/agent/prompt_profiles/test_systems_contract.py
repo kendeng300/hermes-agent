@@ -1,10 +1,44 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> None:
+    """Bind the parent renderer to a deterministic supported policy core."""
+    from agent.prompt_profiles import renderer
+
+    reqs = [
+        [f"test-{index}", "constraint", "universal", f"gate-{index}"]
+        for index in range(152)
+    ]
+    core = "\n".join(
+        [*renderer._PROTECTED_BLOCKS]
+        + [
+            f"<!-- REQ:{req} type:{kind} scope:{scope} gate:{gate} -->"
+            for req, kind, scope, gate in reqs
+        ]
+    ) + "\n"
+    core_path = tmp_path / "SOUL.md"
+    core_path.write_text(core, encoding="utf-8")
+    monkeypatch.setattr(renderer, "_APPROVED_CANONICAL_CORE_PATH", core_path)
+    monkeypatch.setattr(
+        renderer,
+        "_APPROVED_CANONICAL_CORE_SHA256",
+        hashlib.sha256(core.encode()).hexdigest(),
+    )
+    monkeypatch.setattr(
+        renderer,
+        "_APPROVED_REQ_MANIFEST_SHA256",
+        hashlib.sha256(
+            json.dumps(reqs, ensure_ascii=False, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
 
 
 def test_profile_registry_and_effective_windows() -> None:
@@ -33,9 +67,8 @@ def test_rendered_adapters_use_canonical_standard_process_checkout(
     monkeypatch,
 ) -> None:
     from agent.prompt_profiles import get_profile, render_profile
-    from tests.agent.prompt_profiles.fixtures import install_approved_test_core
 
-    install_approved_test_core(tmp_path, monkeypatch)
+    _install_parent_supported_core(tmp_path, monkeypatch)
     rendered = render_profile(get_profile(provider, model)).stable
     command = (
         "cd /home/linux/.hermes/scripts && "

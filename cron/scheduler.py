@@ -2217,6 +2217,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
             success, script_output = prerun_script
         else:
             success, script_output = _run_job_script(script_path)
+        script_output = _scan_raw_injected_cron_data(str(script_output or ""), job)
         if success:
             if script_output:
                 prompt = (
@@ -2242,13 +2243,16 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
-        from cron.jobs import get_cron_output_dir
-        output_dir = get_cron_output_dir()
+        from cron.jobs import _job_output_dir
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
-            # Guard against path traversal — valid job IDs are 12-char hex strings
-            if not source_job_id or not all(c in "0123456789abcdef" for c in source_job_id):
+            # Job IDs are UUIDs today, while safe legacy IDs remain supported.
+            # Resolve through the canonical output-path validator so absolute,
+            # traversal, and nested path components still fail closed.
+            try:
+                job_output_dir = _job_output_dir(source_job_id)
+            except ValueError:
                 logger.warning(
                     "context_from: skipping invalid job_id %r for job_id=%r name=%r%s",
                     source_job_id,
@@ -2258,7 +2262,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 )
                 continue
             try:
-                job_output_dir = output_dir / source_job_id
                 if not job_output_dir.exists():
                     continue  # silent skip — no output yet
                 output_files = sorted(
@@ -2274,6 +2277,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
                     latest_output = latest_output[:_MAX_CONTEXT_CHARS] + "\n\n[... output truncated ...]"
                 if latest_output:
+                    latest_output = _scan_raw_injected_cron_data(latest_output, job)
                     prompt = (
                         f"## Output from job '{source_job_id}'\n"
                         "The following is the most recent output from a preceding "
@@ -2466,6 +2470,22 @@ def _scan_assembled_cron_prompt(
         )
         raise CronPromptInjectionBlocked(scan_error)
     return assembled
+
+
+def _scan_raw_injected_cron_data(payload: str, job: dict) -> str:
+    """Apply loose injection patterns before framing raw runtime data."""
+    from tools.cronjob_tools import _scan_cron_injected_data
+
+    cleaned, scan_error = _scan_cron_injected_data(payload)
+    if scan_error:
+        job_label = job.get("name") or job.get("id") or "<unknown>"
+        logger.warning(
+            "Cron job '%s': raw injected data blocked by injection scanner — %s",
+            job_label,
+            scan_error,
+        )
+        raise CronPromptInjectionBlocked(scan_error)
+    return cleaned
 
 
 def _guard_job_credential_exfil(job: dict) -> None:
