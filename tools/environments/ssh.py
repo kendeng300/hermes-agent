@@ -44,47 +44,41 @@ class SSHEnvironment(BaseEnvironment):
 
     def __init__(self, host: str, user: str, cwd: str = "~",
                  timeout: int = 60, port: int = 22, key_path: str = ""):
-        _ensure_ssh_available()
-        self._bind_backend_temp_home("/root" if user == "root" else f"/home/{user}")
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
 
-        self._temp_authority = None
-        self._control_dir_owner = None
-        self._sync_manager = None
-        self.control_socket = None
-        try:
-            from hermes_temp import current_temp_authority
-            self._temp_authority = current_temp_authority()
-            self._control_dir_owner = self._temp_authority.mkdir("ssh-control")
-            self.control_dir = self._control_dir_owner.path
-            # Keep the socket filename short and deterministic so the full
-            # path stays below the platform's Unix socket budget.
-            _socket_id = hashlib.sha256(
-                f"{user}@{host}:{port}".encode()
-            ).hexdigest()[:16]
-            self.control_socket = self.control_dir / f"{_socket_id}.sock"
-            self._establish_connection()
-            self._remote_home = self._detect_remote_home()
-            self._bind_backend_temp_home(self._remote_home)
+        self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
+        self.control_dir.mkdir(parents=True, exist_ok=True)
+        # Keep the socket filename short and deterministic so the full path
+        # stays under the 104-byte sun_path limit that macOS enforces on
+        # Unix domain sockets. A raw ``user@host:port`` — especially with an
+        # IPv6 host — plus the 16-byte random suffix SSH appends in
+        # ControlMaster mode easily exceeds the limit under macOS's
+        # deeply-nested $TMPDIR (e.g. /var/folders/xx/yy/T/). Hashing the
+        # triple keeps the path stable across reconnects so ControlMaster
+        # reuse still works.
+        _socket_id = hashlib.sha256(
+            f"{user}@{host}:{port}".encode()
+        ).hexdigest()[:16]
+        self.control_socket = self.control_dir / f"{_socket_id}.sock"
+        _ensure_ssh_available()
+        self._establish_connection()
+        self._remote_home = self._detect_remote_home()
 
-            self._ensure_remote_dirs()
-            self._sync_manager = FileSyncManager(
-                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-                upload_fn=self._scp_upload,
-                delete_fn=self._ssh_delete,
-                bulk_upload_fn=self._ssh_bulk_upload,
-                bulk_download_fn=self._ssh_bulk_download,
-            )
-            self._sync_manager.sync(force=True)
+        self._ensure_remote_dirs()
+        self._sync_manager = FileSyncManager(
+            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+            upload_fn=self._scp_upload,
+            delete_fn=self._ssh_delete,
+            bulk_upload_fn=self._ssh_bulk_upload,
+            bulk_download_fn=self._ssh_bulk_download,
+        )
+        self._sync_manager.sync(force=True)
 
-            self.init_session()
-        except Exception:
-            self._release_local_authority(sync_back=False)
-            raise
+        self.init_session()
 
     def _build_ssh_command(self, extra_args: list | None = None) -> list:
         cmd = ["ssh"]
@@ -149,7 +143,7 @@ class SSHEnvironment(BaseEnvironment):
     def _ensure_remote_dirs(self) -> None:
         """Create base ~/.hermes directory tree on remote in one SSH call."""
         base = f"{self._remote_home}/.hermes"
-        dirs = [base, f"{base}/skills", f"{base}/credentials", f"{base}/cache", f"{base}/tmp"]
+        dirs = [base, f"{base}/skills", f"{base}/credentials", f"{base}/cache"]
         cmd = self._build_ssh_command()
         cmd.append(quoted_mkdir_command(dirs))
         subprocess.run(
@@ -225,9 +219,7 @@ class SSHEnvironment(BaseEnvironment):
         # OSError with winerror 1314 (privilege not held).  Catch only
         # that specific error and fall back to a plain copy; all other
         # OSErrors (e.g. disk full, bad path) are re-raised as normal.
-        from hermes_temp import current_temp_authority
-        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("ssh-bulk") as owned_tmp:
-            staging = str(owned_tmp.path)
+        with tempfile.TemporaryDirectory(prefix="hermes-ssh-bulk-") as staging:
             for host_path, remote_path in files:
                 try:
                     rel_remote = os.path.relpath(remote_path, base)
@@ -360,37 +352,24 @@ class SSHEnvironment(BaseEnvironment):
 
         return _popen_bash(cmd, stdin_data)
 
-    def _release_local_authority(self, *, sync_back: bool) -> None:
-        manager = getattr(self, "_sync_manager", None)
-        self._sync_manager = None
-        try:
-            if sync_back and manager is not None:
-                logger.info("SSH: syncing files from sandbox...")
-                manager.sync_back()
-        finally:
-            control_socket = getattr(self, "control_socket", None)
-            if control_socket is not None and control_socket.exists():
-                try:
-                    cmd = ["ssh", "-o", f"ControlPath={control_socket}",
-                           "-O", "exit", f"{self.user}@{self.host}"]
-                    subprocess.run(
-                        cmd,
-                        capture_output=True,
-                        timeout=5,
-                        stdin=subprocess.DEVNULL,
-                    )
-                except (OSError, subprocess.SubprocessError):
-                    pass
-            owner = getattr(self, "_control_dir_owner", None)
-            authority = getattr(self, "_temp_authority", None)
-            self._control_dir_owner = None
-            self._temp_authority = None
-            try:
-                if owner is not None:
-                    owner.cleanup()
-            finally:
-                if authority is not None:
-                    authority.close()
-
     def cleanup(self):
-        self._release_local_authority(sync_back=True)
+        if self._sync_manager:
+            logger.info("SSH: syncing files from sandbox...")
+            self._sync_manager.sync_back()
+
+        if self.control_socket.exists():
+            try:
+                cmd = ["ssh", "-o", f"ControlPath={self.control_socket}",
+                       "-O", "exit", f"{self.user}@{self.host}"]
+                subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    timeout=5,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+            try:
+                self.control_socket.unlink()
+            except OSError:
+                pass

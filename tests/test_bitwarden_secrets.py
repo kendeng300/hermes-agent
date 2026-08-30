@@ -29,37 +29,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agent.secret_sources import bitwarden as bw  # noqa: E402
-from hermes_temp import resolve_temp_authority  # noqa: E402
-
-
-_TEMP_BINDING_KEYS = (
-    "HERMES_TEMP_ROOT",
-    "HERMES_TEMP_ROOT_IDENTITY",
-    "HERMES_TEMP_SCOPE",
-    "HERMES_TEMP_MANIFEST_SHA256",
-    "HERMES_TEMP_AUTHORITY_VERSION",
-    "TMPDIR",
-    "TEMP",
-    "TMP",
-)
-
-
-def _bind_test_home(monkeypatch, home: Path) -> Path:
-    home.mkdir(parents=True, exist_ok=True, mode=0o700)
-    home.chmod(0o700)
-    for name in _TEMP_BINDING_KEYS:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    authority = resolve_temp_authority(
-        scope="test",
-        run_nonce=os.environ["HERMES_TEMP_RUN_NONCE"],
-    )
-    try:
-        for name, value in authority.child_environment().items():
-            monkeypatch.setenv(name, value)
-    finally:
-        authority.close()
-    return home
 
 
 @pytest.fixture(autouse=True)
@@ -73,7 +42,8 @@ def _reset_caches():
 def hermes_home(tmp_path, monkeypatch):
     """Point Hermes at an isolated home directory."""
     home = tmp_path / ".hermes"
-    _bind_test_home(monkeypatch, home)
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     # Some modules cache get_hermes_home; clear if needed.
     import hermes_constants
     if hasattr(hermes_constants, "_HERMES_HOME_CACHE"):

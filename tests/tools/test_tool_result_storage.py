@@ -12,6 +12,7 @@ from tools.tool_result_storage import (
     HEREDOC_MARKER,
     PERSISTED_OUTPUT_TAG,
     PERSISTED_OUTPUT_CLOSING_TAG,
+    STORAGE_DIR,
     _build_persisted_message,
     _heredoc_marker,
     _resolve_storage_dir,
@@ -156,12 +157,8 @@ class TestWriteToSandbox:
 
 
 class TestResolveStorageDir:
-    def test_defaults_to_bound_authority_without_env(self):
-        from hermes_temp import current_temp_authority
-
-        with current_temp_authority() as authority:
-            expected = f"{authority.root}/hermes-results"
-        assert _resolve_storage_dir(None) == expected
+    def test_defaults_to_storage_dir_without_env(self):
+        assert _resolve_storage_dir(None) == STORAGE_DIR
 
     def test_uses_env_temp_dir_when_available(self):
         env = MagicMock()
@@ -396,7 +393,7 @@ class TestMaybePersistToolResult:
     def test_tool_use_id_cannot_escape_storage_dir(self):
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}
-        env.get_temp_dir.return_value = "/remote/home/.hermes/tmp"
+        env.get_temp_dir.return_value = ""
         content = "x" * 60_000
         result = maybe_persist_tool_result(
             content=content,
@@ -408,9 +405,9 @@ class TestMaybePersistToolResult:
         cmd = env.execute.call_args[0][0]
         target = cmd.split("cat > ", 1)[1].split(" <<", 1)[0]
 
-        assert "Full output saved to: /remote/home/.hermes/tmp/hermes-results/outside_whoami_x_" in result
-        assert "/remote/home/.hermes/tmp/hermes-results/../" not in result
-        assert target.startswith("/remote/home/.hermes/tmp/hermes-results/outside_whoami_x_")
+        assert "Full output saved to: /tmp/hermes-results/outside_whoami_x_" in result
+        assert "/tmp/hermes-results/../" not in result
+        assert target.startswith("/tmp/hermes-results/outside_whoami_x_")
         assert "/../" not in target
         assert "$(whoami)" not in target
         assert ";" not in target

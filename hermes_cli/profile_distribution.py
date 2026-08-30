@@ -619,9 +619,7 @@ def install_distribution(
         create_wrapper_script,
     )
 
-    from hermes_temp import current_temp_authority
-    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("profile-install") as owned_tmp:
-        tmp = owned_tmp.path
+    with tempfile.TemporaryDirectory(prefix="hermes_dist_install_") as tmp:
         plan = plan_install(source, Path(tmp), override_name=name)
 
         if plan.existing and not force:
@@ -683,9 +681,7 @@ def update_distribution(
             "`hermes profile install <source> --name {canon} --force`."
         )
 
-    from hermes_temp import current_temp_authority
-    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("profile-update") as owned_tmp:
-        tmp = owned_tmp.path
+    with tempfile.TemporaryDirectory(prefix="hermes_dist_update_") as tmp:
         plan = plan_install(
             existing_manifest.source,
             Path(tmp),

@@ -68,8 +68,9 @@ def _windows_to_msys_path(cwd: str) -> str:
 
 def _resolve_safe_cwd(cwd: str) -> str:
     """Return ``cwd`` if it exists as a directory, else the nearest existing
-    ancestor.  If walking up cannot find an existing directory, uses the
-    current Hermes temporary authority and fails closed if it is unavailable.
+    ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
+    path can't find any existing directory (effectively never on a healthy
+    filesystem, but cheap belt-and-braces).
 
     On Windows, also normalizes Git Bash / MSYS-style POSIX paths
     (``/c/Users/x``) to native Windows form before the isdir check so a
@@ -95,9 +96,7 @@ def _resolve_safe_cwd(cwd: str) -> str:
             # genuinely nothing to fall back to except the temp dir.
             break
         parent = next_parent
-    from hermes_temp import current_temp_authority
-    with current_temp_authority() as temp_authority:
-        return str(temp_authority.root)
+    return tempfile.gettempdir()
 
 
 # Hermes-internal env vars that should NOT leak into terminal subprocesses.
@@ -945,16 +944,50 @@ class LocalEnvironment(BaseEnvironment):
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
-        Resolve the complete, identity-bound Hermes TempAuthority inherited by
-        this backend. Partial or ambient system-temp configuration is rejected.
+        Termux does not provide /tmp by default, but exposes a POSIX TMPDIR.
+        Prefer POSIX-style env vars when available, keep using /tmp on regular
+        Unix systems, and only fall back to tempfile.gettempdir() when it also
+        resolves to a POSIX path.
 
-        The authority path is normalized for Git Bash on Windows.
+        Check the environment configured for this backend first so callers can
+        override the temp root explicitly (for example via terminal.env or a
+        custom TMPDIR), then fall back to the host process environment.
+
+        **Windows:** hardcoded ``/tmp`` is wrong in two ways — native Python
+        can't open the path, and the Windows default temp (``%TEMP%``) often
+        contains spaces (``C:\\Users\\Some Name\\AppData\\Local\\Temp``) that
+        break unquoted bash interpolations.  Use a dedicated cache dir under
+        ``HERMES_HOME`` instead — single-word path, guaranteed to exist, same
+        string resolves in both Git Bash and native Python.
         """
-        from hermes_temp import current_temp_authority
-        effective_env = dict(os.environ)
-        effective_env.update(self.env)
-        with current_temp_authority(env=effective_env) as temp_authority:
-            return str(temp_authority.root).replace("\\", "/")
+        if _IS_WINDOWS:
+            # Derive a Windows-safe temp dir under HERMES_HOME.  Using
+            # forward slashes makes the same string work unchanged in bash
+            # command interpolations AND in Python ``open()`` — Windows
+            # accepts forward slashes in filesystem paths, and we control
+            # the path so we can guarantee no spaces.
+            try:
+                from hermes_constants import get_hermes_home
+                cache_dir = get_hermes_home() / "cache" / "terminal"
+            except Exception:
+                cache_dir = Path(tempfile.gettempdir()) / "hermes_terminal"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            # Force forward slashes so the same string serves both contexts.
+            return str(cache_dir).replace("\\", "/")
+
+        for env_var in ("TMPDIR", "TMP", "TEMP"):
+            candidate = self.env.get(env_var) or os.environ.get(env_var)
+            if candidate and candidate.startswith("/"):
+                return candidate.rstrip("/") or "/"
+
+        if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK | os.X_OK):
+            return "/tmp"
+
+        candidate = tempfile.gettempdir()
+        if candidate.startswith("/"):
+            return candidate.rstrip("/") or "/"
+
+        return "/tmp"
 
     @staticmethod
     def _quote_cwd_for_cd(cwd: str) -> str:

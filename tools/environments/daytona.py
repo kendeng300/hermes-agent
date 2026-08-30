@@ -49,7 +49,6 @@ class DaytonaEnvironment(BaseEnvironment):
         task_id: str = "default",
     ):
         requested_cwd = cwd
-        self._bind_backend_temp_home("/home/daytona")
         super().__init__(cwd=cwd, timeout=timeout)
 
         try:
@@ -185,7 +184,7 @@ class DaytonaEnvironment(BaseEnvironment):
         rel_base = f"{self._remote_home}/.hermes".lstrip("/")
         # PID-suffixed remote temp path avoids collisions if sync_back fires
         # concurrently for the same sandbox (e.g. retry after partial failure).
-        remote_tar = f"{self.get_temp_dir()}/hermes-sync-{os.getpid()}.tar"
+        remote_tar = f"/tmp/.hermes_sync.{os.getpid()}.tar"
         self._sandbox.process.exec(
             f"tar cf {shlex.quote(remote_tar)} -C / {shlex.quote(rel_base)}"
         )

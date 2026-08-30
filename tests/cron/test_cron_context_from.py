@@ -255,14 +255,18 @@ class TestBuildJobPromptContextFrom:
         # Job should not crash, prompt should still contain the base prompt
         assert "Process" in prompt
 
-    def test_invalid_job_id_skipped(self, cron_env):
-        """context_from with path traversal job_id should be skipped."""
+    @pytest.mark.parametrize(
+        "invalid_job_id",
+        ("../../../etc/passwd", "/etc/passwd", "nested/job"),
+    )
+    def test_invalid_job_id_skipped(self, cron_env, invalid_job_id):
+        """Unsafe context_from path components should be skipped."""
         from cron.jobs import create_job
         from cron.scheduler import _build_job_prompt
 
         job = create_job(prompt="Process", schedule="every 2h")
         # Manually inject invalid context_from (simulating tampered jobs.json)
-        job["context_from"] = ["../../../etc/passwd"]
+        job["context_from"] = [invalid_job_id]
         prompt = _build_job_prompt(job)
         # Should not crash and should not inject anything malicious
         assert "Process" in prompt

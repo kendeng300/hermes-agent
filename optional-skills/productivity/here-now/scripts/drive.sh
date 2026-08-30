@@ -39,8 +39,6 @@ USAGE
 die() { echo "error: $1" >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HERMES_AGENT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-. "$HERMES_AGENT_ROOT/scripts/lib/temp-authority.sh"
 SKILL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 BUNDLED_JQ="${SKILL_DIR}/bin/jq"
 
@@ -124,7 +122,7 @@ api_json() {
   local url="$1"; shift
   local body="${1:-}"
   local tmp
-  hermes_temp_file tmp herenow-response .json
+  tmp=$(mktemp)
   local code
   if [[ -n "$body" ]]; then
     code=$(curl -sS -o "$tmp" -w "%{http_code}" -X "$method" "$url" "${auth_header[@]}" -H "content-type: application/json" -d "$body")

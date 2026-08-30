@@ -29,10 +29,7 @@ def _find_chrome() -> str:
 
 
 def _start_chrome(port: int):
-    from hermes_temp import current_temp_authority
-    temp_authority = current_temp_authority()
-    owned_profile = temp_authority.mkdir("browser-benchmark")
-    profile = str(owned_profile.path)
+    profile = tempfile.mkdtemp(prefix="hermes-bench-eval-")
     proc = subprocess.Popen(
         [
             _find_chrome(),
@@ -51,14 +48,10 @@ def _start_chrome(port: int):
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=1) as r:
                 info = json.loads(r.read().decode())
-                return proc, profile, info["webSocketDebuggerUrl"], owned_profile, temp_authority
+                return proc, profile, info["webSocketDebuggerUrl"]
         except Exception:
             time.sleep(0.25)
     proc.terminate()
-    try:
-        owned_profile.cleanup()
-    finally:
-        temp_authority.close()
     raise RuntimeError("Chrome didn't expose CDP")
 
 
@@ -68,7 +61,7 @@ def main():
     parser.add_argument("--port", type=int, default=9333)
     args = parser.parse_args()
 
-    proc, profile, cdp_url, owned_profile, temp_authority = _start_chrome(args.port)
+    proc, profile, cdp_url = _start_chrome(args.port)
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY
 
@@ -138,10 +131,7 @@ def main():
             proc.wait(timeout=3)
         except Exception:
             proc.kill()
-        try:
-            owned_profile.cleanup()
-        finally:
-            temp_authority.close()
+        shutil.rmtree(profile, ignore_errors=True)
 
 
 if __name__ == "__main__":

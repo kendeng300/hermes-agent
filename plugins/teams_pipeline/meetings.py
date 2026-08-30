@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -199,11 +199,8 @@ async def download_transcript_text(
     encoding: str = "utf-8",
 ) -> str:
     suffix = Path(transcript.display_name or "transcript.vtt").suffix or ".txt"
-    from hermes_temp import current_temp_authority
-    temp_authority = current_temp_authority()
-    descriptor, owned_destination = temp_authority.mkstemp("teams-transcript", suffix)
-    os.close(descriptor)
-    destination = owned_destination.path
+    with tempfile.NamedTemporaryFile(prefix="teams-transcript-", suffix=suffix, delete=False) as handle:
+        destination = Path(handle.name)
     try:
         await client.download_to_file(_transcript_download_path(meeting_ref, transcript), destination)
         text = destination.read_text(encoding=encoding).strip()
@@ -216,9 +213,9 @@ async def download_transcript_text(
         ) from exc
     finally:
         try:
-            owned_destination.cleanup()
-        finally:
-            temp_authority.close()
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     if not text:
         raise TeamsMeetingArtifactNotFoundError(

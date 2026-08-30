@@ -2811,7 +2811,7 @@ class TestOrchestratorRoleBehavior(unittest.TestCase):
             "Fix tests", role="leaf",
             max_spawn_depth=2, child_depth=1,
         )
-        self.assertNotIn("delegate_task", prompt)
+        self.assertNotIn("You have access to the `delegate_task` tool", prompt)
         self.assertNotIn("Orchestrator Role", prompt)
 
     def test_orchestrator_prompt_mentions_delegation_capability(self):

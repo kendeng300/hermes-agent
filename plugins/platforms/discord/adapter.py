@@ -686,12 +686,9 @@ class VoiceReceiver:
     def pcm_to_wav(pcm_data: bytes, output_path: str,
                    src_rate: int = 48000, src_channels: int = 2):
         """Convert raw PCM to 16kHz mono WAV via ffmpeg."""
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        descriptor, owned_pcm = temp_authority.mkstemp("discord-pcm", ".pcm")
-        with os.fdopen(descriptor, "wb") as f:
+        with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as f:
             f.write(pcm_data)
-        pcm_path = str(owned_pcm.path)
+            pcm_path = f.name
         try:
             from hermes_cli._subprocess_compat import windows_hide_flags
 
@@ -713,9 +710,9 @@ class VoiceReceiver:
             )
         finally:
             try:
-                owned_pcm.cleanup()
-            finally:
-                temp_authority.close()
+                os.unlink(pcm_path)
+            except OSError:
+                pass
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:
@@ -2809,11 +2806,12 @@ class DiscordAdapter(BasePlatformAdapter):
             phrase = random.choice(phrases)
 
         # Synthesise the ack via the configured TTS provider, then layer it.
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        audio_fd, owned_audio = temp_authority.mkstemp("discord-ack", ".mp3")
-        os.close(audio_fd)
-        audio_path = str(owned_audio.path)
+        import uuid as _uuid
+        audio_path = os.path.join(
+            tempfile.gettempdir(), "hermes_voice",
+            f"ack_{_uuid.uuid4().hex[:12]}.mp3",
+        )
+        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
         try:
             from tools.tts_tool import text_to_speech_tool
             result_json = await asyncio.to_thread(
@@ -2839,17 +2837,12 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("play_ack_in_voice failed: %s", e)
             return False
         finally:
-            for p in {locals().get("actual")}:
-                if p and p != audio_path and os.path.isfile(p):
+            for p in {audio_path, locals().get("actual")}:
+                if p and os.path.isfile(p):
                     try:
                         os.unlink(p)
                     except OSError:
                         pass
-            try:
-                if owned_audio.path.exists():
-                    owned_audio.cleanup()
-            finally:
-                temp_authority.close()
 
     def voice_mixer_active(self, guild_id: int) -> bool:
         """True when a continuous mixer is installed for this guild."""
@@ -3193,11 +3186,9 @@ class DiscordAdapter(BasePlatformAdapter):
         """Convert PCM -> WAV -> STT -> callback."""
         from tools.voice_mode import is_whisper_hallucination
 
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        wav_fd, owned_wav = temp_authority.mkstemp("discord-listen", ".wav")
-        os.close(wav_fd)
-        wav_path = str(owned_wav.path)
+        tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
+        wav_path = tmp_f.name
+        tmp_f.close()
         try:
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
 
@@ -3222,9 +3213,9 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("Voice input processing failed: %s", e, exc_info=True)
         finally:
             try:
-                owned_wav.cleanup()
-            finally:
-                temp_authority.close()
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
     def _discord_channel_ids_allowed(self, channel_ids: set[str]) -> bool:
         """True when *channel_ids* intersect ``DISCORD_ALLOWED_CHANNELS``."""

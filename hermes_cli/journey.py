@@ -291,14 +291,12 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _open_in_editor(initial: str, *, suffix: str) -> Optional[str]:
     import os
     import subprocess
-    from hermes_temp import current_temp_authority
+    import tempfile
 
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
-    temp_authority = current_temp_authority()
-    descriptor, owned_editor_file = temp_authority.mkstemp("journey-editor", suffix)
-    path = str(owned_editor_file.path)
-    with os.fdopen(descriptor, "w", encoding="utf-8") as fh:
+    with tempfile.NamedTemporaryFile("w", suffix=suffix, delete=False, encoding="utf-8") as fh:
         fh.write(initial)
+        path = fh.name
     try:
         subprocess.call([*editor.split(), path])
         with open(path, encoding="utf-8") as fh:
@@ -308,9 +306,9 @@ def _open_in_editor(initial: str, *, suffix: str) -> Optional[str]:
         return None
     finally:
         try:
-            owned_editor_file.cleanup()
-        finally:
-            temp_authority.close()
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def register_cli(parent: argparse.ArgumentParser) -> None:

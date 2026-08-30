@@ -21,89 +21,15 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import os
-import stat
 import sys
 from pathlib import Path
 
 import pytest
 
-from hermes_constants import get_hermes_home
-
 # Ensure project root is importable
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-
-
-def pytest_sessionstart(session):
-    """Reject pytest before collection unless its basetemp is authority-bound.
-
-    ``tmp_path`` can be allocated before any autouse fixture runs.  The
-    process environment therefore is not enough: a direct pytest invocation
-    must provide an already-created, private ``--basetemp`` below the active
-    TempAuthority root.  The canonical runner creates exactly that directory.
-    """
-    config = session.config
-    from hermes_temp import TempAuthorityError, current_temp_authority
-
-    required_offline = {
-        "HERMES_TEST_ACTIVE": "1",
-        "HERMES_OFFLINE": "1",
-        "OFFLINE": "1",
-        "NO_NETWORK": "1",
-    }
-    invalid_offline = {
-        name: os.environ.get(name) for name, expected in required_offline.items()
-        if os.environ.get(name) != expected
-    }
-    if invalid_offline:
-        raise pytest.UsageError(
-            "pytest requires the exact pre-collection offline test contract: "
-            "HERMES_TEST_ACTIVE=1,HERMES_OFFLINE=1,OFFLINE=1,NO_NETWORK=1"
-        )
-
-    try:
-        authority = current_temp_authority()
-    except TempAuthorityError as exc:
-        raise pytest.UsageError(
-            f"pytest requires a complete Hermes temporary authority: {exc}"
-        ) from exc
-    try:
-        if authority.scope not in {"test", "ci", "remote"}:
-            raise pytest.UsageError(
-                "pytest requires a test, ci, or remote temporary authority"
-            )
-        configured = config.getoption("basetemp")
-        if configured is None:
-            raise pytest.UsageError(
-                "pytest requires an explicit authority-contained --basetemp"
-            )
-        basetemp = Path(configured)
-        if not basetemp.is_absolute():
-            raise pytest.UsageError("pytest --basetemp must be absolute")
-        try:
-            metadata = basetemp.lstat()
-            resolved = basetemp.resolve(strict=True)
-            authority_root = authority.root.resolve(strict=True)
-        except OSError as exc:
-            raise pytest.UsageError(
-                "pytest --basetemp must be a precreated private directory"
-            ) from exc
-        if (
-            stat.S_ISLNK(metadata.st_mode)
-            or not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(metadata.st_mode) != 0o700
-            or not resolved.is_relative_to(authority_root)
-            or resolved == authority_root
-        ):
-            raise pytest.UsageError(
-                "pytest --basetemp is outside the private temporary authority"
-            )
-    except BaseException:
-        authority.close()
-        raise
-    config.add_cleanup(authority.close)
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -401,7 +327,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_environment(tmp_path, monkeypatch, request):
+def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
     Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
@@ -428,48 +354,12 @@ def _hermetic_environment(tmp_path, monkeypatch, request):
     #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
     #    is a bug to fix at the callsite.
     fake_hermes_home = tmp_path / "hermes_test"
-    fake_hermes_home.mkdir(mode=0o700)
-    # Mode is part of the authority contract and must not depend on the
-    # invoking user's umask (CI sandboxes may deliberately run with 000).
-    fake_hermes_home.chmod(0o700)
+    fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
-    # Replace the process-level authority with one derived from this test's
-    # isolated profile.  ``tmp_path`` itself is safe because the wrapper binds
-    # pytest's per-file basetemp beneath the process authority before pytest
-    # starts; this creates a second, profile-specific authority below it.
-    for name in (
-        "HERMES_TEMP_ROOT",
-        "HERMES_TEMP_ROOT_IDENTITY",
-        "HERMES_TEMP_SCOPE",
-        "HERMES_TEMP_MANIFEST_SHA256",
-        "HERMES_TEMP_AUTHORITY_VERSION",
-        "TMPDIR",
-        "TEMP",
-        "TMP",
-    ):
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
-    from hermes_temp import resolve_temp_authority
-    authority = resolve_temp_authority(
-        scope="test",
-        run_nonce=os.environ.get("HERMES_TEMP_RUN_NONCE"),
-    )
-    request.addfinalizer(authority.close)
-    for name, value in authority.child_environment().items():
-        monkeypatch.setenv(name, value)
-    import tempfile as _tempfile
-    monkeypatch.setattr(_tempfile, "tempdir", str(authority.root))
-
-    # The approved test runtime lives under /home rather than the host temp
-    # filesystem. Without a ceiling, Git walks out of a test's private
-    # basetemp and discovers the enclosing workspace repository, turning an
-    # empty fixture into a false coding project. Tests that create their own
-    # repository pass an explicit subprocess environment and remain able to
-    # initialize/detect that nested repository.
-    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path.parent))
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
@@ -504,6 +394,7 @@ def _hermetic_environment(tmp_path, monkeypatch, request):
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
 
+
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
 @pytest.fixture(autouse=True)
@@ -536,17 +427,15 @@ def tmp_dir(tmp_path):
 
 
 @pytest.fixture()
-def mock_config(_hermetic_environment):
+def mock_config():
     """Return a minimal hermes config dict suitable for unit tests."""
-    workspace = get_hermes_home() / "workspace"
-    workspace.mkdir(mode=0o700)
     return {
         "model": "test/mock-model",
         "toolsets": ["terminal", "file"],
         "max_turns": 10,
         "terminal": {
             "backend": "local",
-            "cwd": str(workspace),
+            "cwd": "/tmp",
             "timeout": 30,
         },
         "compression": {"enabled": False},

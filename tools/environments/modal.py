@@ -180,7 +180,6 @@ class ModalEnvironment(BaseEnvironment):
         persistent_filesystem: bool = True,
         task_id: str = "default",
     ):
-        self._bind_backend_temp_home("/root")
         super().__init__(cwd=cwd, timeout=timeout)
 
         self._persistent = persistent_filesystem

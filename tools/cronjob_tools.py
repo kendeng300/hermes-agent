@@ -297,6 +297,29 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
     return cleaned, ""
 
 
+def _scan_cron_injected_data(payload: str) -> tuple[str, str]:
+    """Scan raw runtime data before it is wrapped in trusted prompt markup.
+
+    Runtime data keeps the assembled scanner's loose pattern set so quoted
+    command shapes remain valid input. Unlike skill markdown, raw data is not
+    trusted documentation, so its own fences, backticks, and HTML comments
+    must not hide an injection directive from the matcher.
+    """
+    cleaned, removed = _strip_invisible_unicode(payload)
+    if removed:
+        logger.warning(
+            "Cron injected data: stripped %d invisible-unicode char(s) (%s)",
+            len(removed), ", ".join(removed),
+        )
+    for pattern, pid in _CRON_SKILL_ASSEMBLED_PATTERNS:
+        if re.search(pattern, cleaned, re.IGNORECASE):
+            return cleaned, (
+                f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts "
+                "must not contain injection or exfiltration payloads."
+            )
+    return cleaned, ""
+
+
 def _origin_from_env() -> Optional[Dict[str, str]]:
     from gateway.session_context import get_session_env
     origin_platform = get_session_env("HERMES_SESSION_PLATFORM")

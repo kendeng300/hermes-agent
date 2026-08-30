@@ -49,9 +49,7 @@ def pack(
             if not success:
                 return None, f"Error: Validation failed for {input_dir}"
 
-    from hermes_temp import current_temp_authority
-    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("office-pack") as owned_tmp:
-        temp_dir = owned_tmp.path
+    with tempfile.TemporaryDirectory() as temp_dir:
         temp_content_dir = Path(temp_dir) / "content"
         shutil.copytree(input_dir, temp_content_dir)
 

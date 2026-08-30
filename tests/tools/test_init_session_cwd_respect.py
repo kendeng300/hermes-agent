@@ -13,7 +13,7 @@ Fix: the bootstrap now includes an explicit ``cd`` back to self.cwd before
 running ``pwd -P``, so the configured cwd is always what gets recorded.
 """
 
-from io import BytesIO
+from tempfile import TemporaryFile
 from unittest.mock import MagicMock
 
 from tools.environments.base import BaseEnvironment
@@ -22,10 +22,7 @@ from tools.environments.base import BaseEnvironment
 class _TestableEnv(BaseEnvironment):
     """Concrete subclass for testing base class methods."""
 
-    def __init__(self, cwd="/home/hermes-test/work", timeout=10):
-        # Command-shape unit seam; executable remote identity admission is
-        # covered separately by the H2 migration contract.
-        self._backend_temp_dir = "/home/hermes-test/.hermes/tmp"
+    def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
 
     def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
@@ -50,7 +47,7 @@ class TestInitSessionCwdRespect:
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 0
-            stdout = BytesIO()
+            stdout = TemporaryFile(mode="w+b")
             stdout.seek(0)
             mock.stdout = stdout
             return mock
@@ -90,7 +87,7 @@ class TestInitSessionCwdRespect:
             mock.returncode = 0
             # Simulate output where pwd reports the configured cwd
             output = f"snapshot output\n{marker}{configured_cwd}{marker}\n"
-            stdout = BytesIO()
+            stdout = TemporaryFile(mode="w+b")
             stdout.write(output.encode("utf-8"))
             stdout.seek(0)
             mock.stdout = stdout
@@ -104,8 +101,8 @@ class TestInitSessionCwdRespect:
         )
 
     def test_default_cwd_still_works(self):
-        """When no custom cwd is configured, the bound work path is preserved."""
-        env = _TestableEnv()
+        """When no custom cwd is configured, default /tmp behavior is preserved."""
+        env = _TestableEnv()  # default cwd="/tmp"
 
         marker = env._cwd_marker
 
@@ -113,8 +110,8 @@ class TestInitSessionCwdRespect:
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 0
-            output = f"snapshot output\n{marker}/home/hermes-test/work{marker}\n"
-            stdout = BytesIO()
+            output = f"snapshot output\n{marker}/tmp{marker}\n"
+            stdout = TemporaryFile(mode="w+b")
             stdout.write(output.encode("utf-8"))
             stdout.seek(0)
             mock.stdout = stdout
@@ -123,7 +120,7 @@ class TestInitSessionCwdRespect:
         env._run_bash = mock_run_bash
         env.init_session()
 
-        assert env.cwd == "/home/hermes-test/work"
+        assert env.cwd == "/tmp"
 
     def test_bootstrap_cd_uses_shlex_quote(self):
         """Paths with spaces must be properly quoted in the bootstrap cd."""
@@ -136,7 +133,7 @@ class TestInitSessionCwdRespect:
             mock = MagicMock()
             mock.poll.return_value = 0
             mock.returncode = 0
-            stdout = BytesIO()
+            stdout = TemporaryFile(mode="w+b")
             stdout.seek(0)
             mock.stdout = stdout
             return mock

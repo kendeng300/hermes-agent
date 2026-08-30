@@ -27,8 +27,6 @@ HERMES_NODE_MIN_VERSION="${HERMES_NODE_MIN_VERSION:-20}"
 HERMES_NODE_TARGET_MAJOR="${HERMES_NODE_TARGET_MAJOR:-22}"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 HERMES_NODE_AVAILABLE=false
-_NB_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-. "$_NB_LIB_DIR/temp-authority.sh"
 
 # ---------------------------------------------------------------------------
 # Logging — prefer the host script's log_* helpers when present
@@ -189,7 +187,7 @@ _nb_install_bundled_node() {
     fi
 
     local tmp
-    hermes_temp_dir tmp node-bootstrap || return 1
+    tmp=$(mktemp -d)
     _nb_log "Downloading $tarball..."
     curl -fsSL "${index_url}${tarball}" -o "$tmp/$tarball" || {
         _nb_warn "Download failed"; rm -rf "$tmp"; return 1

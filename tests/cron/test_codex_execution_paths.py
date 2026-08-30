@@ -33,6 +33,18 @@ def _patch_agent_bootstrap(monkeypatch):
     monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
 
 
+def _install_fake_tiktoken(monkeypatch):
+    encoding = SimpleNamespace(encode=lambda value, **_: list(value))
+    monkeypatch.setitem(
+        sys.modules,
+        "tiktoken",
+        SimpleNamespace(
+            __version__="test",
+            get_encoding=lambda _name: encoding,
+        ),
+    )
+
+
 def _codex_message_response(text: str):
     return SimpleNamespace(
         output=[
@@ -92,7 +104,15 @@ class _Codex401ThenSuccessAgent(run_agent.AIAgent):
         return super().run_conversation(user_message, conversation_history=conversation_history, task_id=task_id)
 
 
-def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_cron_run_job_codex_path_handles_internal_401_refresh(
+    monkeypatch, tmp_path
+):
+    from tests.agent.prompt_profiles.test_systems_contract import (
+        _install_parent_supported_core,
+    )
+
+    _install_parent_supported_core(tmp_path, monkeypatch)
+    _install_fake_tiktoken(monkeypatch)
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)
@@ -123,7 +143,15 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
 
 
-def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
+def test_gateway_run_agent_codex_path_handles_internal_401_refresh(
+    monkeypatch, tmp_path
+):
+    from tests.agent.prompt_profiles.test_systems_contract import (
+        _install_parent_supported_core,
+    )
+
+    _install_parent_supported_core(tmp_path, monkeypatch)
+    _install_fake_tiktoken(monkeypatch)
     _patch_agent_bootstrap(monkeypatch)
     monkeypatch.setattr(run_agent, "OpenAI", _FakeOpenAI)
     monkeypatch.setattr(run_agent, "AIAgent", _Codex401ThenSuccessAgent)

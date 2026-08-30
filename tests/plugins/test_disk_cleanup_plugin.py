@@ -86,9 +86,9 @@ class TestIsSafePath:
         dg = _load_lib()
         assert dg.is_safe_path(Path("/etc/passwd")) is False
 
-    def test_rejects_legacy_tmp_hermes_prefix(self, _isolate_env, tmp_path):
+    def test_accepts_tmp_hermes_prefix(self, _isolate_env, tmp_path):
         dg = _load_lib()
-        assert dg.is_safe_path(Path("/tmp/hermes-abc/x.log")) is False
+        assert dg.is_safe_path(Path("/tmp/hermes-abc/x.log")) is True
 
     def test_rejects_plain_tmp(self, _isolate_env):
         dg = _load_lib()

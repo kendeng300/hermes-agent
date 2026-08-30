@@ -79,9 +79,7 @@ def main() -> int:
         "compatibility shim (see psutil#2762)..."
     )
 
-    from hermes_temp import current_temp_authority
-    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("psutil-install") as owned_tmp:
-        tmp = owned_tmp.path
+    with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
         archive = tmp_path / "psutil.tar.gz"
         urllib.request.urlretrieve(PSUTIL_URL, archive)

@@ -901,35 +901,27 @@ class SimplexAdapter(BasePlatformAdapter):
                         capture_output=True,
                         timeout=30,
                     )
-                from hermes_temp import current_temp_authority
-                temp_authority = current_temp_authority()
-                descriptor, owned_thumbnail = temp_authority.mkstemp("simplex-thumb", ".jpg")
-                os.close(descriptor)
-                tmp_path = str(owned_thumbnail.path)
-                try:
-                    subprocess.run(
-                        [
-                            "convert",
-                            file_path,
-                            "-resize",
-                            "128x128",
-                            "-quality",
-                            "70",
-                            tmp_path,
-                        ],
-                        check=True,
-                        capture_output=True,
-                        timeout=30,
+                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+                    tmp_path = tmp.name
+                subprocess.run(
+                    [
+                        "convert",
+                        file_path,
+                        "-resize",
+                        "128x128",
+                        "-quality",
+                        "70",
+                        tmp_path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=30,
+                )
+                with open(tmp_path, "rb") as f:
+                    thumb_uri = (
+                        "data:image/jpg;base64," + base64.b64encode(f.read()).decode()
                     )
-                    with open(tmp_path, "rb") as f:
-                        thumb_uri = (
-                            "data:image/jpg;base64," + base64.b64encode(f.read()).decode()
-                        )
-                finally:
-                    try:
-                        owned_thumbnail.cleanup()
-                    finally:
-                        temp_authority.close()
+                os.remove(tmp_path)
             except (FileNotFoundError, subprocess.SubprocessError) as exc:
                 logger.warning("SimpleX: image conversion unavailable: %s", exc)
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
-import atexit
 import tempfile
 
 from setuptools import setup
@@ -11,7 +10,6 @@ from setuptools.command.egg_info import egg_info as _egg_info
 
 
 REPO_ROOT = Path(__file__).parent.resolve()
-_TEMP_BUILD_OWNERS: list[tuple[object, object]] = []
 
 
 def _source_tree_is_writable() -> bool:
@@ -30,23 +28,7 @@ def _source_tree_is_writable() -> bool:
 
 
 def _temporary_build_dir(kind: str) -> str:
-    from hermes_temp import current_temp_authority
-    authority = current_temp_authority()
-    owner = authority.mkdir(f"setuptools-{kind}")
-    _TEMP_BUILD_OWNERS.append((owner, authority))
-    return str(owner.path)
-
-
-def _cleanup_build_dirs() -> None:
-    while _TEMP_BUILD_OWNERS:
-        owner, authority = _TEMP_BUILD_OWNERS.pop()
-        try:
-            owner.cleanup()
-        finally:
-            authority.close()
-
-
-atexit.register(_cleanup_build_dirs)
+    return tempfile.mkdtemp(prefix=f"hermes-agent-{kind}-")
 
 
 def _would_write_under_source(path_value: str | None) -> bool:

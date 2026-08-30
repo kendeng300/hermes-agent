@@ -33,6 +33,7 @@ import concurrent.futures
 import base64
 import atexit
 import errno
+import tempfile
 import time
 import uuid
 import textwrap
@@ -11327,7 +11328,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             except Exception:
                 pass
 
-            from tools.voice_mode import cleanup_voice_temp_file, transcribe_recording
+            from tools.voice_mode import transcribe_recording
             result = transcribe_recording(wav_path, model=stt_model)
 
             if result.get("success") and result.get("transcript", "").strip():
@@ -11359,7 +11360,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     if transcription_failed:
                         _cprint(f"{_DIM}Recording preserved at: {wav_path}{_RST}")
                     else:
-                        cleanup_voice_temp_file(wav_path)
+                        os.unlink(wav_path)
             except Exception:
                 pass
 
@@ -11424,20 +11425,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             if not tts_text:
                 return
 
-            # Keep the MP3 and any converter-created siblings inside one
-            # identity-guarded, run-owned workspace until playback completes.
-            from hermes_temp import current_temp_authority
+            # Use MP3 output for CLI playback (afplay doesn't handle OGG well).
+            # The TTS tool may auto-convert MP3->OGG, but the original MP3 remains.
+            os.makedirs(os.path.join(tempfile.gettempdir(), "hermes_voice"), exist_ok=True)
+            mp3_path = os.path.join(
+                tempfile.gettempdir(), "hermes_voice",
+                f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
+            )
 
-            with current_temp_authority() as authority:
-                with authority.temporary_directory("cli-voice") as voice_dir:
-                    mp3_path = str(
-                        voice_dir.path / f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3"
-                    )
-                    text_to_speech_tool(text=tts_text, output_path=mp3_path)
+            text_to_speech_tool(text=tts_text, output_path=mp3_path)
 
-                    # Play the MP3 directly (the TTS tool may also create OGG).
-                    if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-                        play_audio_file(mp3_path)
+            # Play the MP3 directly (the TTS tool returns OGG path but MP3 still exists)
+            if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
+                play_audio_file(mp3_path)
+                # Clean up
+                try:
+                    os.unlink(mp3_path)
+                    ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
+                    if os.path.isfile(ogg_path):
+                        os.unlink(ogg_path)
+                except OSError:
+                    pass
         except Exception as e:
             logger.warning("Voice TTS playback failed: %s", e)
             _cprint(f"{_DIM}TTS playback failed: {e}{_RST}")

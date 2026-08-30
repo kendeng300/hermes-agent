@@ -214,7 +214,6 @@ def format_voice_record_key_for_status(raw: Any) -> str:
 
 
 from tools.voice_mode import (
-    cleanup_voice_temp_file,
     create_audio_recorder,
     is_whisper_hallucination,
     play_audio_file,
@@ -347,7 +346,11 @@ def stop_and_transcribe() -> Optional[str]:
         logger.warning("voice transcription failed: %s", e)
         return None
     finally:
-        cleanup_voice_temp_file(wav_path)
+        try:
+            if os.path.isfile(wav_path):
+                os.unlink(wav_path)
+        except Exception:
+            pass
 
     # transcribe_recording returns {"success": bool, "transcript": str, ...}
     # — matches cli.py:_voice_stop_and_transcribe's result.get("transcript").
@@ -501,7 +504,8 @@ def stop_continuous(force_transcribe: bool = False) -> None:
                                 if text and not is_whisper_hallucination(text):
                                     transcript = text
                         finally:
-                            cleanup_voice_temp_file(wav_path)
+                            if os.path.isfile(wav_path):
+                                os.unlink(wav_path)
                 except Exception as e:
                     logger.warning("failed to stop/transcribe recorder: %s", e)
                 finally:
@@ -633,7 +637,11 @@ def _continuous_on_silence() -> None:
             logger.warning("continuous transcription failed: %s", e)
             _debug(f"_continuous_on_silence: transcribe raised {type(e).__name__}: {e}")
         finally:
-            cleanup_voice_temp_file(wav_path)
+            try:
+                if os.path.isfile(wav_path):
+                    os.unlink(wav_path)
+            except Exception:
+                pass
 
     with _continuous_lock:
         if not _continuous_active:
@@ -791,11 +799,12 @@ def speak_text(text: str) -> None:
         # MP3 output path, pre-chosen so we can play the MP3 directly even
         # when text_to_speech_tool auto-converts to OGG for messaging
         # platforms.  afplay's OGG support is flaky, MP3 always works.
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        mp3_fd, owned_mp3 = temp_authority.mkstemp("voice-tts", ".mp3")
-        os.close(mp3_fd)
-        mp3_path = str(owned_mp3.path)
+        os.makedirs(os.path.join(tempfile.gettempdir(), "hermes_voice"), exist_ok=True)
+        mp3_path = os.path.join(
+            tempfile.gettempdir(),
+            "hermes_voice",
+            f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
+        )
 
         _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
         text_to_speech_tool(text=tts_text, output_path=mp3_path)
@@ -803,21 +812,19 @@ def speak_text(text: str) -> None:
         if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
             _debug(f"speak_text: playing {mp3_path} ({os.path.getsize(mp3_path)} bytes)")
             play_audio_file(mp3_path)
+            try:
+                os.unlink(mp3_path)
+                ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
+                if os.path.isfile(ogg_path):
+                    os.unlink(ogg_path)
+            except OSError:
+                pass
         else:
             _debug(f"speak_text: TTS tool produced no audio at {mp3_path}")
     except Exception as e:
         logger.warning("Voice TTS playback failed: %s", e)
         _debug(f"speak_text raised {type(e).__name__}: {e}")
     finally:
-        if "owned_mp3" in locals():
-            try:
-                if owned_mp3.path.exists():
-                    owned_mp3.cleanup()
-                ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-                if os.path.isfile(ogg_path):
-                    os.unlink(ogg_path)
-            finally:
-                temp_authority.close()
         _tts_playing.set()
         _debug("speak_text: TTS done")
 

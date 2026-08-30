@@ -44,8 +44,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from hermes_temp import current_temp_authority
-
 try:
     import aiohttp
 
@@ -1917,14 +1915,12 @@ class QQAdapter(BasePlatformAdapter):
                 return None
 
             # 3. Convert to wav (skip if we already have a pre-converted WAV)
-            wav_owned = None
             if is_pre_wav:
-                with current_temp_authority() as authority:
-                    descriptor, owned = authority.mkstemp("qq-prewav", suffix=".wav")
-                    with os.fdopen(descriptor, "wb") as tmp:
-                        tmp.write(audio_data)
-                    wav_path = str(owned.path)
-                    wav_owned = owned
+                import tempfile
+
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                    tmp.write(audio_data)
+                    wav_path = tmp.name
                 logger.debug(
                     "[%s] STT: using pre-converted WAV directly (%d bytes)",
                     self._log_tag,
@@ -1934,23 +1930,22 @@ class QQAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[%s] STT: converting to wav, filename=%r", self._log_tag, filename
                 )
-                converted = await self._convert_audio_to_wav_file(audio_data, filename)
-                if not converted:
+                wav_path = await self._convert_audio_to_wav_file(audio_data, filename)
+                if not wav_path or not Path(wav_path).exists():
                     logger.warning(
                         "[%s] STT: ffmpeg conversion produced no output", self._log_tag
                     )
                     return None
-                wav_path, wav_owned = converted
 
             # 4. Call STT API
             logger.debug("[%s] STT: calling ASR on %s", self._log_tag, wav_path)
+            transcript = await self._call_stt(wav_path)
+
+            # 5. Cleanup temp file
             try:
-                transcript = await self._call_stt(wav_path)
-            finally:
-                # 5. Cleanup the exact authority-owned file/workspace even
-                # when the provider boundary raises.
-                if wav_owned is not None:
-                    wav_owned.cleanup()
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
             if transcript:
                 logger.debug("[%s] STT success: %r", self._log_tag, transcript[:100])
@@ -1968,7 +1963,7 @@ class QQAdapter(BasePlatformAdapter):
 
     async def _convert_audio_to_wav_file(
             self, audio_data: bytes, filename: str
-    ) -> Optional[Tuple[str, Any]]:
+    ) -> Optional[str]:
         """Convert audio bytes to a temp .wav file using pilk (SILK) or ffmpeg.
 
         QQ voice messages are typically SILK format which ffmpeg cannot decode.
@@ -1976,6 +1971,8 @@ class QQAdapter(BasePlatformAdapter):
 
         Returns the wav file path, or None on failure.
         """
+        import tempfile
+
         ext = (
             Path(filename).suffix.lower()
             if Path(filename).suffix
@@ -1989,34 +1986,30 @@ class QQAdapter(BasePlatformAdapter):
             audio_data[:20],
         )
 
-        with current_temp_authority() as authority:
-            workspace = authority.mkdir("qq-audio")
-        src_path = str(workspace.path / f"source{ext}")
-        wav_path = str(workspace.path / "converted.wav")
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_src:
+            tmp_src.write(audio_data)
+            src_path = tmp_src.name
+
+        wav_path = src_path.rsplit(".", 1)[0] + ".wav"
+
+        # Try pilk first (handles SILK and many other formats)
+        result = await self._convert_silk_to_wav(src_path, wav_path)
+
+        # If pilk failed, try ffmpeg
+        if not result:
+            result = await self._convert_ffmpeg_to_wav(src_path, wav_path)
+
+        # If ffmpeg also failed, try writing raw PCM as WAV (last resort)
+        if not result:
+            result = await self._convert_raw_to_wav(audio_data, wav_path)
+
+        # Cleanup source file
         try:
-            descriptor = os.open(src_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "wb") as tmp_src:
-                tmp_src.write(audio_data)
+            os.unlink(src_path)
+        except OSError:
+            pass
 
-            # Try pilk first (handles SILK and many other formats)
-            result = await self._convert_silk_to_wav(src_path, wav_path)
-
-            # If pilk failed, try ffmpeg
-            if not result:
-                result = await self._convert_ffmpeg_to_wav(src_path, wav_path)
-
-            # If ffmpeg also failed, try writing raw PCM as WAV (last resort)
-            if not result:
-                result = await self._convert_raw_to_wav(audio_data, wav_path)
-
-            if not result:
-                workspace.cleanup()
-                return None
-
-            return str(result), workspace
-        except BaseException:
-            workspace.cleanup()
-            raise
+        return result
 
     @staticmethod
     def _guess_ext_from_data(data: bytes) -> str:
@@ -2272,6 +2265,8 @@ class QQAdapter(BasePlatformAdapter):
             self, audio_data: bytes, source_url: str
     ) -> Optional[str]:
         """Convert audio bytes to .wav using pilk (SILK) or ffmpeg, caching the result."""
+        import tempfile
+
         # Determine source format from magic bytes or URL
         ext = (
             Path(urlparse(source_url).path).suffix.lower()
@@ -2290,43 +2285,42 @@ class QQAdapter(BasePlatformAdapter):
         }:
             ext = self._guess_ext_from_data(audio_data)
 
-        with current_temp_authority() as authority:
-            workspace = authority.mkdir("qq-audio")
-        src_path = str(workspace.path / f"source{ext}")
-        wav_path = str(workspace.path / "converted.wav")
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp_src:
+            tmp_src.write(audio_data)
+            src_path = tmp_src.name
+
+        wav_path = src_path.rsplit(".", 1)[0] + ".wav"
         try:
-            try:
-                descriptor = os.open(
-                    src_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+            is_silk = ext == ".silk" or self._looks_like_silk(audio_data)
+            if is_silk:
+                result = await self._convert_silk_to_wav(src_path, wav_path)
+            else:
+                result = await self._convert_ffmpeg_to_wav(src_path, wav_path)
+
+            if not result:
+                logger.warning(
+                    "[%s] audio conversion failed for %s (format=%s)",
+                    self._log_tag,
+                    source_url[:60],
+                    ext,
                 )
-                with os.fdopen(descriptor, "wb") as tmp_src:
-                    tmp_src.write(audio_data)
-                is_silk = ext == ".silk" or self._looks_like_silk(audio_data)
-                if is_silk:
-                    result = await self._convert_silk_to_wav(src_path, wav_path)
-                else:
-                    result = await self._convert_ffmpeg_to_wav(src_path, wav_path)
-
-                if not result:
-                    logger.warning(
-                        "[%s] audio conversion failed for %s (format=%s)",
-                        self._log_tag,
-                        source_url[:60],
-                        ext,
-                    )
-                    return cache_document_from_bytes(audio_data, f"qq_voice{ext}")
-            except Exception:
                 return cache_document_from_bytes(audio_data, f"qq_voice{ext}")
-
-            # Verify output and cache before reaping the owned workspace.
-            try:
-                wav_data = Path(wav_path).read_bytes()
-                return cache_document_from_bytes(wav_data, "qq_voice.wav")
-            except Exception as exc:
-                logger.debug("[%s] Failed to read converted wav: %s", self._log_tag, exc)
-                return None
+        except Exception:
+            return cache_document_from_bytes(audio_data, f"qq_voice{ext}")
         finally:
-            workspace.cleanup()
+            try:
+                os.unlink(src_path)
+            except OSError:
+                pass
+
+        # Verify output and cache
+        try:
+            wav_data = Path(wav_path).read_bytes()
+            os.unlink(wav_path)
+            return cache_document_from_bytes(wav_data, "qq_voice.wav")
+        except Exception as exc:
+            logger.debug("[%s] Failed to read converted wav: %s", self._log_tag, exc)
+            return None
 
     # ------------------------------------------------------------------
     # Outbound messaging — REST API

@@ -402,11 +402,8 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
     base_url = f"https://github.com/{_REPO}/releases/latest/download"
 
     try:
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        owned_tmpdir = temp_authority.mkdir("tirith-install")
-        tmpdir = str(owned_tmpdir.path)
-    except Exception as exc:
+        tmpdir = tempfile.mkdtemp(prefix="tirith-install-")
+    except OSError as exc:
         log("tirith install failed: cannot create temp dir: %s", exc)
         return None, "no_space"
     try:
@@ -484,10 +481,7 @@ def _install_tirith(*, log_failures: bool = True) -> tuple[str | None, str]:
         return dest, ""
 
     finally:
-        try:
-            owned_tmpdir.cleanup()
-        finally:
-            temp_authority.close()
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _is_explicit_path(configured_path: str) -> bool:

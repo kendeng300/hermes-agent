@@ -57,39 +57,6 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = True
 
-
-def _rpc_socket_endpoints(tmpdir: str, root_fd: int) -> tuple[str, str]:
-    """Return server/client paths for one authority-bound Unix socket.
-
-    Linux can address a long run-owned root through the already-pinned root
-    descriptor in procfs.  Other POSIX hosts fail closed when their
-    ``sockaddr_un`` budget cannot represent the authenticated path; loopback
-    TCP is not an equivalent filesystem custody boundary.
-    """
-    if _IS_WINDOWS or not hasattr(socket, "AF_UNIX"):
-        raise RuntimeError("execute_code requires an authority-bound Unix socket")
-    candidate = os.path.join(tmpdir, "rpc.sock")
-    if len(os.fsencode(candidate)) <= 103:
-        return candidate, candidate
-    if not sys.platform.startswith("linux"):
-        raise RuntimeError("temporary authority path exceeds the Unix socket limit")
-    pinned = os.fstat(root_fd)
-    parent, leaf = os.path.split(tmpdir.rstrip(os.sep))
-    observed = os.stat(parent, follow_symlinks=False)
-    if (pinned.st_dev, pinned.st_ino) != (observed.st_dev, observed.st_ino):
-        raise RuntimeError("temporary authority root identity changed")
-    if not leaf or leaf in {".", ".."} or os.sep in leaf:
-        raise RuntimeError("temporary sandbox directory name is invalid")
-    proc_fd = f"/proc/{os.getpid()}/fd/{root_fd}"
-    self_fd = f"/proc/self/fd/{root_fd}"
-    if not os.path.isdir(self_fd):
-        raise RuntimeError("pinned procfs Unix socket authority is unavailable")
-    bind_path = f"{self_fd}/{leaf}/rpc.sock"
-    client_path = f"{proc_fd}/{leaf}/rpc.sock"
-    if max(len(os.fsencode(bind_path)), len(os.fsencode(client_path))) > 103:
-        raise RuntimeError("pinned procfs Unix socket path exceeds the platform limit")
-    return bind_path, client_path
-
 # The 7 tools allowed inside the sandbox. The intersection of this list
 # and the session's enabled tools determines which stubs are generated.
 SANDBOX_ALLOWED_TOOLS = frozenset([
@@ -391,13 +358,25 @@ _call_lock = threading.Lock()
 def _connect():
     """Connect to the parent's RPC server via the transport it picked.
 
-    HERMES_RPC_SOCKET is always an authority-bound Unix domain socket path.
+    HERMES_RPC_SOCKET can be either:
+      - a filesystem path (POSIX Unix domain socket — the default on
+        Linux and macOS)
+      - a string of the form ``tcp://127.0.0.1:<port>`` (Windows, where
+        AF_UNIX is unreliable — the parent falls back to loopback TCP)
     """
     global _sock
     if _sock is None:
         endpoint = os.environ["HERMES_RPC_SOCKET"]
-        _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        _sock.connect(endpoint)
+        if endpoint.startswith("tcp://"):
+            # tcp://host:port  (host is always 127.0.0.1 in practice — we
+            # only bind loopback server-side)
+            _host_port = endpoint[len("tcp://"):]
+            _host, _, _port = _host_port.rpartition(":")
+            _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            _sock.connect((_host or "127.0.0.1", int(_port)))
+        else:
+            _sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            _sock.connect(endpoint)
         _sock.settimeout(300)
     return _sock
 
@@ -436,9 +415,7 @@ _FILE_TRANSPORT_HEADER = '''\
 """Auto-generated Hermes tools RPC stubs (file-based transport)."""
 import json, os, shlex, tempfile, threading, time
 
-_RPC_DIR = os.environ.get("HERMES_RPC_DIR")
-if not _RPC_DIR:
-    raise RuntimeError("HERMES_RPC_DIR authority binding is required")
+_RPC_DIR = os.environ.get("HERMES_RPC_DIR") or os.path.join(tempfile.gettempdir(), "hermes_rpc")
 _seq = 0
 # `_seq += 1` is not atomic (read-modify-write), so concurrent _call()
 # invocations from multiple threads could allocate the same sequence number
@@ -777,7 +754,10 @@ def _env_temp_dir(env: Any) -> str:
                 return temp_dir.rstrip("/") or "/"
         except Exception as exc:
             logger.debug("Could not resolve execute_code env temp dir: %s", exc)
-    raise RuntimeError("environment did not provide an absolute temporary authority")
+    candidate = tempfile.gettempdir()
+    if isinstance(candidate, str) and candidate.startswith("/"):
+        return candidate.rstrip("/") or "/"
+    return "/tmp"
 
 
 def _rpc_poll_loop(
@@ -1217,13 +1197,26 @@ def execute_code(
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
-    from hermes_temp import current_temp_authority
-    temp_authority = current_temp_authority()
-    owned_tmpdir = temp_authority.mkdir("code-sandbox")
-    tmpdir = str(owned_tmpdir.path)
-    sock_path, rpc_endpoint = _rpc_socket_endpoints(
-        tmpdir, temp_authority._root_fd,
-    )
+    tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
+    # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
+    # Unix domain socket paths past the 104-byte macOS AF_UNIX limit.
+    # On Linux, tempfile.gettempdir() already returns /tmp.
+    #
+    # Windows: Python 3.9+ added partial AF_UNIX support but the file-backed
+    # variant is flaky across Windows builds (requires Windows 10 1803+,
+    # still fails under some configurations, and the socket file can't live
+    # on the same temp drive as the script).  Fall back to loopback TCP —
+    # same ephemeral port, same 1-connection listen queue, same serialized
+    # request/response framing.  The generated client reads the transport
+    # selector from HERMES_RPC_SOCKET (path vs. ``tcp://host:port``).
+    _sock_tmpdir = "/tmp" if sys.platform == "darwin" else tempfile.gettempdir()
+    _use_tcp_rpc = _IS_WINDOWS
+    if _use_tcp_rpc:
+        sock_path = None  # not used on Windows; TCP endpoint stored below
+        rpc_endpoint = None  # set after bind()
+    else:
+        sock_path = os.path.join(_sock_tmpdir, f"hermes_rpc_{uuid.uuid4().hex}.sock")
+        rpc_endpoint = sock_path
 
     tool_call_log: list = []
     tool_call_counter = [0]  # mutable so the RPC thread can increment
@@ -1252,11 +1245,23 @@ def execute_code(
 
         # --- Start RPC server ---
         rpc_token = secrets.token_urlsafe(32)
-        # The endpoint is always inside the authenticated root, directly or
-        # through the pinned procfs descriptor path for a long root.
-        server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        server_sock.bind(sock_path)
-        os.chmod(os.path.join(tmpdir, "rpc.sock"), 0o600)
+        # Two transports:
+        #   POSIX: AF_UNIX stream socket on sock_path, chmod 0600 for
+        #   owner-only access.  Filesystem permissions gate the socket.
+        #   Windows: AF_INET stream socket on 127.0.0.1 with an ephemeral
+        #   port.  No filesystem permission story, but loopback-only bind
+        #   means only the current user's processes (not remote) can
+        #   connect.  HERMES_RPC_SOCKET is set to ``tcp://127.0.0.1:<port>``
+        #   which the generated client parses to pick AF_INET.
+        if _use_tcp_rpc:
+            server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_sock.bind(("127.0.0.1", 0))  # ephemeral port
+            _host, _port = server_sock.getsockname()[:2]
+            rpc_endpoint = f"tcp://{_host}:{_port}"
+        else:
+            server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server_sock.bind(sock_path)
+            os.chmod(sock_path, 0o600)
         server_sock.listen(1)
 
         # Wrapped so the thread inherits the turn's approval context + callbacks
@@ -1559,10 +1564,15 @@ def execute_code(
                 server_sock.close()
             except OSError as e:
                 logger.debug("Server socket close error: %s", e)
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
         try:
-            owned_tmpdir.cleanup()
-        finally:
-            temp_authority.close()
+            # Only UDS has a filesystem socket to unlink; TCP sockets are
+            # freed by server_sock.close() above.
+            if sock_path:
+                os.unlink(sock_path)
+        except OSError:
+            pass  # already cleaned up or never created
 
 
 def _kill_process_group(proc, escalate: bool = False):

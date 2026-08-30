@@ -839,9 +839,7 @@ def _generate_command_tts(
     output_format = _get_command_tts_output_format(config, str(output))
     speed = config.get("speed", tts_config.get("speed", ""))
 
-    from hermes_temp import current_temp_authority
-    with current_temp_authority() as temp_authority, temp_authority.temporary_directory("command-tts") as owned_tmp:
-        tmpdir = owned_tmp.path
+    with tempfile.TemporaryDirectory() as tmpdir:
         text_path = Path(tmpdir) / "input.txt"
         text_path.write_text(text, encoding="utf-8")
 
@@ -1781,12 +1779,9 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     # WAV -- this matches the NeuTTS behavior and keeps the tool usable on
     # systems without ffmpeg (audio still plays, just with a misleading
     # extension).
-    from hermes_temp import current_temp_authority
-    temp_authority = current_temp_authority()
-    wav_fd, owned_wav = temp_authority.mkstemp("tts-convert", ".wav")
-    with os.fdopen(wav_fd, "wb") as tmp:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(wav_bytes)
-    wav_path = str(owned_wav.path)
+        wav_path = tmp.name
 
     try:
         ffmpeg = shutil.which("ffmpeg")
@@ -1815,9 +1810,9 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
             shutil.copyfile(wav_path, output_path)
     finally:
         try:
-            owned_wav.cleanup()
-        finally:
-            temp_authority.close()
+            os.remove(wav_path)
+        except OSError:
+            pass
 
     return output_path
 
@@ -2717,15 +2712,11 @@ def stream_tts_to_speaker(
         def _play_via_tempfile(audio_iter, stop_evt):
             """Write PCM chunks to a temp WAV file and play it."""
             tmp_path = None
-            temp_authority = None
-            owned_wav = None
             try:
                 import wave
-                from hermes_temp import current_temp_authority
-                temp_authority = current_temp_authority()
-                wav_fd, owned_wav = temp_authority.mkstemp("tts-stream", ".wav")
-                tmp_path = str(owned_wav.path)
-                with os.fdopen(wav_fd, "w+b") as tmp, wave.open(tmp, "wb") as wf:
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                with wave.open(tmp, "wb") as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)  # 16-bit
                     wf.setframerate(24000)
@@ -2738,11 +2729,11 @@ def stream_tts_to_speaker(
             except Exception as exc:
                 logger.warning("Temp-file TTS fallback failed: %s", exc)
             finally:
-                if owned_wav is not None:
+                if tmp_path:
                     try:
-                        owned_wav.cleanup()
-                    finally:
-                        temp_authority.close()
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
         while not stop_event.is_set():
             # Read next delta from queue

@@ -5,8 +5,8 @@ These tests verify RED before implementation.
 import sys
 from pathlib import Path
 
-# Path to hermes-agent repo
-AGENT_DIR = Path("/home/linux/.hermes/hermes-agent")
+# Path to the checkout under test.
+AGENT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(AGENT_DIR))
 
 import pytest
@@ -55,32 +55,29 @@ class TestGrokExecutionGuidance:
     """F12a: Verify Grok (xAI) models get OPENAI_MODEL_EXECUTION_GUIDANCE."""
 
     def test_grok_gets_execution_guidance(self):
-        """Grok model must receive OPENAI_MODEL_EXECUTION_GUIDANCE in run_agent.py path."""
+        """Grok must receive guidance in the active system-prompt builder."""
         import ast
 
-        run_agent_path = AGENT_DIR / "run_agent.py"
-        source = run_agent_path.read_text()
+        system_prompt_path = AGENT_DIR / "agent" / "system_prompt.py"
+        source = system_prompt_path.read_text()
         tree = ast.parse(source)
 
-        # Find the injection logic around line 4438
         for node in ast.walk(tree):
             if isinstance(node, ast.If):
-                try:
-                    test_code = ast.unparse(node.test)
-                except Exception:
-                    test_code = ast.dump(node.test)
-                
-                # Check if any OPENAI_MODEL_EXECUTION_GUIDANCE injection checks
-                # include "grok" in the model match condition
                 if "OPENAI_MODEL_EXECUTION_GUIDANCE" in ast.unparse(node):
-                    test_str = ast.unparse(node.test)
-                    if '"grok"' in test_str or "'grok'" in test_str:
-                        return  # PASS — grok is included
+                    compared_names = {
+                        child.value
+                        for child in ast.walk(node.test)
+                        if isinstance(child, ast.Constant)
+                        and isinstance(child.value, str)
+                    }
+                    if {"gpt", "codex", "grok"} <= compared_names:
+                        return
 
         pytest.fail(
             "F12a RED: Grok is NOT in the OPENAI_MODEL_EXECUTION_GUIDANCE injection "
-            "condition in run_agent.py. The condition currently checks only "
-            "'gpt' or 'codex'. Must add 'grok' to match."
+            "condition in agent/system_prompt.py. The condition must include "
+            "'gpt', 'codex', and 'grok'."
         )
 
     def test_grok_in_enforcement_models(self):

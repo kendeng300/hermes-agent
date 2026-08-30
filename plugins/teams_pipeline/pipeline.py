@@ -453,9 +453,9 @@ class TeamsMeetingPipeline:
         meeting_ref: TeamsMeetingRef,
         recording: MeetingArtifact,
     ) -> str:
-        from hermes_temp import current_temp_authority
-        with current_temp_authority() as temp_authority, temp_authority.temporary_directory("teams-recording") as owned_tmp:
-            tmp_dir = owned_tmp.path
+        temp_root = self.config.tmp_dir or (get_hermes_home() / "tmp" / "teams_pipeline")
+        temp_root.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(temp_root), prefix="teams-recording-") as tmp_dir:
             # display_name comes from Graph API and is ultimately set by
             # the meeting organizer — strip any directory components so a
             # crafted name like "../../etc/cron.d/evil" can't escape tmp_dir.

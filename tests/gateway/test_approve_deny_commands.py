@@ -414,6 +414,10 @@ class TestBareTextNoLongerApproves:
 class TestBlockingApprovalE2E:
     """Test the full blocking flow: agent thread blocks → user approves → agent resumes."""
 
+    @pytest.fixture(autouse=True)
+    def _manual_approval_mode(self, monkeypatch):
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "manual")
+
     def setup_method(self):
         _clear_approval_state()
         os.environ.pop("HERMES_YOLO_MODE", None)
@@ -453,23 +457,31 @@ class TestBlockingApprovalE2E:
                 os.environ.pop("HERMES_SESSION_KEY", None)
                 reset_current_session_key(token)
 
-        t = threading.Thread(target=agent_thread)
+        t = threading.Thread(target=agent_thread, daemon=True)
         t.start()
+        try:
+            for _ in range(50):
+                if notified:
+                    break
+                time.sleep(0.05)
 
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
+            assert len(notified) == 1
+            assert "rm -rf /important" in notified[0]["command"]
 
-        assert len(notified) == 1
-        assert "rm -rf /important" in notified[0]["command"]
+            resolve_gateway_approval(session_key, "once")
+            t.join(timeout=5)
 
-        resolve_gateway_approval(session_key, "once")
-        t.join(timeout=5)
-
-        assert result_holder[0] is not None
-        assert result_holder[0]["approved"] is True
-        unregister_gateway_notify(session_key)
+            assert not t.is_alive()
+            assert result_holder[0] is not None
+            assert result_holder[0]["approved"] is True
+        finally:
+            # A failed assertion must not strand the approval wait until its
+            # five-minute production timeout. Resolve any request
+            # that reached the queue, unregister to wake remaining entries,
+            # and join the worker on every path.
+            resolve_gateway_approval(session_key, "deny", resolve_all=True)
+            unregister_gateway_notify(session_key)
+            t.join(timeout=5)
 
     def test_blocking_approval_deny(self):
         """check_all_command_guards returns BLOCKED when denied."""

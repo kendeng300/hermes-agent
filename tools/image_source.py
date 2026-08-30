@@ -182,13 +182,12 @@ def _http_block_reason(url: str) -> Optional[str]:
 
 
 async def _download_to_bytes(url: str) -> bytes:
-    from hermes_temp import current_temp_authority
+    import tempfile
+
     from tools.vision_tools import _download_image
 
-    temp_authority = current_temp_authority()
-    descriptor, owned_download = temp_authority.mkstemp("image-download", ".img")
-    os.close(descriptor)
-    tmp = owned_download.path
+    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as tf:
+        tmp = Path(tf.name)
     try:
         # Enforces the 50MB stream cap, redirect SSRF guard, and website policy.
         await _download_image(url, tmp)
@@ -196,10 +195,7 @@ async def _download_to_bytes(url: str) -> bytes:
     except PermissionError as exc:  # website policy block
         raise SourceUnsafe(str(exc), src=url, origin="http")
     finally:
-        try:
-            owned_download.cleanup()
-        finally:
-            temp_authority.close()
+        tmp.unlink(missing_ok=True)
 
 
 def _is_local_terminal_backend() -> bool:
