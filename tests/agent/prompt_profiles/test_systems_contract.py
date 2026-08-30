@@ -19,6 +19,35 @@ def test_profile_registry_and_effective_windows() -> None:
     assert resolve_effective_window(200_000, openai.contract_window) == 200_000
 
 
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    (
+        ("openai-codex", "gpt-5.6-sol"),
+        ("deepseek", "deepseek-v4-flash"),
+    ),
+)
+def test_rendered_adapters_use_canonical_standard_process_checkout(
+    provider: str,
+    model: str,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from agent.prompt_profiles import get_profile, render_profile
+    from tests.agent.prompt_profiles.fixtures import install_approved_test_core
+
+    install_approved_test_core(tmp_path, monkeypatch)
+    rendered = render_profile(get_profile(provider, model)).stable
+    command = (
+        "cd /home/linux/.hermes/scripts && "
+        "PYTHONPATH=/home/linux/.hermes/scripts python3 "
+        "enforcement/standard_process_mechanical_script.py "
+        "--panel-review <path> --run --approved --task '<description>'"
+    )
+
+    assert command in rendered
+    assert "/home/linux/MarketWatch" not in rendered
+
+
 @pytest.mark.parametrize("runtime_window", [None, 0, -1])
 def test_effective_window_rejects_unknown_runtime(runtime_window: int | None) -> None:
     from agent.prompt_profiles import PromptProfileError, resolve_effective_window
