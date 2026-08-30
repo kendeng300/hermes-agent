@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -9,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
-def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> None:
+def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> str:
     """Bind the parent renderer to a deterministic supported policy core."""
     from agent.prompt_profiles import renderer
 
@@ -19,6 +20,7 @@ def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> None:
     ]
     core = "\n".join(
         [*renderer._PROTECTED_BLOCKS]
+        + ["Truth is the absolute priority."]
         + [
             f"<!-- REQ:{req} type:{kind} scope:{scope} gate:{gate} -->"
             for req, kind, scope, gate in reqs
@@ -38,6 +40,35 @@ def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> None:
         hashlib.sha256(
             json.dumps(reqs, ensure_ascii=False, separators=(",", ":")).encode()
         ).hexdigest(),
+    )
+    return core
+
+
+def _fake_deepseek_transformers(tmp_path: Path, monkeypatch, tokenizer: MagicMock):
+    """Provide hash-verified local tokenizer assets without a host cache."""
+    from agent.prompt_profiles.tokenizer import DeepSeekTokenCounter
+
+    assets = {
+        "tokenizer.json": b"test tokenizer asset",
+        "tokenizer_config.json": b"test tokenizer config asset",
+    }
+    for name, content in assets.items():
+        (tmp_path / name).write_bytes(content)
+    monkeypatch.setattr(
+        DeepSeekTokenCounter,
+        "asset_sha256",
+        {name: hashlib.sha256(content).hexdigest() for name, content in assets.items()},
+    )
+    return SimpleNamespace(
+        __version__="test",
+        AutoTokenizer=SimpleNamespace(
+            from_pretrained=MagicMock(return_value=tokenizer)
+        ),
+        utils=SimpleNamespace(
+            hub=SimpleNamespace(
+                cached_file=lambda _model, name, **_: str(tmp_path / name)
+            )
+        ),
     )
 
 
@@ -89,7 +120,9 @@ def test_effective_window_rejects_unknown_runtime(runtime_window: int | None) ->
         resolve_effective_window(runtime_window, 257_000)
 
 
-def test_loader_and_renderer_are_full_and_deterministic(tmp_path: Path) -> None:
+def test_loader_and_renderer_are_full_and_deterministic(
+    tmp_path: Path, monkeypatch
+) -> None:
     from agent.prompt_profiles import get_profile, load_policy_core, render_profile
 
     core_path = tmp_path / "SOUL.md"
@@ -98,7 +131,7 @@ def test_loader_and_renderer_are_full_and_deterministic(tmp_path: Path) -> None:
     adapter_path.write_bytes(b"adapter\r\n")
 
     core = load_policy_core(core_path)
-    production_core = load_policy_core("/home/linux/.hermes/SOUL.md")
+    production_core = _install_parent_supported_core(tmp_path, monkeypatch)
     rendered_1 = render_profile(
         get_profile("openai-codex", "gpt-5.6-sol"),
         core=production_core,
@@ -119,10 +152,12 @@ def test_loader_and_renderer_are_full_and_deterministic(tmp_path: Path) -> None:
     assert rendered_1.manifest["canonical_core_sha256"] == rendered_1.canonical_core_sha256
 
 
-def test_renderer_rejects_truth_reversal_for_every_core_entrypoint(tmp_path: Path) -> None:
-    from agent.prompt_profiles import PromptProfileError, get_profile, load_policy_core, render_profile
+def test_renderer_rejects_truth_reversal_for_every_core_entrypoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from agent.prompt_profiles import PromptProfileError, get_profile, render_profile
 
-    approved = load_policy_core("/home/linux/.hermes/SOUL.md")
+    approved = _install_parent_supported_core(tmp_path, monkeypatch)
     mutated = approved.replace(
         "Truth is the absolute priority.",
         "Plausible completion is the absolute priority.",
@@ -137,22 +172,51 @@ def test_renderer_rejects_truth_reversal_for_every_core_entrypoint(tmp_path: Pat
             render_profile(spec, **kwargs)
 
 
-def test_render_identity_is_named_as_stable_not_final_prompt_hash() -> None:
+def test_render_identity_is_named_as_stable_not_final_prompt_hash(
+    tmp_path: Path, monkeypatch
+) -> None:
     from agent.prompt_profiles import get_profile, render_profile
 
+    _install_parent_supported_core(tmp_path, monkeypatch)
     rendered = render_profile(get_profile("openai-codex", "gpt-5.6-sol"))
     assert rendered.manifest["stable_render_sha256"] == rendered.stable_sha256
     assert "final_prompt_sha256" not in rendered.manifest
 
 
-def test_provider_counters_use_exact_installed_tokenizers() -> None:
+def test_provider_counters_use_exact_installed_tokenizers(
+    tmp_path: Path, monkeypatch
+) -> None:
     from agent.prompt_profiles import get_token_counter
+    from agent.prompt_profiles import tokenizer as tokenizer_module
 
+    encoding = MagicMock()
+    encoding.encode.side_effect = lambda value, **_: (
+        [0] if value == "hello" else list(range(7))
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tiktoken",
+        SimpleNamespace(
+            __version__="test",
+            get_encoding=MagicMock(return_value=encoding),
+        ),
+    )
     counter = get_token_counter("openai-codex", "gpt-5.6-sol")
     assert counter.tokenizer_id == "o200k_base"
     assert counter.count_text("hello") == 1
     assert counter.count_text("<|endoftext|>") == 7
 
+    installed = MagicMock()
+    installed.encode.side_effect = lambda value, **_: list(value)
+    installed.apply_chat_template.side_effect = (
+        lambda messages, **_: list(str(messages))
+    )
+    transformers = _fake_deepseek_transformers(tmp_path, monkeypatch, installed)
+    monkeypatch.setattr(
+        tokenizer_module.importlib,
+        "import_module",
+        lambda name: transformers if name == "transformers" else __import__(name),
+    )
     deepseek = get_token_counter("deepseek", "deepseek-v4-flash")
     messages = [{"role": "user", "content": "hello"}]
     expected = deepseek._tokenizer.apply_chat_template(

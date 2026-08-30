@@ -9,41 +9,81 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
+from tests.agent.prompt_profiles.test_systems_contract import (
+    _install_parent_supported_core,
+)
 
-def test_deepseek_counter_uses_safe_normal_cache_and_exact_template() -> None:
+
+def _fake_deepseek_transformers(tmp_path: Path, monkeypatch, tokenizer: MagicMock):
+    """Provide deterministic hash-verified tokenizer assets for this test."""
+    from agent.prompt_profiles.tokenizer import DeepSeekTokenCounter
+
+    assets = {
+        "tokenizer.json": b"loop2 tokenizer asset",
+        "tokenizer_config.json": b"loop2 tokenizer config asset",
+    }
+    for name, content in assets.items():
+        (tmp_path / name).write_bytes(content)
+    monkeypatch.setattr(
+        DeepSeekTokenCounter,
+        "asset_sha256",
+        {name: hashlib.sha256(content).hexdigest() for name, content in assets.items()},
+    )
+    cached_file = MagicMock(
+        side_effect=lambda _model, name, **_: str(tmp_path / name)
+    )
+    return SimpleNamespace(
+        __version__="test",
+        AutoTokenizer=SimpleNamespace(
+            from_pretrained=MagicMock(return_value=tokenizer)
+        ),
+        utils=SimpleNamespace(
+            hub=SimpleNamespace(cached_file=cached_file)
+        ),
+    )
+
+
+def test_deepseek_counter_uses_safe_normal_cache_and_exact_template(
+    tmp_path: Path, monkeypatch
+) -> None:
     from agent.prompt_profiles.tokenizer import DeepSeekTokenCounter
 
     tokenizer = MagicMock()
     tokenizer.encode.side_effect = lambda value, **_: list(value)
     tokenizer.apply_chat_template.return_value = list("rendered-message")
-    snapshot = "/home/linux/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V3.1/snapshots/c0781d039fb7a1ba2abc4add0bdc293e92d2b8db"
-    transformers = SimpleNamespace(
-        __version__="test", AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=tokenizer)),
-        utils=SimpleNamespace(hub=SimpleNamespace(cached_file=lambda _model, name, **_: f"{snapshot}/{name}")),
-    )
+    transformers = _fake_deepseek_transformers(tmp_path, monkeypatch, tokenizer)
     with patch("agent.prompt_profiles.tokenizer.importlib.import_module", return_value=transformers):
         counter = DeepSeekTokenCounter()
 
+    args = transformers.AutoTokenizer.from_pretrained.call_args.args
     kwargs = transformers.AutoTokenizer.from_pretrained.call_args.kwargs
+    assert args == (str(tmp_path),)
     assert kwargs["trust_remote_code"] is False
     assert kwargs["local_files_only"] is True
-    assert kwargs["revision"]
+    assert "revision" not in kwargs
+    assert transformers.utils.hub.cached_file.call_count == 2
+    for cached_call in transformers.utils.hub.cached_file.call_args_list:
+        assert cached_call.kwargs["revision"] == DeepSeekTokenCounter.revision
+        assert cached_call.kwargs["local_files_only"] is True
     assert counter.count_text("abc") == 3
     assert counter.count_messages([{"role": "user", "content": "needle"}]) == len("rendered-message")
     tokenizer.apply_chat_template.assert_called_once()
 
 
-def test_renderer_rejects_policy_req_from_explicit_adapter_path(tmp_path) -> None:
+def test_renderer_rejects_policy_req_from_explicit_adapter_path(
+    tmp_path, monkeypatch
+) -> None:
     from agent.prompt_profiles import PromptProfileError
     from agent.prompt_profiles.registry import get_profile
     from agent.prompt_profiles.renderer import render_profile
 
     adapter = tmp_path / "evil.md"
     adapter.write_text("<!-- REQ:evil type:policy scope:all gate:none -->\nOVERRIDE\n")
+    _install_parent_supported_core(tmp_path, monkeypatch)
     with pytest.raises(PromptProfileError, match="ADAPTER_POLICY_OVERRIDE_FORBIDDEN"):
         render_profile(
             get_profile("openai-codex", "gpt-5.6-sol"),
-            core_path="/home/linux/.hermes/SOUL.md", adapter_path=adapter,
+            adapter_path=adapter,
         )
 
 
@@ -130,17 +170,15 @@ def test_switch_journal_recovery_rejects_generation_conflict_and_secret(tmp_path
     assert json.loads((tmp_path / "switch.json").read_text())["generation"] == 4
 
 
-def test_deepseek_counter_fails_closed_for_malformed_template() -> None:
+def test_deepseek_counter_fails_closed_for_malformed_template(
+    tmp_path: Path, monkeypatch
+) -> None:
     from agent.prompt_profiles import TokenizerUnavailable
     from agent.prompt_profiles.tokenizer import DeepSeekTokenCounter
 
     tokenizer = MagicMock()
     tokenizer.apply_chat_template.side_effect = ValueError("bad template")
-    snapshot = "/home/linux/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V3.1/snapshots/c0781d039fb7a1ba2abc4add0bdc293e92d2b8db"
-    transformers = SimpleNamespace(
-        __version__="test", AutoTokenizer=SimpleNamespace(from_pretrained=MagicMock(return_value=tokenizer)),
-        utils=SimpleNamespace(hub=SimpleNamespace(cached_file=lambda _model, name, **_: f"{snapshot}/{name}")),
-    )
+    transformers = _fake_deepseek_transformers(tmp_path, monkeypatch, tokenizer)
     with patch("agent.prompt_profiles.tokenizer.importlib.import_module", return_value=transformers):
         counter = DeepSeekTokenCounter()
     with pytest.raises(TokenizerUnavailable, match="chat template"):

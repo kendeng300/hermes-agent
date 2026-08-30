@@ -228,8 +228,7 @@ async def test_thread_id_passed_to_send(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
-    """When thread_id is empty, no notification is sent (suppressed to avoid
-    channel-level posts that create unwanted top-level threads)."""
+    """When thread_id is empty, preserve chat-level delivery without metadata."""
     import tools.process_registry as pr_module
 
     sessions = [SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0)]
@@ -244,9 +243,9 @@ async def test_no_thread_id_sends_no_metadata(monkeypatch, tmp_path):
 
     await runner._run_process_watcher(_watcher_dict(thread_id=""))
 
-    # With no thread_id, the watcher suppresses all text notifications
-    # to avoid creating unwanted top-level threads at the channel level.
-    assert adapter.send.await_count == 0
+    assert adapter.send.await_count == 1
+    _, kwargs = adapter.send.call_args
+    assert kwargs["metadata"] is None
 
 
 @pytest.mark.asyncio

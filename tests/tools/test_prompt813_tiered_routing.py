@@ -3,6 +3,7 @@ anti-fabrication preamble, delegation_model telemetry.
 """
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -122,11 +123,24 @@ def test_anti_fabrication_preamble_skipped_for_reasoning():
 
 # ── Telemetry tests ───────────────────────────────────────────────────────
 
-def test_delegation_model_attr_set_on_child():
+def test_delegation_model_attr_set_on_child(tmp_path, monkeypatch):
     """_delegation_model is stashed on the child agent for telemetry."""
     from unittest.mock import MagicMock
+    from tests.agent.prompt_profiles.test_systems_contract import (
+        _install_parent_supported_core,
+    )
     from tools.delegate_tool import _build_child_agent
 
+    _install_parent_supported_core(tmp_path, monkeypatch)
+    encoding = SimpleNamespace(encode=lambda value, **_: [0] if value else [])
+    monkeypatch.setitem(
+        sys.modules,
+        "tiktoken",
+        SimpleNamespace(
+            __version__="test",
+            get_encoding=lambda _name: encoding,
+        ),
+    )
     parent = MagicMock()
     parent.model = "gpt-5.6"
     parent.platform = "cli"
