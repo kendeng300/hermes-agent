@@ -54,8 +54,7 @@ Frontmatter:
 - platforms: declare `[macos]`, `[linux]`, and/or `[windows]` IF the skill
   uses OS-bound primitives (osascript/apt/systemctl => the matching OS; /proc,
   os.setsid, signal.SIGKILL => linux; fcntl/termios => POSIX). Prefer fixing it
-  cross-platform first (application-owned private state roots, pathlib.Path,
-  psutil); gate only
+  cross-platform first (tempfile.gettempdir(), pathlib.Path, psutil); gate only
   when the dependency is genuinely platform-bound. Omit the field for portable
   skills.
 - metadata.hermes.tags: a few Capitalized, Relevant, Tags.

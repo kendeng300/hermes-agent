@@ -250,58 +250,24 @@ def _run_one_file(
     orphan onto PID 1. This outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    # This runner is executed by file path (``python scripts/...``), which
-    # makes ``scripts/`` rather than the candidate root ``sys.path[0]``.
-    # Resolve the authority from the same candidate tree that supplied this
-    # runner; never search an installed/live Hermes package as a fallback.
-    candidate_root = str(repo_root.resolve())
-    if candidate_root not in sys.path:
-        sys.path.insert(0, candidate_root)
-    from hermes_temp import current_temp_authority
-
-    authority = current_temp_authority()
-    pytest_workspace = authority.mkdir("pytest-file")
-    basetemp = pytest_workspace.path / "pytest"
-    if any(arg == "--basetemp" or arg.startswith("--basetemp=") for arg in pytest_args):
-        pytest_workspace.cleanup()
-        authority.close()
-        raise ValueError("--basetemp is owned by the Hermes test runner")
-    basetemp.mkdir(mode=0o700)
-    basetemp.chmod(0o700)
-    cmd = [
-        sys.executable,
-        "-m",
-        "pytest",
-        str(file),
-        f"--basetemp={basetemp}",
-        *pytest_args,
-    ]
+    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
     # launch the pytest process
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=repo_root,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
-            env={
-                **os.environ,
-                **authority.child_environment(),
-                "PYTHONDONTWRITEBYTECODE": "1",
-            },
-            # POSIX: place the child at the head of its own process group so
-            # _kill_tree can SIGKILL the group atomically.
-            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-            # _kill_tree handles the Windows path via taskkill /F /T.
-            start_new_session=True,
-        )
-    except BaseException:
-        pytest_workspace.cleanup()
-        authority.close()
-        raise
+    proc = subprocess.Popen(
+        cmd,
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        # skipping writing bytecode because we're running a bunch of parallel python processes on the same code
+        env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
+        # POSIX: place the child at the head of its own process group so
+        # _kill_tree can SIGKILL the group atomically.
+        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+        # _kill_tree handles the Windows path via taskkill /F /T.
+        start_new_session=True,
+    )
 
     # Capture the pgid NOW, before the leader can exit and be reaped. Once
     # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
@@ -332,8 +298,6 @@ def _run_one_file(
         # KeyboardInterrupt / runner crash — make sure no zombie
         # grandchildren outlive us.
         _kill_tree(proc, pgid=pgid)
-        pytest_workspace.cleanup()
-        authority.close()
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
@@ -347,13 +311,6 @@ def _run_one_file(
         # Treat as a pass; surface info in a slightly distinct status
         # so the operator can spot it.
         rc = 0
-    try:
-        pytest_workspace.cleanup()
-    except Exception as exc:
-        rc = 1
-        output += f"\n(temp authority cleanup failed: {exc})\n"
-    finally:
-        authority.close()
     summary = _parse_pytest_summary(output)
     subproc_wall = time.monotonic() - subproc_start
     return file, rc, output, summary, subproc_wall

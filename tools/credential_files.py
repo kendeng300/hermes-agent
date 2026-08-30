@@ -246,13 +246,11 @@ def get_skills_directory_mount(
 
 
 _safe_skills_tempdir: Path | None = None
-_safe_skills_tempowner = None
-_safe_skills_authority = None
 
 
 def _safe_skills_path(skills_dir: Path) -> str:
     """Return *skills_dir* if symlink-free, else a sanitized temp copy."""
-    global _safe_skills_tempdir, _safe_skills_tempowner, _safe_skills_authority
+    global _safe_skills_tempdir
 
     symlinks = [p for p in skills_dir.rglob("*") if p.is_symlink()]
     if not symlinks:
@@ -264,16 +262,13 @@ def _safe_skills_path(skills_dir: Path) -> str:
 
     import atexit
     import shutil
-    from hermes_temp import current_temp_authority
+    import tempfile
 
     # Reuse the same temp dir across calls to avoid accumulation.
-    if _safe_skills_tempowner is not None:
-        _safe_skills_tempowner.cleanup()
-        _safe_skills_authority.close()
+    if _safe_skills_tempdir and _safe_skills_tempdir.is_dir():
+        shutil.rmtree(_safe_skills_tempdir, ignore_errors=True)
 
-    _safe_skills_authority = current_temp_authority()
-    _safe_skills_tempowner = _safe_skills_authority.mkdir("skills-safe")
-    safe_dir = _safe_skills_tempowner.path
+    safe_dir = Path(tempfile.mkdtemp(prefix="hermes-skills-safe-"))
     _safe_skills_tempdir = safe_dir
 
     for item in skills_dir.rglob("*"):
@@ -288,11 +283,8 @@ def _safe_skills_path(skills_dir: Path) -> str:
             shutil.copy2(str(item), str(target))
 
     def _cleanup():
-        if _safe_skills_tempowner is not None and safe_dir.is_dir():
-            try:
-                _safe_skills_tempowner.cleanup()
-            finally:
-                _safe_skills_authority.close()
+        if safe_dir.is_dir():
+            shutil.rmtree(safe_dir, ignore_errors=True)
 
     atexit.register(_cleanup)
     logger.info("credential_files: created symlink-safe skills copy at %s", safe_dir)
@@ -485,4 +477,5 @@ def iter_cache_files(
 def clear_credential_files() -> None:
     """Reset the skill-scoped registry (e.g. on session reset)."""
     _get_registered().clear()
+
 

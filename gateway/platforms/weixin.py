@@ -22,6 +22,7 @@ import os
 import re
 import secrets
 import struct
+import tempfile
 import textwrap
 import time
 import uuid
@@ -29,8 +30,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
-
-from hermes_temp import current_temp_authority
 
 logger = logging.getLogger(__name__)
 
@@ -1985,18 +1984,22 @@ class WeixinAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        cleanup_owned = None
         if image_url.startswith(("http://", "https://")):
-            file_path, cleanup_owned = await self._download_remote_media(image_url)
+            file_path = await self._download_remote_media(image_url)
+            cleanup = True
         else:
             file_path = image_url.replace("file://", "")
             if not os.path.isabs(file_path):
                 file_path = os.path.abspath(file_path)
+            cleanup = False
         try:
             return await self.send_document(chat_id, file_path, caption=caption, metadata=metadata)
         finally:
-            if cleanup_owned is not None:
-                cleanup_owned.cleanup()
+            if cleanup and file_path and os.path.exists(file_path):
+                try:
+                    os.unlink(file_path)
+                except OSError:
+                    pass
 
     async def send_image_file(
         self,
@@ -2079,7 +2082,7 @@ class WeixinAdapter(BasePlatformAdapter):
             logger.error("[%s] send_voice failed to=%s: %s", self.name, _safe_id(chat_id), exc)
             return SendResult(success=False, error=str(exc))
 
-    async def _download_remote_media(self, url: str) -> tuple[str, Any]:
+    async def _download_remote_media(self, url: str) -> str:
         from tools.url_safety import is_safe_url
 
         if not is_safe_url(url):
@@ -2094,15 +2097,9 @@ class WeixinAdapter(BasePlatformAdapter):
                 return await response.read()
         data = await asyncio.wait_for(_do_fetch(), timeout=30)
         suffix = Path(url.split("?", 1)[0]).suffix or ".bin"
-        with current_temp_authority() as authority:
-            descriptor, owned = authority.mkstemp("weixin-media", suffix=suffix)
-            try:
-                with os.fdopen(descriptor, "wb") as handle:
-                    handle.write(data)
-            except BaseException:
-                owned.cleanup()
-                raise
-            return str(owned.path), owned
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
+            handle.write(data)
+            return handle.name
 
     async def _send_file(
         self,

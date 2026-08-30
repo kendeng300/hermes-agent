@@ -2311,10 +2311,7 @@ class CLICommandsMixin:
             "#! Compose your prompt below. Lines starting with '#!' are ignored.\n"
             "#! Save and quit to send; leave empty to cancel.\n\n"
         )
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        fd, owned_prompt = temp_authority.mkstemp("prompt-editor", ".md")
-        path = str(owned_prompt.path)
+        fd, path = tempfile.mkstemp(suffix=".md", prefix="hermes_prompt_")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(header)
@@ -2330,9 +2327,9 @@ class CLICommandsMixin:
                 raw = fh.read()
         finally:
             try:
-                owned_prompt.cleanup()
-            finally:
-                temp_authority.close()
+                os.unlink(path)
+            except OSError:
+                pass
 
         lines = [ln for ln in raw.splitlines() if not ln.startswith("#!")]
         return "\n".join(lines).strip()

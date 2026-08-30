@@ -570,20 +570,7 @@ def _is_present(spec: str) -> bool:
         return False
 
 
-@dataclass
-class _OwnedConstraints:
-    path: Path
-    owned: Any
-    authority: Any
-
-    def cleanup(self) -> None:
-        try:
-            self.owned.cleanup()
-        finally:
-            self.authority.close()
-
-
-def _core_constraints_file() -> Optional[_OwnedConstraints]:
+def _core_constraints_file() -> Optional[Path]:
     """Write a pip constraints file pinning every package already importable
     in the core environment to its installed version.
 
@@ -607,6 +594,7 @@ def _core_constraints_file() -> Optional[_OwnedConstraints]:
     except ImportError:
         return None
     try:
+        import tempfile
         lines = []
         seen = set()
         for dist in distributions():
@@ -621,24 +609,10 @@ def _core_constraints_file() -> Optional[_OwnedConstraints]:
             lines.append(f"{name}=={ver}")
         if not lines:
             return None
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        owned_constraints = None
-        try:
-            fd, owned_constraints = temp_authority.mkstemp("core-constraints", ".txt")
-            path = str(owned_constraints.path)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write("\n".join(sorted(lines)) + "\n")
-            owned_constraints.verify()
-            return _OwnedConstraints(Path(path), owned_constraints, temp_authority)
-        except Exception:
-            if owned_constraints is not None:
-                try:
-                    owned_constraints.cleanup()
-                except Exception:
-                    pass
-            temp_authority.close()
-            raise
+        fd, path = tempfile.mkstemp(prefix="hermes-core-constraints-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(sorted(lines)) + "\n")
+        return Path(path)
     except Exception as e:
         logger.debug("Could not build core constraints file: %s", e)
         return None
@@ -664,7 +638,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         return _InstallResult(True, "", "")
 
     target = _lazy_install_target()
-    constraints: Optional[_OwnedConstraints] = None
+    constraints: Optional[Path] = None
 
     if target is not None:
         err = _ensure_target_ready(target)
@@ -678,7 +652,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         target_args = ["--target", str(target)]
     constraint_args: list[str] = []
     if constraints is not None:
-        constraint_args = ["--constraint", str(constraints.path)]
+        constraint_args = ["--constraint", str(constraints)]
 
     try:
         venv_root = Path(sys.executable).parent.parent
@@ -740,9 +714,9 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     finally:
         if constraints is not None:
             try:
-                constraints.cleanup()
-            except Exception as exc:
-                logger.warning("Core constraints cleanup failed: %s", exc)
+                constraints.unlink()
+            except OSError:
+                pass
 
 
 # =============================================================================

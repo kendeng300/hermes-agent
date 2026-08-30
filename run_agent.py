@@ -4850,22 +4850,19 @@ class AIAgent:
             "image/jpeg": ".jpg",
             "image/jpg": ".jpg",
         }.get(mime, ".jpg")
-        from hermes_temp import current_temp_authority
-        temp_authority = current_temp_authority()
-        descriptor, owned_image = temp_authority.mkstemp("anthropic-image", suffix)
+        tmp = tempfile.NamedTemporaryFile(prefix="anthropic_image_", suffix=suffix, delete=False)
         try:
-            with os.fdopen(descriptor, "wb") as tmp:
+            with tmp:
                 tmp.write(base64.b64decode(data))
         except Exception:
             # delete=False means a corrupt/unsupported data URL would otherwise
             # leak a zero-byte temp file on every failed materialization.
             try:
-                owned_image.cleanup()
-            finally:
-                temp_authority.close()
+                os.unlink(tmp.name)
+            except OSError:
+                pass
             raise
-        path = owned_image.path
-        temp_authority.close()
+        path = Path(tmp.name)
         return str(path), path
 
     def _describe_image_for_anthropic_fallback(self, image_url: str, role: str) -> str:

@@ -56,12 +56,12 @@ import logging
 import os
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
-from hermes_temp import current_temp_authority
 
 logger = logging.getLogger("hermes.coding_context")
 
@@ -390,19 +390,10 @@ def _resolve_cwd(cwd: Optional[str | Path]) -> Path:
 
 def _git_root(cwd: Path) -> Optional[Path]:
     current = cwd.resolve()
-    # Ask Git itself so linked worktrees and GIT_CEILING_DIRECTORIES are
-    # honored.  The latter is the hermetic boundary used when approved test
-    # workspaces live under a larger checkout rather than a system temp root.
-    raw_root = _git(current, "rev-parse", "--show-toplevel")
-    if not raw_root:
-        return None
-    try:
-        root = Path(raw_root).resolve(strict=True)
-    except (OSError, RuntimeError):
-        return None
-    if root != current and root not in current.parents:
-        return None
-    return root
+    for parent in [current, *current.parents]:
+        if (parent / ".git").exists():
+            return parent
+    return None
 
 
 def _home() -> Optional[Path]:
@@ -426,8 +417,10 @@ def _marker_root(cwd: Path) -> Optional[Path]:
     # manifest in /tmp (left by any process) must not flip every session
     # whose cwd lives under the temp dir into the coding posture. Same
     # reasoning as the $HOME skip below.
-    with current_temp_authority() as temp_authority:
-        temp_root = temp_authority.root
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve()
+    except Exception:
+        temp_root = None
     for depth, parent in enumerate([current, *current.parents]):
         if depth > 6:
             break

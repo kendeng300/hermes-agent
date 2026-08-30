@@ -12,12 +12,7 @@ from tools.environments.base import BaseEnvironment
 class _TestableEnv(BaseEnvironment):
     """Concrete subclass for testing base class methods."""
 
-    def __init__(self, cwd="/home/hermes-test/work", timeout=10):
-        # This test double exercises command construction, not remote
-        # admission. Bind a private backend temp path without claiming a
-        # remote HOME/identity receipt; executable remote admission lives in
-        # test_temp_authority_h2_migrations.py.
-        self._backend_temp_dir = "/home/hermes-test/.hermes/tmp"
+    def __init__(self, cwd="/tmp", timeout=10):
         super().__init__(cwd=cwd, timeout=timeout)
 
     def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
@@ -31,10 +26,10 @@ class TestWrapCommand:
     def test_basic_shape(self):
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hello", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo hello", "/tmp")
 
         assert "source" in wrapped
-        assert "cd -- /home/hermes-test/work" in wrapped
+        assert "cd -- /tmp" in wrapped or "cd -- '/tmp'" in wrapped
         assert "eval 'echo hello'" in wrapped
         assert "__hermes_ec=$?" in wrapped
         assert "export -p >" in wrapped
@@ -45,14 +40,14 @@ class TestWrapCommand:
     def test_no_snapshot_skips_source(self):
         env = _TestableEnv()
         env._snapshot_ready = False
-        wrapped = env._wrap_command("echo hello", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo hello", "/tmp")
 
         assert "source" not in wrapped
 
     def test_single_quote_escaping(self):
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo 'hello world'", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo 'hello world'", "/tmp")
 
         assert "eval 'echo '\\''hello world'\\'''" in wrapped
 
@@ -108,7 +103,7 @@ class TestAtomicSnapshotWrite:
     def test_wrap_command_uses_atomic_temp_then_mv(self):
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hi", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo hi", "/tmp")
         # Env dump goes to a temp file, not directly over the live snapshot.
         assert "export -p > " in wrapped
         assert ".tmp." in wrapped
@@ -128,7 +123,7 @@ class TestAtomicSnapshotWrite:
         the #38249 cluster."""
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hi", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo hi", "/tmp")
         assert "$BASHPID" in wrapped
         # The bare $$ temp form must be gone.
         assert ".tmp.$$" not in wrapped
@@ -139,11 +134,11 @@ class TestAtomicSnapshotWrite:
         so it still expands."""
         env = _TestableEnv()
         env._snapshot_ready = True
-        env._snapshot_path = "/home/hermes-test/has space/hermes-snap-x.sh"
-        wrapped = env._wrap_command("echo hi", "/home/hermes-test/work")
+        env._snapshot_path = "/tmp/has space/hermes-snap-x.sh"
+        wrapped = env._wrap_command("echo hi", "/tmp")
         # The static path (with its space) is shlex-quoted as a single word, with
         # $BASHPID appended OUTSIDE the quotes so it still expands at runtime.
-        assert "'/home/hermes-test/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
+        assert "'/tmp/has space/hermes-snap-x.sh.tmp.'$BASHPID" in wrapped
         # The space must never appear bare/unquoted in the temp token (that would
         # word-split into two args and break the redirect/mv).
         assert " space/hermes-snap-x.sh.tmp.$BASHPID" not in wrapped
@@ -154,7 +149,7 @@ class TestAtomicSnapshotWrite:
         removed on failure."""
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hi", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo hi", "/tmp")
         assert "export -p > " in wrapped and "&& mv -f " in wrapped
         assert "rm -f " in wrapped  # temp cleanup on failure
 
@@ -182,7 +177,7 @@ class TestAtomicSnapshotWrite:
     def test_snapshot_writes_use_private_umask_after_user_command(self):
         env = _TestableEnv()
         env._snapshot_ready = True
-        wrapped = env._wrap_command("echo hi", "/home/hermes-test/work")
+        wrapped = env._wrap_command("echo hi", "/tmp")
 
         assert "umask 077" in wrapped
         assert wrapped.index("eval 'echo hi'") < wrapped.index("umask 077")
@@ -349,7 +344,7 @@ class TestExtractCwdFromOutput:
         result = {"output": "hello world\n"}
         env._extract_cwd_from_output(result)
 
-        assert env.cwd == "/home/hermes-test/work"  # unchanged
+        assert env.cwd == "/tmp"  # unchanged
 
     def test_marker_in_command_output(self):
         """If the marker appears in command output AND as the real marker,

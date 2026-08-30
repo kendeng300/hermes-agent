@@ -32,9 +32,9 @@ import pytest
 
 
 # Both tests share the same handoff file: the leaker writes here, the
-# verifier reads here. Collection itself must already be under the wrapper's
-# authority; there is deliberately no host-temp fallback.
-_HANDOFF_DIR = Path(os.environ["HERMES_TEMP_ROOT"]) / "hermes-isolation-probe"
+# verifier reads here. We park it in $TMPDIR with a unique-per-run name
+# so concurrent invocations of the suite don't clobber each other.
+_HANDOFF_DIR = Path(os.environ.get("TMPDIR", "/tmp")) / "hermes-isolation-probe"
 _HANDOFF_DIR.mkdir(exist_ok=True)
 
 
@@ -277,46 +277,3 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     # Discovery found the probe file (2 tests), proving the positional path
     # was consumed as a root, not forwarded to pytest as a bad flag.
     assert "test_flagprobe.py" in proc.stdout, proc.stdout
-
-
-def test_runner_binds_and_reaps_unique_authority_basetemp(tmp_path: Path) -> None:
-    """A real child pytest sees only the authority-contained per-file root."""
-    process_authority_root = Path(os.environ["HERMES_TEMP_ROOT"])
-    probe_dir = tmp_path / "authority-probe"
-    probe_dir.mkdir()
-    handoff = _handoff_path_for(f"authority-{os.getpid()}")
-    handoff.unlink(missing_ok=True)
-    (probe_dir / "test_authority_probe.py").write_text(
-        "import json, os\n"
-        "from pathlib import Path\n"
-        f"HANDOFF = Path({str(handoff)!r})\n"
-        "def test_bound(tmp_path):\n"
-        "    keys = ('HERMES_HOME', 'HERMES_TEMP_ROOT', "
-        "'HERMES_TEMP_ROOT_IDENTITY', 'HERMES_TEMP_SCOPE', "
-        "'HERMES_TEMP_RUN_NONCE', 'HERMES_TEMP_AUTHORITY_VERSION', "
-        "'TMPDIR', 'TEMP', 'TMP')\n"
-        "    HANDOFF.write_text(json.dumps({\n"
-        "        'env': {key: os.environ.get(key) for key in keys},\n"
-        "        'tmp_path': str(tmp_path),\n"
-        "    }, sort_keys=True), encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-
-    proc = _run_runner(probe_dir, "-q")
-    assert proc.returncode == 0, proc.stdout
-    evidence = json.loads(handoff.read_text(encoding="utf-8"))
-    handoff.unlink()
-    values = evidence["env"]
-    authority_root = Path(values["HERMES_TEMP_ROOT"])
-    child_tmp = Path(evidence["tmp_path"])
-    assert authority_root == Path(values["HERMES_HOME"]) / "tmp"
-    assert {values[key] for key in ("TMPDIR", "TEMP", "TMP")} == {
-        str(authority_root)
-    }
-    assert authority_root == process_authority_root
-    assert child_tmp.is_relative_to(process_authority_root)
-    relative = child_tmp.relative_to(authority_root)
-    assert relative.parts[0].startswith("pytest-file-")
-    per_file_workspace = authority_root / relative.parts[0]
-    assert not child_tmp.exists(), "runner must reap the per-file basetemp"
-    assert not per_file_workspace.exists(), "runner must reap its owned workspace"

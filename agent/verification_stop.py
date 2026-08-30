@@ -8,10 +8,9 @@ finish immediately after editing code without fresh evidence.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable
-
-from hermes_temp import current_temp_authority
 
 
 _MAX_CHANGED_PATHS_IN_NUDGE = 8
@@ -290,12 +289,11 @@ def build_verify_on_stop_nudge(
             + "), read any failure, repair the code, and summarize what passed."
         )
     else:
-        with current_temp_authority() as temp_authority:
-            temp_dir = str(temp_authority.root)
+        temp_dir = os.path.realpath(tempfile.gettempdir())
         command_instruction = (
             "No canonical test/lint/build command was detected. Create a focused "
             f"temporary verification script under `{temp_dir}` using an OS-safe "
-            "Hermes-owned temporary path with a `hermes-verify-` filename prefix, run it "
+            "`tempfile` path with a `hermes-verify-` filename prefix, run it "
             "against the changed behavior, clean it up when possible, and "
             "summarize it explicitly as ad-hoc verification rather than suite "
             "green."

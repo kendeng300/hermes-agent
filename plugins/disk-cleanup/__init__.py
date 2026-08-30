@@ -107,7 +107,7 @@ def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     paths: Set[str] = set()
     cmd = args.get("command") or ""
     if isinstance(cmd, str) and cmd:
-        # Tokenise the command, then apply the HERMES_HOME-only safety check.
+        # Tokenise the command — catches `touch /tmp/hermes-x/test_foo.py`
         try:
             for tok in shlex.split(cmd, posix=True):
                 if tok.startswith(("/", "~")):
@@ -205,7 +205,7 @@ Subcommands:
 
 Categories: temp | test | research | download | chrome-profile | cron-output | other
 
-All operations are scoped to HERMES_HOME.
+All operations are scoped to HERMES_HOME and /tmp/hermes-*.
 Test files are auto-tracked on write_file / terminal and auto-cleaned at session end.
 """
 

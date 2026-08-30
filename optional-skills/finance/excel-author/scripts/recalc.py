@@ -16,9 +16,8 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-
-from hermes_temp import current_temp_authority
 
 
 def find_libreoffice() -> str | None:
@@ -41,38 +40,36 @@ def recalc(xlsx_path: str, timeout: int = 60) -> dict:
             "error": "libreoffice not found on PATH — install it or recalc in a real Excel session",
         }
 
-    with current_temp_authority() as authority:
-        with authority.temporary_directory("excel-recalc") as owned_output:
-            td = str(owned_output.path)
-            try:
-                subprocess.run(
-                    [
-                        lo,
-                        "--headless",
-                        "--calc",
-                        "--convert-to",
-                        "xlsx",
-                        str(src),
-                        "--outdir",
-                        td,
-                    ],
-                    check=True,
-                    capture_output=True,
-                    timeout=timeout,
-                )
-            except subprocess.TimeoutExpired:
-                return {"status": "error", "error": f"libreoffice timed out after {timeout}s"}
-            except subprocess.CalledProcessError as e:
-                return {
-                    "status": "error",
-                    "error": f"libreoffice exited {e.returncode}: {e.stderr.decode(errors='replace')[:500]}",
-                }
+    with tempfile.TemporaryDirectory() as td:
+        try:
+            subprocess.run(
+                [
+                    lo,
+                    "--headless",
+                    "--calc",
+                    "--convert-to",
+                    "xlsx",
+                    str(src),
+                    "--outdir",
+                    td,
+                ],
+                check=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "error", "error": f"libreoffice timed out after {timeout}s"}
+        except subprocess.CalledProcessError as e:
+            return {
+                "status": "error",
+                "error": f"libreoffice exited {e.returncode}: {e.stderr.decode(errors='replace')[:500]}",
+            }
 
-            produced = owned_output.path / src.name
-            if not produced.exists():
-                return {"status": "error", "error": "libreoffice did not produce output file"}
+        produced = Path(td) / src.name
+        if not produced.exists():
+            return {"status": "error", "error": "libreoffice did not produce output file"}
 
-            shutil.copy(produced, src)
+        shutil.copy(produced, src)
 
     return {"status": "success", "file": str(src)}
 

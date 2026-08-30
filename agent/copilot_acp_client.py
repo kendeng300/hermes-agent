@@ -28,7 +28,6 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
-from hermes_temp import current_temp_authority
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -94,10 +93,10 @@ def _resolve_home_dir() -> str:
     except Exception:
         pass
 
-    # Last resort stays inside the active profile.  Resolving the authority
-    # validates ownership/mode and never falls back to a host temp directory.
-    with current_temp_authority() as authority:
-        return str(authority.hermes_home)
+    # Last resort: /tmp (writable on any POSIX system). Avoids crashing the
+    # subprocess with no HOME; callers can set HERMES_HOME explicitly if they
+    # need a different writable dir.
+    return "/tmp"
 
 
 def _build_subprocess_env() -> dict[str, str]:

@@ -16,10 +16,9 @@ import json
 import os
 import random
 import sys
+import tempfile
 import time
 from pathlib import Path
-
-from hermes_temp import current_temp_authority
 
 WT = str(Path(__file__).resolve().parents[2])
 
@@ -54,7 +53,8 @@ def seed_tasks(conn, kb, n, assignee="bench-worker", with_parents=False):
     return ids
 
 
-def _run_benchmarks(home: str, out_path: Path) -> None:
+def main():
+    home = tempfile.mkdtemp(prefix="hermes_bench_")
     os.environ["HERMES_HOME"] = home
     os.environ["HOME"] = home
     sys.path.insert(0, WT)
@@ -210,21 +210,11 @@ def _run_benchmarks(home: str, out_path: Path) -> None:
     for r in results:
         print(f"{r['label']:<50} {r['min_ms']:>7.1f}ms {r['median_ms']:>7.1f}ms {r['max_ms']:>7.1f}ms")
 
-    # Save for future diffing in the profile-owned durable data tree.
+    # Save for future diffing.
+    out_path = "/tmp/kanban_bench_results.json"
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nResults saved to {out_path}")
-
-
-def main() -> None:
-    with current_temp_authority() as authority:
-        result_dir = authority.hermes_home / "data" / "benchmarks"
-        result_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with authority.temporary_directory("kanban-bench") as work:
-            _run_benchmarks(
-                str(work.path),
-                result_dir / "kanban_bench_results.json",
-            )
 
 
 if __name__ == "__main__":

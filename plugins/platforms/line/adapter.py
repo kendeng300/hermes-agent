@@ -1301,10 +1301,11 @@ class LineAdapter(BasePlatformAdapter):
         except Exception:
             hermes_home = Path.home().joinpath(".hermes").resolve()
 
-        from hermes_temp import current_temp_authority
-        with current_temp_authority() as temp_authority:
-            temp_root = temp_authority.root.resolve()
-        allowed_roots = {temp_root, hermes_home}
+        allowed_roots = {
+            Path(tempfile.gettempdir()).resolve(),
+            Path("/tmp").resolve(),  # → /private/tmp on macOS
+            hermes_home,
+        }
         resolved = path.resolve()
         if not any(_is_relative_to(resolved, r) for r in allowed_roots):
             logger.warning("LINE: refusing to serve outside allowed roots: %s", resolved)
@@ -1396,23 +1397,19 @@ class LineAdapter(BasePlatformAdapter):
             preview_token = self._register_media(str(Path(preview_path).resolve()))
             preview_filename = Path(preview_path).name
         else:
-            from hermes_temp import current_temp_authority
-            temp_authority = current_temp_authority()
-            descriptor, owned_preview = temp_authority.mkstemp("line-preview", ".png")
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             try:
-                with os.fdopen(descriptor, "wb") as tmp:
-                    tmp.write(_FALLBACK_PNG_PREVIEW)
-                    tmp.flush()
-                preview_token = self._register_media(str(owned_preview.path), cleanup=True)
+                tmp.write(_FALLBACK_PNG_PREVIEW)
+                tmp.flush()
+                tmp.close()
+                preview_token = self._register_media(tmp.name, cleanup=True)
                 preview_filename = "preview.png"
             except Exception:
                 try:
-                    owned_preview.cleanup()
-                finally:
-                    temp_authority.close()
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
                 raise
-            else:
-                temp_authority.close()
 
         video_token = self._register_media(str(path.resolve()))
         video_url = self._media_url(video_token, path.name)

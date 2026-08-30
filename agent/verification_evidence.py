@@ -11,6 +11,7 @@ import json
 import re
 import shlex
 import sqlite3
+import tempfile
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -18,7 +19,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
-from hermes_temp import current_temp_authority
 
 
 _DB_LOCK = threading.Lock()
@@ -250,14 +250,24 @@ def _is_under_temp_dir(token: str) -> bool:
         if not path.is_absolute():
             return False
         resolved = path.resolve()
-        with current_temp_authority() as temp_authority:
-            temp_root = temp_authority.root
+        temp_root = Path(tempfile.gettempdir()).resolve()
         return resolved == temp_root or temp_root in resolved.parents
     except Exception:
         return False
 
 
-def _is_temp_script_path(token: str) -> bool:
+def _is_under_root(token: str, root: str | Path | None) -> bool:
+    if not root:
+        return False
+    try:
+        path = Path(token).expanduser().resolve()
+        root_path = Path(root).expanduser().resolve()
+        return path == root_path or root_path in path.parents
+    except Exception:
+        return False
+
+
+def _is_temp_script_path(token: str, root: str | Path | None) -> bool:
     try:
         name = Path(token).expanduser().name
     except Exception:
@@ -265,30 +275,31 @@ def _is_temp_script_path(token: str) -> bool:
     return (
         name.startswith(_AD_HOC_SCRIPT_NAME_PREFIXES)
         and _is_under_temp_dir(token)
+        and not _is_under_root(token, root)
     )
 
 
-def _ad_hoc_script_args(tokens: list[str]) -> Optional[list[str]]:
+def _ad_hoc_script_args(tokens: list[str], root: str | Path | None) -> Optional[list[str]]:
     candidate_tokens = _strip_command_prefix(tokens)
     if not candidate_tokens:
         return None
     command = candidate_tokens[0]
-    if _is_temp_script_path(command):
+    if _is_temp_script_path(command, root):
         return candidate_tokens[1:]
     if command in {"python", "python3", "node", "bash", "sh", "ruby", "perl"}:
         for idx, token in enumerate(candidate_tokens[1:], start=1):
             if token == "--":
                 continue
-            if _is_temp_script_path(token):
+            if _is_temp_script_path(token, root):
                 return candidate_tokens[idx + 1:]
             if not token.startswith("-"):
                 return None
     return None
 
 
-def _find_ad_hoc_match(command: str) -> Optional[list[str]]:
+def _find_ad_hoc_match(command: str, root: str | Path | None) -> Optional[list[str]]:
     for tokens in _split_segment_tokens(command):
-        trailing_args = _ad_hoc_script_args(tokens)
+        trailing_args = _ad_hoc_script_args(tokens, root)
         if trailing_args is not None:
             return trailing_args
     return None
@@ -394,7 +405,7 @@ def classify_verification_command(
     match = _find_canonical_match(command, verify_commands)
     is_ad_hoc = False
     if match is None and not verify_commands:
-        ad_hoc_args = _find_ad_hoc_match(command)
+        ad_hoc_args = _find_ad_hoc_match(command, facts.get("root"))
         if ad_hoc_args is not None:
             match = ("ad-hoc verification script", ad_hoc_args)
             is_ad_hoc = True

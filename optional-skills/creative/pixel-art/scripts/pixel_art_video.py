@@ -21,9 +21,9 @@ import os
 import random
 import shutil
 import subprocess
+import tempfile
 
 from PIL import Image, ImageDraw
-from hermes_temp import current_temp_authority
 
 
 # ── Pixel drawing helpers ──────────────────────────────────────────────
@@ -285,39 +285,37 @@ def pixel_art_video(
     n_frames = fps * duration
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
 
-    with current_temp_authority() as authority:
-        with authority.temporary_directory("pixelart-frames") as owned_frames:
-            frames_dir = str(owned_frames.path)
-            for frame_idx in range(n_frames):
-                canvas = base.copy()
-                draw = ImageDraw.Draw(canvas)
-                t = frame_idx / fps
-                for draw_fn, state in layers:
-                    draw_fn(draw, state, t, W, H)
-                canvas.save(os.path.join(frames_dir, f"frame_{frame_idx:04d}.png"))
+    with tempfile.TemporaryDirectory(prefix="pixelart_frames_") as frames_dir:
+        for frame_idx in range(n_frames):
+            canvas = base.copy()
+            draw = ImageDraw.Draw(canvas)
+            t = frame_idx / fps
+            for draw_fn, state in layers:
+                draw_fn(draw, state, t, W, H)
+            canvas.save(os.path.join(frames_dir, f"frame_{frame_idx:04d}.png"))
 
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error",
+             "-framerate", str(fps),
+             "-i", os.path.join(frames_dir, "frame_%04d.png"),
+             "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+             output_path],
+            check=True,
+        )
+
+        gif_path = None
+        if export_gif:
+            gif_path = output_path.rsplit(".", 1)[0] + ".gif"
             subprocess.run(
                 ["ffmpeg", "-y", "-loglevel", "error",
                  "-framerate", str(fps),
                  "-i", os.path.join(frames_dir, "frame_%04d.png"),
-                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
-                 output_path],
+                 "-vf",
+                 "scale=320:-1:flags=neighbor,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                 "-loop", "0",
+                 gif_path],
                 check=True,
             )
-
-            gif_path = None
-            if export_gif:
-                gif_path = output_path.rsplit(".", 1)[0] + ".gif"
-                subprocess.run(
-                    ["ffmpeg", "-y", "-loglevel", "error",
-                     "-framerate", str(fps),
-                     "-i", os.path.join(frames_dir, "frame_%04d.png"),
-                     "-vf",
-                     "scale=320:-1:flags=neighbor,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
-                     "-loop", "0",
-                     gif_path],
-                    check=True,
-                )
 
     return output_path, gif_path
 
