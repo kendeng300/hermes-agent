@@ -678,6 +678,14 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         # also clears the fire claim) and returns True iff it processed the job.
         processed = run_one_job(job)
         ok, error = get_job_firing_result(job_id, processed)
+        if not ok and error is None:
+            # Compatibility for legacy/mocked run_one_job implementations that
+            # do not publish through the shared accessor: retain the original
+            # post-run store read.  A cleanup quarantine always supplies its
+            # exact reason above and therefore remains authoritative.
+            refreshed = get_job(job_id) or {}
+            ok = bool(processed and refreshed.get("last_status") == "ok")
+            error = refreshed.get("last_error")
         return {
             "claimed": True,
             "success": ok,

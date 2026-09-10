@@ -59,6 +59,20 @@ class TestCronjobRunExecutesImmediately:
         assert out["job"]["execution_success"] is False
         assert out["job"]["execution_error"] == "provider 500"
 
+    def test_cleanup_quarantine_result_overrides_stale_successful_reread(self):
+        """The compatibility reread cannot erase fail-closed cleanup truth."""
+        stale = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        critical = "CRITICAL: durable pause failed after cleanup uncertainty"
+        with patch("tools.cronjob_tools.resolve_job_ref", return_value=dict(_JOB)), \
+             patch("tools.cronjob_tools.claim_job_for_fire", return_value=True), \
+             patch("cron.scheduler.run_one_job", return_value=False), \
+             patch("cron.scheduler.get_job_firing_result", return_value=(False, critical)), \
+             patch("tools.cronjob_tools.get_job", return_value=stale):
+            out = json.loads(cronjob(action="run", job_id="job-run-1"))
+
+        assert out["job"]["execution_success"] is False
+        assert out["job"]["execution_error"] == critical
+
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \

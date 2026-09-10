@@ -195,7 +195,7 @@ def _cleanup(target: subprocess.Popen) -> Cleanup:
             uncertain = True
             stopped = identities
         for identity in reversed(stopped):
-            if _signal_identity(identity, signal.SIGKILL) is Probe.UNKNOWN:
+            if _signal_identity(identity, signal.SIGKILL) is Probe.UNKNOWN:  # windows-footgun: ok — Linux-only helper
                 uncertain = True
         try:
             target.wait(timeout=0.02)
@@ -235,7 +235,10 @@ def main() -> int:
     clean = Cleanup.UNKNOWN
     try:
         start_state, identity = _read_identity(target.pid)
-        if start_state is not Probe.PRESENT or identity is None:
+        # A tiny script can already be a zombie here.  Its /proc identity is
+        # still stable and owned until this Popen reaps it, so preserve that
+        # birth identity in START.  Missing/unknown identity remains fatal.
+        if start_state is Probe.UNKNOWN or identity is None:
             raise RuntimeError("cron script target identity is not readable")
         os.write(
             result_fd,

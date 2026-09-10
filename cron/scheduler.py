@@ -2150,7 +2150,7 @@ def _kill_known_target_group(
     if state != "LIVE":
         return state == "GONE"
     try:
-        os.killpg(target_pid, signal.SIGKILL)
+        os.killpg(target_pid, signal.SIGKILL)  # windows-footgun: ok — Linux-only admission
     except (ProcessLookupError, FileNotFoundError):
         return True
     except (PermissionError, OSError):

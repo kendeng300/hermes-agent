@@ -151,6 +151,36 @@ class TestRunJobScript:
         assert "exited with code 1" in output
         assert "error info" in output
 
+    @pytest.mark.parametrize("returncode", [0, 7])
+    def test_immediate_exit_handshake_is_repeatable(
+        self, cron_env, returncode
+    ):
+        """A target that is already a zombie still has a stable birth ID."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / f"immediate_{returncode}.py"
+        script.write_text(
+            f"import sys\nprint('instant-{returncode}')\nsys.exit({returncode})\n"
+        )
+        for _ in range(8):
+            success, output = _run_job_script(str(script))
+            assert success is (returncode == 0)
+            if returncode == 0:
+                assert output == "instant-0"
+            else:
+                assert "Script exited with code 7" in output
+                assert "instant-7" in output
+
+    def test_immediate_wake_gate_handshake_is_repeatable(self, cron_env):
+        from cron.scheduler import _parse_wake_gate, _run_job_script
+
+        script = cron_env / "scripts" / "immediate_wake.py"
+        script.write_text('print(\'{"wakeAgent": false}\')\n')
+        for _ in range(8):
+            success, output = _run_job_script(str(script))
+            assert success is True
+            assert _parse_wake_gate(output) is False
+
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""
         from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
@@ -472,10 +502,20 @@ class TestRunJobScript:
     ):
         from cron import scheduler as sched_mod
 
+        actual_fds = {}
+        real_pipe = sched_mod.os.pipe
+
+        def capture_pipe():
+            pair = real_pipe()
+            actual_fds["pair"] = pair
+            return pair
+
         process = MagicMock(pid=43210, returncode=None)
         process.communicate.side_effect = raised
         cleanup = MagicMock(return_value=None)
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", MagicMock(return_value=process))
+        popen = MagicMock(return_value=process)
+        monkeypatch.setattr(sched_mod.os, "pipe", capture_pipe)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", popen)
         monkeypatch.setattr(sched_mod, "_read_supervisor_start", MagicMock(return_value=(50, 60)))
         monkeypatch.setattr(sched_mod, "_cleanup_preserving_exception", cleanup)
 
@@ -483,7 +523,9 @@ class TestRunJobScript:
             sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
 
         assert caught.value is raised
-        cleanup.assert_called_once_with(process, (50, 60), 15)
+        read_fd, write_fd = actual_fds["pair"]
+        assert popen.call_args.kwargs["pass_fds"] == (write_fd,)
+        cleanup.assert_called_once_with(process, (50, 60), read_fd)
 
     @pytest.mark.parametrize(
         "close_error",
@@ -518,12 +560,22 @@ class TestRunJobScript:
     def test_cleanup_baseexception_after_success_is_propagated(self, monkeypatch):
         from cron import scheduler as sched_mod
 
+        actual_fds = {}
+        real_pipe = sched_mod.os.pipe
+
+        def capture_pipe():
+            pair = real_pipe()
+            actual_fds["pair"] = pair
+            return pair
+
         process = MagicMock(pid=43210, returncode=0)
         process.communicate.return_value = ("out", "err")
         cleanup_error = SystemExit(9)
         cleanup = MagicMock(side_effect=cleanup_error)
         preserving = MagicMock(return_value=None)
-        monkeypatch.setattr(sched_mod.subprocess, "Popen", MagicMock(return_value=process))
+        popen = MagicMock(return_value=process)
+        monkeypatch.setattr(sched_mod.os, "pipe", capture_pipe)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", popen)
         monkeypatch.setattr(sched_mod, "_read_supervisor_start", MagicMock(return_value=(50, 60)))
         monkeypatch.setattr(sched_mod, "_cleanup_linux_supervisor", cleanup)
         monkeypatch.setattr(sched_mod, "_cleanup_preserving_exception", preserving)
@@ -532,7 +584,9 @@ class TestRunJobScript:
             sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
 
         assert caught.value is cleanup_error
-        preserving.assert_called_once_with(process, (50, 60), 15)
+        read_fd, write_fd = actual_fds["pair"]
+        assert popen.call_args.kwargs["pass_fds"] == (write_fd,)
+        preserving.assert_called_once_with(process, (50, 60), read_fd)
 
     def test_active_exception_cleanup_retries_without_masking(self, monkeypatch):
         from cron import scheduler as sched_mod
