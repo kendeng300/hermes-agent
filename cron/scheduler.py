@@ -238,7 +238,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import SCRIPT_CLEANUP_PAUSE_PREFIX, get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -299,9 +299,10 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
 # Process-local fail-closed guard used only when a script cleanup could not be
-# proven.  Durable pause is authoritative; this set prevents another spawn in
-# this process even if persisting that pause fails.
-_cleanup_unverified_job_ids: set[str] = set()
+# proven.  The durable paused job remains authoritative when persistence
+# succeeds.  When it fails, this minimal record preserves the critical reason
+# and prevents another spawn in this process until durable remediation/restart.
+_cleanup_unverified_jobs: dict[str, dict[str, object]] = {}
 
 
 def _record_running_marker(job_id: str, running: bool) -> None:
@@ -2475,7 +2476,7 @@ def _pause_job_for_unverified_script_cleanup(
     """Disable one exact job in memory and durably pause it in the job store."""
     job_id = str(job["id"])
     reason = (
-        "Cron script cleanup unverified; job paused before recurrence. "
+        f"{SCRIPT_CLEANUP_PAUSE_PREFIX} job paused before recurrence. "
         f"{cleanup_error}"
     )
     updates = {
@@ -2486,7 +2487,10 @@ def _pause_job_for_unverified_script_cleanup(
         "last_error": reason,
     }
     with _running_lock:
-        _cleanup_unverified_job_ids.add(job_id)
+        _cleanup_unverified_jobs[job_id] = {
+            "reason": reason,
+            "pause_persisted": False,
+        }
     job.update(updates)
     try:
         from cron.jobs import update_job
@@ -2494,28 +2498,111 @@ def _pause_job_for_unverified_script_cleanup(
         updated = update_job(job_id, updates)
         if updated is None:
             raise RuntimeError("job was not found in the durable cron store")
+        with _running_lock:
+            record = _cleanup_unverified_jobs.get(job_id)
+            if record is not None:
+                record["pause_persisted"] = True
         _notify_provider_jobs_changed()
     except Exception as persist_error:
-        raise CronScriptCleanupError(
+        critical = CronScriptCleanupError(
             f"{reason}; CRITICAL: durable pause failed: {persist_error}",
             original_error=cleanup_error,
-        ) from persist_error
+        )
+        critical_reason = str(critical)
+        job["paused_reason"] = critical_reason
+        job["last_error"] = critical_reason
+        with _running_lock:
+            record = _cleanup_unverified_jobs.get(job_id)
+            if record is not None:
+                record["reason"] = critical_reason
+        raise critical from persist_error
     return reason
+
+
+def _cleanup_quarantine_reason(job: dict) -> Optional[str]:
+    """Return a quarantine refusal, or consume an intentional durable resume.
+
+    A successfully persisted pause can be cleared only after the exact durable
+    job has been explicitly resumed/triggered.  A failed pause persistence is
+    never cleared in-process: the operator must durably remediate and restart.
+    """
+    job_id = str(job["id"])
+    with _running_lock:
+        record = _cleanup_unverified_jobs.get(job_id)
+        if record is None:
+            return None
+        reason = str(record["reason"])
+        pause_persisted = bool(record["pause_persisted"])
+
+    if not pause_persisted:
+        return reason
+
+    try:
+        from cron.jobs import get_job
+
+        durable = get_job(job_id)
+    except Exception:
+        durable = None
+    intentionally_resumed = bool(
+        durable
+        and durable.get("enabled") is True
+        and durable.get("state") == "scheduled"
+        and durable.get("paused_at") is None
+        and durable.get("paused_reason") is None
+    )
+    if not intentionally_resumed:
+        return reason
+
+    with _running_lock:
+        current = _cleanup_unverified_jobs.get(job_id)
+        if current != record:
+            return str(current["reason"]) if current is not None else None
+        _cleanup_unverified_jobs.pop(job_id, None)
+    job.clear()
+    job.update(durable)
+    return None
+
+
+def _clear_cleanup_fire_claim(job_id: str) -> None:
+    """Best-effort release of only the transient manual/provider fire claim."""
+    try:
+        from cron.jobs import get_job, update_job
+
+        current = get_job(job_id)
+        if current is None or current.get("fire_claim") is None:
+            return
+        update_job(job_id, {"fire_claim": None})
+    except Exception as exc:
+        logger.critical(
+            "Job '%s': failed to clear transient fire claim after cleanup "
+            "quarantine: %s",
+            job_id,
+            exc,
+        )
+
+
+def get_job_firing_result(job_id: str, processed: bool) -> tuple[bool, Optional[str]]:
+    """Return the shared manual/provider firing result without stale reloads."""
+    with _running_lock:
+        record = _cleanup_unverified_jobs.get(str(job_id))
+        if record is not None:
+            return False, str(record["reason"])
+    try:
+        from cron.jobs import get_job
+
+        refreshed = get_job(job_id) or {}
+    except Exception as exc:
+        return False, f"Failed to read cron firing result: {exc}"
+    return bool(processed and refreshed.get("last_status") == "ok"), refreshed.get("last_error")
 
 
 def _run_scheduled_job_script(job: dict, script_path: str) -> tuple[bool, str]:
     """Run one job-owned script, pausing recurrence on unverified cleanup."""
     job_id = job.get("id")
-    with _running_lock:
-        cleanup_unverified = (
-            job_id is not None
-            and str(job_id) in _cleanup_unverified_job_ids
-        )
-    if cleanup_unverified:
-        return False, str(
-            job.get("last_error")
-            or "Cron script cleanup remains unverified; job is paused"
-        )
+    if job_id is not None:
+        quarantine_reason = _cleanup_quarantine_reason(job)
+        if quarantine_reason is not None:
+            return False, quarantine_reason
     try:
         return _run_job_script(script_path)
     except CronScriptCleanupError as cleanup_error:
@@ -3052,7 +3139,7 @@ def run_job(
         prerun_script = _run_scheduled_job_script(job, script_path)
         _ran_ok, _script_output = prerun_script
         with _running_lock:
-            cleanup_unverified = str(job_id) in _cleanup_unverified_job_ids
+            cleanup_unverified = str(job_id) in _cleanup_unverified_jobs
         if cleanup_unverified:
             now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
             failed_doc = (
@@ -3857,13 +3944,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
-    with _running_lock:
-        if str(job["id"]) in _cleanup_unverified_job_ids:
-            logger.critical(
-                "Job '%s' refused: prior script cleanup was not verified",
-                job["id"],
-            )
-            return False
+    quarantine_reason = _cleanup_quarantine_reason(job)
+    if quarantine_reason is not None:
+        logger.critical(
+            "Job '%s' refused: %s",
+            job["id"],
+            quarantine_reason,
+        )
+        _clear_cleanup_fire_claim(str(job["id"]))
+        return False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4018,6 +4107,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 # backstop, not a hard dependency).
                 logger.warning("SYS-666 completeness gate check error: %s", _e)
 
+        with _running_lock:
+            cleanup_quarantined = str(job["id"]) in _cleanup_unverified_jobs
+        if cleanup_quarantined:
+            # The pause helper already persisted the exact authoritative
+            # paused row and cleanup reason.  Do not let mark_job_run clear the
+            # error, re-arm recurrence, complete/delete a one-shot, or advance
+            # a finite repeat.  Only release a transient manual/provider claim.
+            _clear_cleanup_fire_claim(str(job["id"]))
+            return False
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
@@ -4025,7 +4123,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         with _running_lock:
-            cleanup_unverified = str(job["id"]) in _cleanup_unverified_job_ids
+            cleanup_unverified = str(job["id"]) in _cleanup_unverified_jobs
+        if cleanup_unverified:
+            _clear_cleanup_fire_claim(str(job["id"]))
         if not cleanup_unverified and not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         return False
@@ -4083,11 +4183,10 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
     try:
         due_jobs = get_due_jobs()
-        with _running_lock:
-            due_jobs = [
-                job for job in due_jobs
-                if str(job["id"]) not in _cleanup_unverified_job_ids
-            ]
+        due_jobs = [
+            job for job in due_jobs
+            if _cleanup_quarantine_reason(job) is None
+        ]
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))

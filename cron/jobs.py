@@ -1475,6 +1475,9 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
+SCRIPT_CLEANUP_PAUSE_PREFIX = "Cron script cleanup unverified;"
+
+
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                  delivery_error: Optional[str] = None):
     """
@@ -1490,6 +1493,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                if (
+                    job.get("state") == "paused"
+                    and isinstance(job.get("paused_reason"), str)
+                    and job["paused_reason"].startswith(SCRIPT_CLEANUP_PAUSE_PREFIX)
+                ):
+                    # Script cleanup uncertainty is a fail-closed lifecycle
+                    # terminal.  No completion path may clear its exact reason,
+                    # delete a one-shot, increment a finite repeat, or compute a
+                    # successor.  Releasing a transient external-fire claim is
+                    # the sole permitted mutation.
+                    if job.get("fire_claim") is not None:
+                        job["fire_claim"] = None
+                        jobs[i] = job
+                        save_jobs(jobs)
+                    return
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"

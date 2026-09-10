@@ -614,7 +614,7 @@ class TestRunJobScript:
             assert unchanged["state"] == "scheduled"
         finally:
             with sched_mod._running_lock:
-                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
 
     def test_pause_persistence_failure_blocks_next_in_process_spawn(
         self, monkeypatch
@@ -641,7 +641,173 @@ class TestRunJobScript:
             claim.assert_not_called()
         finally:
             with sched_mod._running_lock:
-                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    @pytest.mark.parametrize(
+        ("schedule", "repeat"),
+        [
+            ("every 5m", None),
+            ("every 5m", 3),
+            ((datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), 1),
+        ],
+        ids=["recurring", "finite-repeat", "one-shot"],
+    )
+    def test_cleanup_quarantine_preserves_paused_row_across_finalization(
+        self, cron_env, monkeypatch, schedule, repeat
+    ):
+        from cron import jobs as jobs_mod
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job
+
+        job = create_job(
+            prompt="run",
+            schedule=schedule,
+            repeat=repeat,
+            script="owned.py",
+        )
+        paused_postimage = {}
+
+        def fail_with_cleanup(target, *, defer_agent_teardown=None):
+            cleanup = sched_mod.CronScriptCleanupError(
+                "TimeoutExpired; cleanup: missing RESULT"
+            )
+            reason = sched_mod._pause_job_for_unverified_script_cleanup(
+                target, cleanup
+            )
+            paused_postimage.update(get_job(target["id"]))
+            return False, reason, "", reason
+
+        mark = MagicMock()
+        monkeypatch.setattr(sched_mod, "run_job", fail_with_cleanup)
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        monkeypatch.setattr(sched_mod, "mark_job_run", mark)
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        try:
+            assert sched_mod.run_one_job(job) is False
+            assert get_job(job["id"]) == paused_postimage
+            assert paused_postimage["enabled"] is False
+            assert paused_postimage["state"] == "paused"
+            assert paused_postimage["last_error"] == paused_postimage["paused_reason"]
+            mark.assert_not_called()
+            jobs_mod.mark_job_run(job["id"], True)
+            assert get_job(job["id"]) == paused_postimage
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_builtin_tick_accepts_exact_durable_resume(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job, resume_job
+
+        job = create_job(prompt="run", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation missing")
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+        resumed = resume_job(job["id"])
+        assert resumed["state"] == "scheduled"
+
+        monkeypatch.setattr(sched_mod, "get_due_jobs", MagicMock(return_value=[job]))
+        monkeypatch.setattr(sched_mod, "advance_next_run", MagicMock(return_value=True))
+        monkeypatch.setattr(
+            sched_mod,
+            "_get_lock_paths",
+            MagicMock(return_value=(cron_env / "cron", cron_env / "cron" / "tick.lock")),
+        )
+        monkeypatch.setattr(
+            sched_mod, "run_job", MagicMock(return_value=(True, "out", "done", None))
+        )
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        try:
+            assert sched_mod.tick(verbose=False, sync=True) == 1
+            assert get_job(job["id"])["last_status"] == "ok"
+            with sched_mod._running_lock:
+                assert job["id"] not in sched_mod._cleanup_unverified_jobs
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_provider_fire_accepts_exact_durable_trigger(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job, trigger_job
+        from cron.scheduler_provider import InProcessCronScheduler
+
+        job = create_job(prompt="run", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation invalid")
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+        assert trigger_job(job["id"])["state"] == "scheduled"
+        monkeypatch.setattr(
+            sched_mod, "run_job", MagicMock(return_value=(True, "out", "done", None))
+        )
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        try:
+            assert InProcessCronScheduler().fire_due(job["id"]) is True
+            assert get_job(job["id"])["last_status"] == "ok"
+            with sched_mod._running_lock:
+                assert job["id"] not in sched_mod._cleanup_unverified_jobs
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_manual_fire_accepts_resume_and_returns_current_result(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job, resume_job
+        from tools.cronjob_tools import _execute_job_now
+
+        job = create_job(prompt="run", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation missing")
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+        resume_job(job["id"])
+        monkeypatch.setattr(
+            sched_mod, "run_job", MagicMock(return_value=(True, "out", "done", None))
+        )
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        try:
+            result = _execute_job_now(job)
+            assert result == {"claimed": True, "success": True, "error": None}
+            assert get_job(job["id"])["last_status"] == "ok"
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_pause_persistence_failure_is_actionable_for_manual_and_provider(
+        self, cron_env, monkeypatch
+    ):
+        from cron import jobs as jobs_mod
+        from cron import scheduler as sched_mod
+        from cron.scheduler_provider import InProcessCronScheduler
+        from tools.cronjob_tools import _execute_job_now
+
+        job = jobs_mod.create_job(prompt="run", schedule="every 5m")
+        original_update = jobs_mod.update_job
+        monkeypatch.setattr(
+            jobs_mod, "update_job", MagicMock(side_effect=OSError("disk unavailable"))
+        )
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation missing")
+        try:
+            with pytest.raises(sched_mod.CronScriptCleanupError, match="CRITICAL"):
+                sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+            monkeypatch.setattr(jobs_mod, "update_job", original_update)
+            spawn = MagicMock()
+            monkeypatch.setattr(sched_mod, "claim_dispatch", spawn)
+
+            manual = _execute_job_now(job)
+            assert manual["claimed"] is True
+            assert manual["success"] is False
+            assert "cleanup attestation missing" in manual["error"]
+            assert "durable pause failed: disk unavailable" in manual["error"]
+            assert InProcessCronScheduler().fire_due(job["id"]) is False
+            spawn.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
 
     def test_verified_cleanup_timeout_does_not_pause(self, monkeypatch):
         from cron import scheduler as sched_mod
@@ -681,13 +847,16 @@ class TestRunJobScript:
         )
         try:
             with sched_mod._running_lock:
-                sched_mod._cleanup_unverified_job_ids.add(job["id"])
+                sched_mod._cleanup_unverified_jobs[job["id"]] = {
+                    "reason": "cleanup uncertain",
+                    "pause_persisted": False,
+                }
             assert sched_mod.tick(verbose=False) == 0
             advance.assert_not_called()
             run.assert_not_called()
         finally:
             with sched_mod._running_lock:
-                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
 
     def test_agent_script_path_pauses_before_agent_spawn(
         self, cron_env, monkeypatch
@@ -721,7 +890,7 @@ class TestRunJobScript:
             agent.assert_not_called()
         finally:
             with sched_mod._running_lock:
-                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
 
     def test_all_job_aware_script_callers_use_pause_wrapper(self):
         import inspect

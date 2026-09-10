@@ -657,7 +657,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     job_id = job["id"]
     try:
-        from cron.scheduler import run_one_job
+        from cron.scheduler import get_job_firing_result, run_one_job
 
         # At-most-once claim: bail without running if a tick/other fire owns it.
         if not claim_job_for_fire(job_id):
@@ -677,12 +677,11 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
         processed = run_one_job(job)
-        refreshed = get_job(job_id) or {}
-        ok = refreshed.get("last_status") == "ok"
+        ok, error = get_job_firing_result(job_id, processed)
         return {
             "claimed": True,
-            "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
+            "success": ok,
+            "error": error,
         }
 
     except Exception as e:
