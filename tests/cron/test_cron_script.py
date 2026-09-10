@@ -9,8 +9,13 @@ Tests cover:
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import textwrap
+import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -146,6 +151,36 @@ class TestRunJobScript:
         assert "exited with code 1" in output
         assert "error info" in output
 
+    @pytest.mark.parametrize("returncode", [0, 7])
+    def test_immediate_exit_handshake_is_repeatable(
+        self, cron_env, returncode
+    ):
+        """A target that is already a zombie still has a stable birth ID."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / f"immediate_{returncode}.py"
+        script.write_text(
+            f"import sys\nprint('instant-{returncode}')\nsys.exit({returncode})\n"
+        )
+        for _ in range(8):
+            success, output = _run_job_script(str(script))
+            assert success is (returncode == 0)
+            if returncode == 0:
+                assert output == "instant-0"
+            else:
+                assert "Script exited with code 7" in output
+                assert "instant-7" in output
+
+    def test_immediate_wake_gate_handshake_is_repeatable(self, cron_env):
+        from cron.scheduler import _parse_wake_gate, _run_job_script
+
+        script = cron_env / "scripts" / "immediate_wake.py"
+        script.write_text('print(\'{"wakeAgent": false}\')\n')
+        for _ in range(8):
+            success, output = _run_job_script(str(script))
+            assert success is True
+            assert _parse_wake_gate(output) is False
+
     def test_script_subprocess_env_sanitized(self, cron_env, monkeypatch):
         """Cron scripts must not inherit Hermes provider env (SECURITY.md §2.3)."""
         from tools.environments.local import _HERMES_PROVIDER_ENV_BLOCKLIST
@@ -194,6 +229,995 @@ class TestRunJobScript:
         success, output = _run_job_script(str(script))
         assert success is False
         assert "timed out" in output.lower()
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+    @pytest.mark.live_system_guard_bypass
+    def test_script_timeout_kills_descendant_process(self, cron_env, monkeypatch):
+        """A timed-out wrapper must not leave its long-running child alive."""
+        import psutil
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+
+        child_pid_path = cron_env / "scripts" / "child.identity"
+        child = cron_env / "scripts" / "child.py"
+        child.write_text(textwrap.dedent(f"""\
+            import os
+            import pathlib
+            import time
+
+            stat = pathlib.Path(f"/proc/{{os.getpid()}}/stat").read_text()
+            birth = stat.rsplit(")", 1)[1].split()[19]
+            pathlib.Path({str(child_pid_path)!r}).write_text(
+                f"{{os.getpid()}}:{{birth}}"
+            )
+            time.sleep(30)
+        """))
+        wrapper = cron_env / "scripts" / "wrapper.py"
+        wrapper.write_text(textwrap.dedent(f"""\
+            import pathlib
+            import subprocess
+            import sys
+            import time
+
+            subprocess.Popen([sys.executable, {str(child)!r}])
+            time.sleep(30)
+        """))
+
+        identity = None
+        try:
+            success, output = _run_job_script(str(wrapper))
+            assert success is False
+            assert "timed out" in output.lower()
+            identity = self._read_identity(child_pid_path)
+            self._assert_identity_exits(identity)
+        finally:
+            identity = identity or self._read_identity_if_present(child_pid_path)
+            if identity is not None:
+                self._kill_identity_if_live(identity)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+    @pytest.mark.live_system_guard_bypass
+    def test_script_timeout_kills_escaped_session_child(self, cron_env, monkeypatch):
+        """A setsid child remains owned even after leaving the initial group."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        child_pid_path = cron_env / "scripts" / "escaped.identity"
+        child = cron_env / "scripts" / "escaped.py"
+        child.write_text(textwrap.dedent(f"""\
+            import os
+            import pathlib
+            import time
+
+            stat = pathlib.Path(f"/proc/{{os.getpid()}}/stat").read_text()
+            birth = stat.rsplit(")", 1)[1].split()[19]
+            pathlib.Path({str(child_pid_path)!r}).write_text(
+                f"{{os.getpid()}}:{{birth}}"
+            )
+            time.sleep(30)
+        """))
+        wrapper = cron_env / "scripts" / "escaped_wrapper.py"
+        wrapper.write_text(textwrap.dedent(f"""\
+            import pathlib
+            import subprocess
+            import sys
+            import time
+
+            subprocess.Popen(
+                [sys.executable, {str(child)!r}],
+                start_new_session=True,
+            )
+            time.sleep(30)
+        """))
+
+        identity = None
+        try:
+            success, output = _run_job_script(str(wrapper))
+            assert success is False
+            assert "timed out" in output.lower()
+            identity = self._read_identity(child_pid_path)
+            self._assert_identity_exits(identity)
+        finally:
+            identity = identity or self._read_identity_if_present(child_pid_path)
+            if identity is not None:
+                self._kill_identity_if_live(identity)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+    @pytest.mark.live_system_guard_bypass
+    def test_wrapper_exit_pipe_holder_is_bounded_and_killed(self, cron_env, monkeypatch):
+        """A reaped wrapper cannot leave a same-group pipe holder behind."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        child_pid_path = cron_env / "scripts" / "pipe_holder.identity"
+        child = cron_env / "scripts" / "pipe_holder.py"
+        child.write_text(textwrap.dedent(f"""\
+            import os
+            import pathlib
+            import time
+
+            stat = pathlib.Path(f"/proc/{{os.getpid()}}/stat").read_text()
+            birth = stat.rsplit(")", 1)[1].split()[19]
+            pathlib.Path({str(child_pid_path)!r}).write_text(
+                f"{{os.getpid()}}:{{birth}}"
+            )
+            time.sleep(30)
+        """))
+        wrapper = cron_env / "scripts" / "pipe_wrapper.py"
+        wrapper.write_text(textwrap.dedent(f"""\
+            import pathlib
+            import subprocess
+            import sys
+            import time
+
+            subprocess.Popen([sys.executable, {str(child)!r}])
+            deadline = time.monotonic() + 1
+            while not pathlib.Path({str(child_pid_path)!r}).exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("pipe holder did not publish identity")
+                time.sleep(0.01)
+        """))
+
+        identity = None
+        started = time.monotonic()
+        try:
+            success, output = _run_job_script(str(wrapper))
+            assert time.monotonic() - started < 6
+            assert success is True
+            assert output == ""
+            identity = self._read_identity(child_pid_path)
+            self._assert_identity_exits(identity)
+        finally:
+            identity = identity or self._read_identity_if_present(child_pid_path)
+            if identity is not None:
+                self._kill_identity_if_live(identity)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+    @pytest.mark.live_system_guard_bypass
+    def test_fast_detached_child_cannot_escape_successful_wrapper(self, cron_env):
+        """A fast setsid child is adopted even after redirecting captured pipes."""
+        from cron.scheduler import _run_job_script
+
+        child_pid_path = cron_env / "scripts" / "fast_detached.identity"
+        wrapper = cron_env / "scripts" / "fast_wrapper.py"
+        wrapper.write_text(textwrap.dedent(f"""\
+            import os
+            import pathlib
+            import time
+
+            if os.fork() == 0:
+                os.setsid()
+                if os.fork() != 0:
+                    os._exit(0)
+                devnull = os.open(os.devnull, os.O_RDWR)
+                for fd in (0, 1, 2):
+                    os.dup2(devnull, fd)
+                stat = pathlib.Path(f"/proc/{{os.getpid()}}/stat").read_text()
+                birth = stat.rsplit(")", 1)[1].split()[19]
+                pathlib.Path({str(child_pid_path)!r}).write_text(
+                    f"{{os.getpid()}}:{{birth}}"
+                )
+                time.sleep(30)
+            deadline = time.monotonic() + 1
+            while not pathlib.Path({str(child_pid_path)!r}).exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("detached child did not publish identity")
+                time.sleep(0.01)
+        """))
+
+        identity = None
+        try:
+            success, output = _run_job_script(str(wrapper))
+            assert success is True
+            assert output == ""
+            identity = self._read_identity(child_pid_path)
+            self._assert_identity_exits(identity)
+        finally:
+            identity = identity or self._read_identity_if_present(child_pid_path)
+            if identity is not None:
+                self._kill_identity_if_live(identity)
+
+    @staticmethod
+    def _read_identity(path):
+        pid, birth = path.read_text().split(":")
+        return int(pid), int(birth)
+
+    @classmethod
+    def _read_identity_if_present(cls, path):
+        try:
+            return cls._read_identity(path)
+        except (FileNotFoundError, ValueError):
+            return None
+
+    @staticmethod
+    def _current_birth(pid):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            return int(stat.rsplit(")", 1)[1].split()[19])
+        except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+            return None
+
+    @classmethod
+    def _assert_identity_exits(cls, identity, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cls._current_birth(identity[0]) != identity[1]:
+                return
+            time.sleep(0.05)
+        pytest.fail(f"cron script descendant identity {identity!r} is still running")
+
+    @classmethod
+    def _kill_identity_if_live(cls, identity):
+        import psutil
+
+        pid, birth = identity
+        if cls._current_birth(pid) != birth:
+            return
+        try:
+            process = psutil.Process(pid)
+            if cls._current_birth(pid) == birth:
+                process.kill()
+                process.wait(timeout=2)
+        except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+            pass
+
+    @pytest.mark.parametrize(
+        "platform",
+        ["win32", "darwin"],
+    )
+    def test_unsupported_platform_fails_closed_before_spawn(self, monkeypatch, platform):
+        from cron import scheduler as sched_mod
+
+        popen = MagicMock()
+        pipe = MagicMock()
+        monkeypatch.setattr(sched_mod, "sys", SimpleNamespace(platform=platform))
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", popen)
+        monkeypatch.setattr(sched_mod.os, "pipe", pipe)
+
+        with pytest.raises(RuntimeError, match=(
+            rf"Cron script process-tree containment requires Linux; "
+            rf"refusing to spawn on {platform}"
+        )):
+            sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
+
+        pipe.assert_not_called()
+        popen.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "raised",
+        [
+            OSError("pipe read failed"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid byte"),
+            KeyboardInterrupt(),
+            SystemExit(7),
+        ],
+        ids=["oserror", "decode-error", "keyboard-interrupt", "system-exit"],
+    )
+    def test_every_post_spawn_exception_cleans_and_preserves_exception(
+        self, monkeypatch, raised
+    ):
+        from cron import scheduler as sched_mod
+
+        actual_fds = {}
+        real_pipe = sched_mod.os.pipe
+
+        def capture_pipe():
+            pair = real_pipe()
+            actual_fds["pair"] = pair
+            return pair
+
+        process = MagicMock(pid=43210, returncode=None)
+        process.communicate.side_effect = raised
+        cleanup = MagicMock(return_value=None)
+        popen = MagicMock(return_value=process)
+        monkeypatch.setattr(sched_mod.os, "pipe", capture_pipe)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", popen)
+        monkeypatch.setattr(sched_mod, "_read_supervisor_start", MagicMock(return_value=(50, 60)))
+        monkeypatch.setattr(sched_mod, "_cleanup_preserving_exception", cleanup)
+
+        with pytest.raises(type(raised)) as caught:
+            sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
+
+        assert caught.value is raised
+        read_fd, write_fd = actual_fds["pair"]
+        assert popen.call_args.kwargs["pass_fds"] == (write_fd,)
+        cleanup.assert_called_once_with(process, (50, 60), read_fd)
+
+    @pytest.mark.parametrize(
+        "close_error",
+        [OSError("close failed"), KeyboardInterrupt(), SystemExit(8)],
+        ids=["oserror", "keyboard-interrupt", "system-exit"],
+    )
+    def test_post_spawn_control_fd_close_exception_cleans(
+        self, monkeypatch, close_error
+    ):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=43210, returncode=None)
+        real_close = sched_mod.os.close
+        cleanup = MagicMock(return_value=None)
+
+        def _close(fd):
+            if fd == 101:
+                raise close_error
+            return real_close(fd)
+
+        monkeypatch.setattr(sched_mod.os, "pipe", MagicMock(return_value=(100, 101)))
+        monkeypatch.setattr(sched_mod.os, "close", _close)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", MagicMock(return_value=process))
+        monkeypatch.setattr(sched_mod, "_cleanup_preserving_exception", cleanup)
+
+        with pytest.raises(type(close_error)) as caught:
+            sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
+
+        assert caught.value is close_error
+        cleanup.assert_called_once_with(process, None, 100)
+
+    def test_cleanup_baseexception_after_success_is_propagated(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        actual_fds = {}
+        real_pipe = sched_mod.os.pipe
+
+        def capture_pipe():
+            pair = real_pipe()
+            actual_fds["pair"] = pair
+            return pair
+
+        process = MagicMock(pid=43210, returncode=0)
+        process.communicate.return_value = ("out", "err")
+        cleanup_error = SystemExit(9)
+        cleanup = MagicMock(side_effect=cleanup_error)
+        preserving = MagicMock(return_value=None)
+        popen = MagicMock(return_value=process)
+        monkeypatch.setattr(sched_mod.os, "pipe", capture_pipe)
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", popen)
+        monkeypatch.setattr(sched_mod, "_read_supervisor_start", MagicMock(return_value=(50, 60)))
+        monkeypatch.setattr(sched_mod, "_cleanup_linux_supervisor", cleanup)
+        monkeypatch.setattr(sched_mod, "_cleanup_preserving_exception", preserving)
+
+        with pytest.raises(SystemExit) as caught:
+            sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
+
+        assert caught.value is cleanup_error
+        read_fd, write_fd = actual_fds["pair"]
+        assert popen.call_args.kwargs["pass_fds"] == (write_fd,)
+        preserving.assert_called_once_with(process, (50, 60), read_fd)
+
+    def test_active_exception_cleanup_retries_without_masking(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=43210)
+        cleanup = MagicMock(side_effect=[KeyboardInterrupt(), None])
+        monkeypatch.setattr(sched_mod, "_cleanup_linux_supervisor", cleanup)
+
+        sched_mod._cleanup_preserving_exception(process, (50, 60), 15)
+
+        assert cleanup.call_count == 2
+
+    def test_timeout_with_unverified_cleanup_has_distinct_outward_error(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=43210, returncode=None)
+        timeout = subprocess.TimeoutExpired("script", 1)
+        process.communicate.side_effect = timeout
+        cleanup = sched_mod.CronScriptCleanupError("attestation missing")
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", MagicMock(return_value=process)
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_start",
+            MagicMock(return_value=(50, 60)),
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_cleanup_preserving_exception",
+            MagicMock(return_value=cleanup),
+        )
+
+        with pytest.raises(sched_mod.CronScriptCleanupError) as caught:
+            sched_mod._run_script_process(
+                ["script"], timeout=1, cwd="/", env={}
+            )
+
+        assert caught.value.original_error is timeout
+        assert "TimeoutExpired" in str(caught.value)
+        assert "attestation missing" in str(caught.value)
+
+    @pytest.mark.parametrize(
+        "attestation",
+        [
+            "missing RESULT",
+            "invalid RESULT bytes",
+            "supervisor exited 124 with CLEANUP UNKNOWN",
+        ],
+    )
+    def test_cleanup_unverified_durably_pauses_only_exact_job(
+        self, cron_env, monkeypatch, attestation
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job
+
+        script = cron_env / "scripts" / "pause.py"
+        script.write_text("print('never')\n")
+        job = create_job(prompt="one", schedule="every 5m", script="pause.py")
+        other = create_job(prompt="two", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError(
+            f"TimeoutExpired after 1s; cleanup: {attestation}"
+        )
+        monkeypatch.setattr(sched_mod, "_run_job_script", MagicMock(side_effect=cleanup))
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        try:
+            ok, error = sched_mod._run_scheduled_job_script(job, "pause.py")
+            paused = get_job(job["id"])
+            unchanged = get_job(other["id"])
+            assert ok is False
+            assert "cleanup unverified" in error
+            assert paused["enabled"] is False
+            assert paused["state"] == "paused"
+            assert paused["paused_reason"] == paused["last_error"] == error
+            assert "TimeoutExpired" in error and attestation in error
+            assert unchanged["enabled"] is True
+            assert unchanged["state"] == "scheduled"
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_pause_persistence_failure_blocks_next_in_process_spawn(
+        self, monkeypatch
+    ):
+        from cron import jobs as jobs_mod
+        from cron import scheduler as sched_mod
+
+        job = {"id": "cleanup-uncertain", "enabled": True, "state": "scheduled"}
+        cleanup = sched_mod.CronScriptCleanupError("missing cleanup attestation")
+        monkeypatch.setattr(
+            jobs_mod, "update_job", MagicMock(side_effect=OSError("disk unavailable"))
+        )
+        claim = MagicMock()
+        monkeypatch.setattr(sched_mod, "claim_dispatch", claim)
+        try:
+            with pytest.raises(
+                sched_mod.CronScriptCleanupError, match="CRITICAL"
+            ) as caught:
+                sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+            assert job["enabled"] is False
+            assert job["state"] == "paused"
+            assert "disk unavailable" in str(caught.value)
+            assert sched_mod.run_one_job(job) is False
+            claim.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    @pytest.mark.parametrize(
+        ("schedule", "repeat"),
+        [
+            ("every 5m", None),
+            ("every 5m", 3),
+            ((datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(), 1),
+        ],
+        ids=["recurring", "finite-repeat", "one-shot"],
+    )
+    def test_cleanup_quarantine_preserves_paused_row_across_finalization(
+        self, cron_env, monkeypatch, schedule, repeat
+    ):
+        from cron import jobs as jobs_mod
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job
+
+        job = create_job(
+            prompt="run",
+            schedule=schedule,
+            repeat=repeat,
+            script="owned.py",
+        )
+        paused_postimage = {}
+
+        def fail_with_cleanup(target, *, defer_agent_teardown=None):
+            cleanup = sched_mod.CronScriptCleanupError(
+                "TimeoutExpired; cleanup: missing RESULT"
+            )
+            reason = sched_mod._pause_job_for_unverified_script_cleanup(
+                target, cleanup
+            )
+            paused_postimage.update(get_job(target["id"]))
+            return False, reason, "", reason
+
+        mark = MagicMock()
+        monkeypatch.setattr(sched_mod, "run_job", fail_with_cleanup)
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        monkeypatch.setattr(sched_mod, "mark_job_run", mark)
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        try:
+            assert sched_mod.run_one_job(job) is False
+            assert get_job(job["id"]) == paused_postimage
+            assert paused_postimage["enabled"] is False
+            assert paused_postimage["state"] == "paused"
+            assert paused_postimage["last_error"] == paused_postimage["paused_reason"]
+            mark.assert_not_called()
+            jobs_mod.mark_job_run(job["id"], True)
+            assert get_job(job["id"]) == paused_postimage
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_builtin_tick_accepts_exact_durable_resume(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job, resume_job
+
+        job = create_job(prompt="run", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation missing")
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+        resumed = resume_job(job["id"])
+        assert resumed["state"] == "scheduled"
+
+        monkeypatch.setattr(sched_mod, "get_due_jobs", MagicMock(return_value=[job]))
+        monkeypatch.setattr(sched_mod, "advance_next_run", MagicMock(return_value=True))
+        monkeypatch.setattr(
+            sched_mod,
+            "_get_lock_paths",
+            MagicMock(return_value=(cron_env / "cron", cron_env / "cron" / "tick.lock")),
+        )
+        monkeypatch.setattr(
+            sched_mod, "run_job", MagicMock(return_value=(True, "out", "done", None))
+        )
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        try:
+            assert sched_mod.tick(verbose=False, sync=True) == 1
+            assert get_job(job["id"])["last_status"] == "ok"
+            with sched_mod._running_lock:
+                assert job["id"] not in sched_mod._cleanup_unverified_jobs
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_provider_fire_accepts_exact_durable_trigger(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job, trigger_job
+        from cron.scheduler_provider import InProcessCronScheduler
+
+        job = create_job(prompt="run", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation invalid")
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+        assert trigger_job(job["id"])["state"] == "scheduled"
+        monkeypatch.setattr(
+            sched_mod, "run_job", MagicMock(return_value=(True, "out", "done", None))
+        )
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        try:
+            assert InProcessCronScheduler().fire_due(job["id"]) is True
+            assert get_job(job["id"])["last_status"] == "ok"
+            with sched_mod._running_lock:
+                assert job["id"] not in sched_mod._cleanup_unverified_jobs
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_manual_fire_accepts_resume_and_returns_current_result(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job, resume_job
+        from tools.cronjob_tools import _execute_job_now
+
+        job = create_job(prompt="run", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation missing")
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+        resume_job(job["id"])
+        monkeypatch.setattr(
+            sched_mod, "run_job", MagicMock(return_value=(True, "out", "done", None))
+        )
+        monkeypatch.setattr(sched_mod, "save_job_output", MagicMock(return_value="out"))
+        monkeypatch.setattr(sched_mod, "_deliver_result", MagicMock(return_value=None))
+        try:
+            result = _execute_job_now(job)
+            assert result == {"claimed": True, "success": True, "error": None}
+            assert get_job(job["id"])["last_status"] == "ok"
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_pause_persistence_failure_is_actionable_for_manual_and_provider(
+        self, cron_env, monkeypatch
+    ):
+        from cron import jobs as jobs_mod
+        from cron import scheduler as sched_mod
+        from cron.scheduler_provider import InProcessCronScheduler
+        from tools.cronjob_tools import _execute_job_now
+
+        job = jobs_mod.create_job(prompt="run", schedule="every 5m")
+        original_update = jobs_mod.update_job
+        monkeypatch.setattr(
+            jobs_mod, "update_job", MagicMock(side_effect=OSError("disk unavailable"))
+        )
+        cleanup = sched_mod.CronScriptCleanupError("cleanup attestation missing")
+        try:
+            with pytest.raises(sched_mod.CronScriptCleanupError, match="CRITICAL"):
+                sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+            monkeypatch.setattr(jobs_mod, "update_job", original_update)
+            spawn = MagicMock()
+            monkeypatch.setattr(sched_mod, "claim_dispatch", spawn)
+
+            manual = _execute_job_now(job)
+            assert manual["claimed"] is True
+            assert manual["success"] is False
+            assert "cleanup attestation missing" in manual["error"]
+            assert "durable pause failed: disk unavailable" in manual["error"]
+            assert InProcessCronScheduler().fire_due(job["id"]) is False
+            spawn.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_verified_cleanup_timeout_does_not_pause(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        pause = MagicMock()
+        monkeypatch.setattr(
+            sched_mod,
+            "_run_job_script",
+            MagicMock(return_value=(False, "Script timed out after 1s")),
+        )
+        monkeypatch.setattr(sched_mod, "_pause_job_for_unverified_script_cleanup", pause)
+
+        assert sched_mod._run_scheduled_job_script(
+            {"id": "ordinary-timeout"}, "slow.py"
+        ) == (False, "Script timed out after 1s")
+        pause.assert_not_called()
+
+    def test_next_tick_filters_cleanup_unverified_job_before_advance_or_spawn(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        job = {
+            "id": "quarantined-next-tick",
+            "enabled": True,
+            "state": "scheduled",
+        }
+        advance = MagicMock()
+        run = MagicMock()
+        monkeypatch.setattr(sched_mod, "get_due_jobs", MagicMock(return_value=[job]))
+        monkeypatch.setattr(sched_mod, "advance_next_run", advance)
+        monkeypatch.setattr(sched_mod, "run_one_job", run)
+        monkeypatch.setattr(
+            sched_mod,
+            "_get_lock_paths",
+            MagicMock(return_value=(cron_env / "cron", cron_env / "cron" / "tick.lock")),
+        )
+        try:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs[job["id"]] = {
+                    "reason": "cleanup uncertain",
+                    "pause_persisted": False,
+                }
+            assert sched_mod.tick(verbose=False) == 0
+            advance.assert_not_called()
+            run.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_agent_script_path_pauses_before_agent_spawn(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job
+
+        script = cron_env / "scripts" / "agent_gate.py"
+        script.write_text("print('never')\n")
+        job = create_job(
+            prompt="report", schedule="every 5m", script="agent_gate.py"
+        )
+        agent = MagicMock()
+        monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=agent))
+        monkeypatch.setattr(
+            sched_mod,
+            "_run_job_script",
+            MagicMock(side_effect=sched_mod.CronScriptCleanupError(
+                "TimeoutExpired; cleanup: invalid RESULT"
+            )),
+        )
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        try:
+            success, doc, final, error = sched_mod.run_job(job)
+            stored = get_job(job["id"])
+            assert success is False
+            assert final == ""
+            assert "cleanup unverified" in doc
+            assert error == stored["last_error"] == stored["paused_reason"]
+            assert stored["enabled"] is False and stored["state"] == "paused"
+            agent.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_jobs.pop(job["id"], None)
+
+    def test_all_job_aware_script_callers_use_pause_wrapper(self):
+        import inspect
+        from cron import scheduler as sched_mod
+
+        assert inspect.getsource(sched_mod.run_job).count(
+            "_run_scheduled_job_script(job, script_path)"
+        ) == 2
+        assert inspect.getsource(sched_mod._build_job_prompt).count(
+            "_run_scheduled_job_script(job, script_path)"
+        ) == 1
+
+    def test_invalid_protocol_kills_birth_matched_target_before_owner(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        events = []
+        process = MagicMock(pid=40)
+        process.poll.return_value = None
+        process.terminate.side_effect = lambda: events.append("owner-term-request")
+        process.wait.side_effect = [subprocess.TimeoutExpired("supervisor", 2), None]
+        process.kill.side_effect = lambda: events.append("owner-kill")
+        monkeypatch.setattr(
+            sched_mod, "_linux_process_probe", MagicMock(side_effect=["LIVE", "LIVE", "GONE"])
+        )
+        monkeypatch.setattr(sched_mod.os, "getpgid", MagicMock(return_value=50))
+        monkeypatch.setattr(sched_mod.os, "killpg", MagicMock(
+            side_effect=lambda *_args: events.append("target-group-kill")
+        ))
+        monkeypatch.setattr(sched_mod, "_read_supervisor_status", MagicMock(return_value=b""))
+
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="supervisor result"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
+
+        assert events == ["owner-term-request", "target-group-kill", "owner-kill"]
+
+    def test_fallback_rejects_reused_target_identity(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("supervisor", 2), None]
+        monkeypatch.setattr(sched_mod, "_linux_process_probe", MagicMock(return_value="GONE"))
+        monkeypatch.setattr(sched_mod, "_read_supervisor_status", MagicMock(return_value=b""))
+        killpg = MagicMock()
+        monkeypatch.setattr(sched_mod.os, "killpg", killpg)
+
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="supervisor result"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
+
+        killpg.assert_not_called()
+        process.kill.assert_called_once()
+
+    def test_supervisor_exit_124_cleanup_failure_is_not_accepted(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40, returncode=124)
+        process.poll.return_value = 124
+        process.wait.return_value = 124
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_status",
+            MagicMock(return_value=b"CLEANUP UNKNOWN\n"),
+        )
+        monkeypatch.setattr(
+            sched_mod, "_linux_process_probe", MagicMock(return_value="GONE")
+        )
+
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="supervisor result"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
+
+    def test_supervisor_complete_cleanup_protocol_is_accepted(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40, returncode=124)
+        process.poll.return_value = 124
+        process.wait.return_value = 124
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_status",
+            MagicMock(return_value=b"CLEANUP COMPLETE\n"),
+        )
+        monkeypatch.setattr(
+            sched_mod, "_linux_process_probe", MagicMock(return_value="GONE")
+        )
+
+        assert sched_mod._cleanup_linux_supervisor(process, (50, 60), 15) == (
+            b"CLEANUP COMPLETE\n"
+        )
+
+    def test_result_protocol_cannot_override_live_target(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40, returncode=0)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_status",
+            MagicMock(return_value=b"RESULT 0\n"),
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_linux_process_probe",
+            MagicMock(side_effect=["LIVE", "LIVE", "LIVE", "GONE"]),
+        )
+        monkeypatch.setattr(sched_mod.os, "getpgid", MagicMock(return_value=50))
+        killpg = MagicMock()
+        monkeypatch.setattr(sched_mod.os, "killpg", killpg)
+
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="remained live"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
+
+        killpg.assert_called_once_with(50, signal.SIGKILL)
+
+    def test_owner_local_census_error_is_unknown(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        monkeypatch.setattr(
+            supervisor,
+            "_task_children",
+            MagicMock(return_value=(supervisor.Probe.UNKNOWN, set())),
+        )
+
+        state, identities = supervisor._owned_census()
+        assert state is supervisor.Probe.UNKNOWN
+        assert identities == []
+
+    def test_child_stat_error_is_unknown_not_empty(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        root = os.getpid()
+        monkeypatch.setattr(
+            supervisor,
+            "_task_children",
+            MagicMock(return_value=(supervisor.Probe.PRESENT, {43210})),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_read_identity",
+            MagicMock(return_value=(supervisor.Probe.UNKNOWN, None)),
+        )
+
+        state, identities = supervisor._owned_census()
+        assert root != 43210
+        assert state is supervisor.Probe.UNKNOWN
+        assert identities == []
+
+    def test_signal_error_yields_unknown_cleanup(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        identity = supervisor.ProcessIdentity(51, 100, os.getpid(), "S")
+        monkeypatch.setattr(supervisor, "_CLEANUP_SECONDS", 0.03)
+        monkeypatch.setattr(
+            supervisor,
+            "_owned_census",
+            MagicMock(return_value=(supervisor.Probe.PRESENT, [identity])),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_signal_identity",
+            MagicMock(return_value=supervisor.Probe.UNKNOWN),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_reap_direct",
+            MagicMock(return_value=supervisor.Probe.PRESENT),
+        )
+
+        assert supervisor._cleanup(MagicMock(pid=50)) is supervisor.Cleanup.UNKNOWN
+
+    def test_reused_pid_is_never_signaled(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        observed = supervisor.ProcessIdentity(51, 100, os.getpid(), "S")
+        reused = supervisor.ProcessIdentity(51, 101, os.getpid(), "S")
+        monkeypatch.setattr(
+            supervisor,
+            "_read_identity",
+            MagicMock(return_value=(supervisor.Probe.PRESENT, reused)),
+        )
+        kill = MagicMock()
+        monkeypatch.setattr(supervisor.os, "kill", kill)
+
+        assert supervisor._signal_identity(observed, signal.SIGKILL) is supervisor.Probe.GONE
+        kill.assert_not_called()
+
+    def test_supervisor_stops_tree_before_killing_for_fork_race(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        events = []
+
+        parent = supervisor.ProcessIdentity(51, 100, os.getpid(), "S")
+        late_child = supervisor.ProcessIdentity(52, 101, 51, "S")
+        monkeypatch.setattr(supervisor, "_owned_census", MagicMock(side_effect=[
+            (supervisor.Probe.PRESENT, [parent]),
+            (supervisor.Probe.PRESENT, [parent, late_child]),
+            (supervisor.Probe.PRESENT, []),
+            (supervisor.Probe.PRESENT, []),
+        ]))
+        monkeypatch.setattr(
+            supervisor,
+            "_signal_identity",
+            MagicMock(side_effect=lambda ident, sig: (
+                events.append((ident.pid, sig)) or supervisor.Probe.PRESENT
+            )),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_reap_direct",
+            MagicMock(return_value=supervisor.Probe.PRESENT),
+        )
+        target = MagicMock(pid=50)
+
+        assert supervisor._cleanup(target) is supervisor.Cleanup.COMPLETE
+        assert events == [
+            (51, signal.SIGSTOP),
+            (52, signal.SIGKILL),
+            (51, signal.SIGKILL),
+        ]
+
+    def test_normal_path_contains_no_host_wide_process_polling(self):
+        import inspect
+        from cron import scheduler as sched_mod
+        from cron import script_supervisor as supervisor
+
+        source = inspect.getsource(sched_mod._run_script_process)
+        source += inspect.getsource(sched_mod._cleanup_linux_supervisor)
+        source += inspect.getsource(sched_mod._kill_known_target_group)
+        source += inspect.getsource(sched_mod._linux_process_probe)
+        source += inspect.getsource(supervisor)
+        assert "process_iter" not in source
+        assert "psutil" not in source
+        assert "_ScriptProcessTracker" not in inspect.getsource(sched_mod)
+        assert "/proc/self/task" in source
+        assert 'f"/proc/{pid}/task"' in source
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+    @pytest.mark.live_system_guard_bypass
+    def test_real_supervisor_crash_after_start_rejects_and_kills_live_target(
+        self, cron_env, monkeypatch
+    ):
+        """Missing RESULT after helper death cannot accept a still-live target."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        target_path = cron_env / "scripts" / "crashed_owner_target.identity"
+        script = cron_env / "scripts" / "crash_owner.py"
+        script.write_text(textwrap.dedent(f"""\
+            import os
+            import pathlib
+            import signal
+            import time
+
+            stat = pathlib.Path(f"/proc/{{os.getpid()}}/stat").read_text()
+            birth = stat.rsplit(")", 1)[1].split()[19]
+            pathlib.Path({str(target_path)!r}).write_text(f"{{os.getpid()}}:{{birth}}")
+            os.kill(os.getppid(), signal.SIGKILL)
+            time.sleep(30)
+        """))
+
+        identity = None
+        try:
+            with pytest.raises(sched_mod.CronScriptCleanupError) as caught:
+                _run_job_script(str(script))
+            assert "TimeoutExpired" in str(caught.value)
+            assert "supervisor result was missing" in str(caught.value)
+            identity = self._read_identity(target_path)
+            self._assert_identity_exits(identity)
+        finally:
+            identity = identity or self._read_identity_if_present(target_path)
+            if identity is not None:
+                self._kill_identity_if_live(identity)
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""

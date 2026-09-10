@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -40,7 +41,6 @@ from typing import Any, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
@@ -238,7 +238,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
+from cron.jobs import SCRIPT_CLEANUP_PAUSE_PREFIX, get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch, heartbeat_run_claim
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -298,6 +298,11 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+# Process-local fail-closed guard used only when a script cleanup could not be
+# proven.  The durable paused job remains authoritative when persistence
+# succeeds.  When it fails, this minimal record preserves the critical reason
+# and prevents another spawn in this process until durable remediation/restart.
+_cleanup_unverified_jobs: dict[str, dict[str, object]] = {}
 
 
 def _record_running_marker(job_id: str, running: bool) -> None:
@@ -2004,6 +2009,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
+_SCRIPT_PROCESS_CLEANUP_SECONDS = 3.0
+_SCRIPT_SUPERVISOR_START_SECONDS = 5.0
 
 
 def _get_script_timeout() -> int:
@@ -2037,6 +2044,308 @@ def _get_script_timeout() -> int:
         logger.debug("Failed to load cron script timeout from config: %s", exc)
 
     return _DEFAULT_SCRIPT_TIMEOUT
+
+
+def _close_script_pipes(process: subprocess.Popen) -> None:
+    """Best-effort close scheduler-owned pipes without waiting for EOF."""
+    for stream in (process.stdout, process.stderr):
+        if stream is None:
+            continue
+        try:
+            stream.close()
+        except BaseException:
+            pass
+
+
+def _linux_process_probe(pid: int, expected_birth: int) -> str:
+    """Return LIVE, GONE, or UNKNOWN for one exact Linux birth identity."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+    except (FileNotFoundError, ProcessLookupError):
+        return "GONE"
+    except (PermissionError, OSError):
+        return "UNKNOWN"
+    try:
+        fields = stat.rsplit(")", 1)[1].split()
+        birth = int(fields[19])
+        state = fields[0]
+    except (ValueError, IndexError):
+        return "UNKNOWN"
+    if birth != expected_birth or state == "Z":
+        return "GONE"
+    return "LIVE"
+
+
+def _read_supervisor_start(fd: int, timeout: float) -> tuple[int, int]:
+    """Read the supervisor's exact target PID/birth handshake boundedly."""
+    import select
+
+    deadline = time.monotonic() + timeout
+    data = bytearray()
+    while b"\n" not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise subprocess.TimeoutExpired(
+                cmd="cron script supervisor start",
+                timeout=timeout,
+            )
+        # Read exactly one line without consuming a fast script's RESULT line.
+        chunk = os.read(fd, 1)
+        if not chunk:
+            raise RuntimeError("cron script supervisor closed its start handshake")
+        data.extend(chunk)
+        if len(data) > 128:
+            raise RuntimeError("cron script supervisor sent an oversized handshake")
+    if not re.fullmatch(rb"START [1-9]\d* [1-9]\d*\n", data):
+        raise RuntimeError("cron script supervisor sent an invalid start handshake")
+    _, pid, birth = data.decode("ascii").strip().split()
+    return int(pid), int(birth)
+
+
+class CronScriptCleanupError(RuntimeError):
+    """The Linux supervisor could not prove complete descendant cleanup."""
+
+    def __init__(self, message: str, *, original_error: BaseException | None = None):
+        super().__init__(message)
+        self.original_error = original_error
+
+
+def _read_supervisor_status(fd: int, deadline: float) -> bytes:
+    """Read the size- and time-bounded supervisor protocol stream."""
+    import select
+
+    data = bytearray()
+    while len(data) <= 128:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            return bytes(data)
+        chunk = os.read(fd, 129 - len(data))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _kill_known_target_group(
+    target_identity: Optional[tuple[int, int]], deadline: float
+) -> bool:
+    """Best-effort group assist guarded by exact target birth identity."""
+    if target_identity is None:
+        return False
+    target_pid, target_birth = target_identity
+    state = _linux_process_probe(target_pid, target_birth)
+    if state == "GONE":
+        return True
+    if state != "LIVE":
+        return False
+    try:
+        if os.getpgid(target_pid) != target_pid:
+            return False
+    except (ProcessLookupError, FileNotFoundError):
+        return True
+    except (PermissionError, OSError):
+        return False
+    # Revalidate immediately before the numeric process-group operation.
+    state = _linux_process_probe(target_pid, target_birth)
+    if state != "LIVE":
+        return state == "GONE"
+    try:
+        os.killpg(target_pid, signal.SIGKILL)  # windows-footgun: ok — Linux-only admission
+    except (ProcessLookupError, FileNotFoundError):
+        return True
+    except (PermissionError, OSError):
+        return False
+    while time.monotonic() < deadline:
+        state = _linux_process_probe(target_pid, target_birth)
+        if state == "GONE":
+            return True
+        if state == "UNKNOWN":
+            return False
+        time.sleep(0.01)
+    return False
+
+
+def _cleanup_linux_supervisor(
+    process: subprocess.Popen,
+    target_identity: Optional[tuple[int, int]],
+    result_fd: int,
+) -> bytes:
+    """Require a complete helper protocol; assist target before owner kill."""
+    _close_script_pipes(process)
+    deadline = time.monotonic() + _SCRIPT_PROCESS_CLEANUP_SECONDS
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except (ProcessLookupError, OSError):
+            pass
+    exited = False
+    try:
+        process.wait(timeout=min(2.0, max(0.0, deadline - time.monotonic())))
+        exited = True
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    status = _read_supervisor_status(result_fd, deadline) if exited else b""
+    valid_result = (
+        process.returncode == 0
+        and re.fullmatch(rb"RESULT -?\d+\n", status) is not None
+    )
+    valid_cleanup = process.returncode == 124 and status == b"CLEANUP COMPLETE\n"
+    if valid_result or valid_cleanup:
+        if target_identity is not None:
+            target_state = _linux_process_probe(*target_identity)
+            if target_state == "GONE":
+                return status
+        # A success protocol cannot override a live or unknowable target.
+        _kill_known_target_group(target_identity, deadline)
+        raise CronScriptCleanupError(
+            "Cron script cleanup failed: supervisor reported completion while "
+            "the target remained live or unknown"
+        )
+
+    # A crashed/nonconforming helper cannot attest to escaped adopted
+    # descendants.  Still kill and wait its known target group before failing
+    # closed; a missing/invalid protocol can never produce an accepted result.
+    target_gone = _kill_known_target_group(target_identity, deadline)
+
+    # If the owner did not exit, kill it only after its known target group.
+    if not exited and process.poll() is None:
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    if not target_gone:
+        raise CronScriptCleanupError(
+            "Cron script cleanup failed: target liveness is unknown or live"
+        )
+    raise CronScriptCleanupError(
+        "Cron script cleanup failed: supervisor result was missing, invalid, "
+        "or incomplete"
+    )
+
+
+def _cleanup_preserving_exception(
+    process: subprocess.Popen,
+    target_identity: Optional[tuple[int, int]],
+    result_fd: int,
+) -> CronScriptCleanupError | None:
+    """Return cleanup uncertainty without losing an active exception."""
+    last_error: BaseException | None = None
+    for attempt in range(2):
+        try:
+            _cleanup_linux_supervisor(process, target_identity, result_fd)
+            return None
+        except CronScriptCleanupError as exc:
+            try:
+                logger.exception("Cron script supervisor cleanup was not proven complete")
+            except BaseException:
+                pass
+            return exc
+        except BaseException as exc:
+            last_error = exc
+            if attempt == 0:
+                try:
+                    logger.exception("Cron script supervisor cleanup failed; retrying")
+                except BaseException:
+                    pass
+    return CronScriptCleanupError(
+        f"Cron script cleanup failed while handling another exception: {last_error}",
+        original_error=last_error,
+    )
+
+
+def _run_script_process(
+    argv: list[str],
+    *,
+    timeout: int,
+    cwd: str,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess:
+    """Run a script under the Linux subreaper containment contract."""
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "Cron script process-tree containment requires Linux; "
+            f"refusing to spawn on {sys.platform}"
+        )
+
+    result_fd, result_write_fd = os.pipe()
+    supervisor = Path(__file__).with_name("script_supervisor.py")
+    process_argv = [
+        sys.executable,
+        str(supervisor),
+        str(result_write_fd),
+        "--",
+        *argv,
+    ]
+    try:
+        process = subprocess.Popen(
+            process_argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+            env=env,
+            start_new_session=True,
+            pass_fds=(result_write_fd,),
+        )
+    except BaseException:
+        for fd in (result_fd, result_write_fd):
+            try:
+                os.close(fd)
+            except BaseException:
+                pass
+        raise
+
+    target_identity: Optional[tuple[int, int]] = None
+    started = time.monotonic()
+    try:
+        # This close is deliberately inside the post-Popen protected region:
+        # OSError, KeyboardInterrupt, and SystemExit all trigger tree cleanup.
+        os.close(result_write_fd)
+        result_write_fd = -1
+        target_identity = _read_supervisor_start(
+            result_fd,
+            min(float(timeout), _SCRIPT_SUPERVISOR_START_SECONDS),
+        )
+        remaining = max(0.001, float(timeout) - (time.monotonic() - started))
+        stdout, stderr = process.communicate(timeout=remaining)
+
+        # Even normal success crosses the same cleanup boundary.  A new
+        # BaseException here is cleaned again below, then propagated.
+        status = _cleanup_linux_supervisor(process, target_identity, result_fd)
+        returncode = int(status.decode("ascii").split()[1])
+        os.close(result_fd)
+        result_fd = -1
+        return subprocess.CompletedProcess(
+            argv,
+            returncode,
+            stdout=stdout,
+            stderr=stderr,
+        )
+    except BaseException as active_error:
+        cleanup_error = None
+        if not isinstance(active_error, CronScriptCleanupError):
+            cleanup_error = _cleanup_preserving_exception(
+                process, target_identity, result_fd
+            )
+        for fd in (result_fd, result_write_fd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except BaseException:
+                    pass
+        if cleanup_error is not None:
+            raise CronScriptCleanupError(
+                "Cron script cleanup was not verified after "
+                f"{type(active_error).__name__}: {active_error}; "
+                f"cleanup: {cleanup_error}",
+                original_error=active_error,
+            ) from active_error
+        raise
 
 
 def _run_job_script(script_path: str) -> tuple[bool, str]:
@@ -2124,15 +2433,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-        result = subprocess.run(
+        result = _run_script_process(
             argv,
-            capture_output=True,
-            text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
             env=_sanitize_subprocess_env(os.environ.copy()),
-            **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -2159,8 +2464,156 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {script_timeout}s: {path}"
+    except CronScriptCleanupError:
+        raise
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+
+
+def _pause_job_for_unverified_script_cleanup(
+    job: dict, cleanup_error: CronScriptCleanupError
+) -> str:
+    """Disable one exact job in memory and durably pause it in the job store."""
+    job_id = str(job["id"])
+    reason = (
+        f"{SCRIPT_CLEANUP_PAUSE_PREFIX} job paused before recurrence. "
+        f"{cleanup_error}"
+    )
+    updates = {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": _hermes_now().isoformat(),
+        "paused_reason": reason,
+        "last_error": reason,
+    }
+    with _running_lock:
+        _cleanup_unverified_jobs[job_id] = {
+            "reason": reason,
+            "pause_persisted": False,
+        }
+    job.update(updates)
+    try:
+        from cron.jobs import update_job
+
+        updated = update_job(job_id, updates)
+        if updated is None:
+            raise RuntimeError("job was not found in the durable cron store")
+        with _running_lock:
+            record = _cleanup_unverified_jobs.get(job_id)
+            if record is not None:
+                record["pause_persisted"] = True
+        _notify_provider_jobs_changed()
+    except Exception as persist_error:
+        critical = CronScriptCleanupError(
+            f"{reason}; CRITICAL: durable pause failed: {persist_error}",
+            original_error=cleanup_error,
+        )
+        critical_reason = str(critical)
+        job["paused_reason"] = critical_reason
+        job["last_error"] = critical_reason
+        with _running_lock:
+            record = _cleanup_unverified_jobs.get(job_id)
+            if record is not None:
+                record["reason"] = critical_reason
+        raise critical from persist_error
+    return reason
+
+
+def _cleanup_quarantine_reason(job: dict) -> Optional[str]:
+    """Return a quarantine refusal, or consume an intentional durable resume.
+
+    A successfully persisted pause can be cleared only after the exact durable
+    job has been explicitly resumed/triggered.  A failed pause persistence is
+    never cleared in-process: the operator must durably remediate and restart.
+    """
+    job_id = str(job["id"])
+    with _running_lock:
+        record = _cleanup_unverified_jobs.get(job_id)
+        if record is None:
+            return None
+        reason = str(record["reason"])
+        pause_persisted = bool(record["pause_persisted"])
+
+    if not pause_persisted:
+        return reason
+
+    try:
+        from cron.jobs import get_job
+
+        durable = get_job(job_id)
+    except Exception:
+        durable = None
+    intentionally_resumed = bool(
+        durable
+        and durable.get("enabled") is True
+        and durable.get("state") == "scheduled"
+        and durable.get("paused_at") is None
+        and durable.get("paused_reason") is None
+    )
+    if not intentionally_resumed:
+        return reason
+
+    with _running_lock:
+        current = _cleanup_unverified_jobs.get(job_id)
+        if current != record:
+            return str(current["reason"]) if current is not None else None
+        _cleanup_unverified_jobs.pop(job_id, None)
+    job.clear()
+    job.update(durable)
+    return None
+
+
+def _clear_cleanup_fire_claim(job_id: str) -> None:
+    """Best-effort release of only the transient manual/provider fire claim."""
+    try:
+        from cron.jobs import get_job, update_job
+
+        current = get_job(job_id)
+        if current is None or current.get("fire_claim") is None:
+            return
+        update_job(job_id, {"fire_claim": None})
+    except Exception as exc:
+        logger.critical(
+            "Job '%s': failed to clear transient fire claim after cleanup "
+            "quarantine: %s",
+            job_id,
+            exc,
+        )
+
+
+def get_job_firing_result(job_id: str, processed: bool) -> tuple[bool, Optional[str]]:
+    """Return the shared manual/provider firing result without stale reloads."""
+    with _running_lock:
+        record = _cleanup_unverified_jobs.get(str(job_id))
+        if record is not None:
+            return False, str(record["reason"])
+    try:
+        from cron.jobs import get_job
+
+        refreshed = get_job(job_id) or {}
+    except Exception as exc:
+        return False, f"Failed to read cron firing result: {exc}"
+    return bool(processed and refreshed.get("last_status") == "ok"), refreshed.get("last_error")
+
+
+def _run_scheduled_job_script(job: dict, script_path: str) -> tuple[bool, str]:
+    """Run one job-owned script, pausing recurrence on unverified cleanup."""
+    job_id = job.get("id")
+    if job_id is not None:
+        quarantine_reason = _cleanup_quarantine_reason(job)
+        if quarantine_reason is not None:
+            return False, quarantine_reason
+    try:
+        return _run_job_script(script_path)
+    except CronScriptCleanupError as cleanup_error:
+        if job_id is None:
+            raise CronScriptCleanupError(
+                "Cron script cleanup was not verified and the caller supplied "
+                "no job id to pause",
+                original_error=cleanup_error,
+            ) from cleanup_error
+        reason = _pause_job_for_unverified_script_cleanup(job, cleanup_error)
+        return False, reason
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -2216,7 +2669,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_scheduled_job_script(job, script_path)
         script_output = _scan_raw_injected_cron_data(str(script_output or ""), job)
         if success:
             if script_output:
@@ -2594,7 +3047,7 @@ def run_job(
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_scheduled_job_script(job, script_path)
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2683,8 +3136,20 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_scheduled_job_script(job, script_path)
         _ran_ok, _script_output = prerun_script
+        with _running_lock:
+            cleanup_unverified = str(job_id) in _cleanup_unverified_jobs
+        if cleanup_unverified:
+            now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+            failed_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {now_iso}\n"
+                "**Status:** paused — script cleanup unverified\n\n"
+                f"{_script_output}\n"
+            )
+            return False, failed_doc, "", _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3479,6 +3944,15 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    quarantine_reason = _cleanup_quarantine_reason(job)
+    if quarantine_reason is not None:
+        logger.critical(
+            "Job '%s' refused: %s",
+            job["id"],
+            quarantine_reason,
+        )
+        _clear_cleanup_fire_claim(str(job["id"]))
+        return False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3633,13 +4107,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                 # backstop, not a hard dependency).
                 logger.warning("SYS-666 completeness gate check error: %s", _e)
 
+        with _running_lock:
+            cleanup_quarantined = str(job["id"]) in _cleanup_unverified_jobs
+        if cleanup_quarantined:
+            # The pause helper already persisted the exact authoritative
+            # paused row and cleanup reason.  Do not let mark_job_run clear the
+            # error, re-arm recurrence, complete/delete a one-shot, or advance
+            # a finite repeat.  Only release a transient manual/provider claim.
+            _clear_cleanup_fire_claim(str(job["id"]))
+            return False
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
+        with _running_lock:
+            cleanup_unverified = str(job["id"]) in _cleanup_unverified_jobs
+        if cleanup_unverified:
+            _clear_cleanup_fire_claim(str(job["id"]))
+        if not cleanup_unverified and not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         return False
 
@@ -3696,6 +4183,10 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
     try:
         due_jobs = get_due_jobs()
+        due_jobs = [
+            job for job in due_jobs
+            if _cleanup_quarantine_reason(job) is None
+        ]
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
