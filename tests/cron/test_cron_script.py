@@ -474,7 +474,7 @@ class TestRunJobScript:
 
         process = MagicMock(pid=43210, returncode=None)
         process.communicate.side_effect = raised
-        cleanup = MagicMock()
+        cleanup = MagicMock(return_value=None)
         monkeypatch.setattr(sched_mod.subprocess, "Popen", MagicMock(return_value=process))
         monkeypatch.setattr(sched_mod, "_read_supervisor_start", MagicMock(return_value=(50, 60)))
         monkeypatch.setattr(sched_mod, "_cleanup_preserving_exception", cleanup)
@@ -497,7 +497,7 @@ class TestRunJobScript:
 
         process = MagicMock(pid=43210, returncode=None)
         real_close = sched_mod.os.close
-        cleanup = MagicMock()
+        cleanup = MagicMock(return_value=None)
 
         def _close(fd):
             if fd == 101:
@@ -522,7 +522,7 @@ class TestRunJobScript:
         process.communicate.return_value = ("out", "err")
         cleanup_error = SystemExit(9)
         cleanup = MagicMock(side_effect=cleanup_error)
-        preserving = MagicMock()
+        preserving = MagicMock(return_value=None)
         monkeypatch.setattr(sched_mod.subprocess, "Popen", MagicMock(return_value=process))
         monkeypatch.setattr(sched_mod, "_read_supervisor_start", MagicMock(return_value=(50, 60)))
         monkeypatch.setattr(sched_mod, "_cleanup_linux_supervisor", cleanup)
@@ -544,6 +544,195 @@ class TestRunJobScript:
         sched_mod._cleanup_preserving_exception(process, (50, 60), 15)
 
         assert cleanup.call_count == 2
+
+    def test_timeout_with_unverified_cleanup_has_distinct_outward_error(
+        self, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=43210, returncode=None)
+        timeout = subprocess.TimeoutExpired("script", 1)
+        process.communicate.side_effect = timeout
+        cleanup = sched_mod.CronScriptCleanupError("attestation missing")
+        monkeypatch.setattr(
+            sched_mod.subprocess, "Popen", MagicMock(return_value=process)
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_start",
+            MagicMock(return_value=(50, 60)),
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_cleanup_preserving_exception",
+            MagicMock(return_value=cleanup),
+        )
+
+        with pytest.raises(sched_mod.CronScriptCleanupError) as caught:
+            sched_mod._run_script_process(
+                ["script"], timeout=1, cwd="/", env={}
+            )
+
+        assert caught.value.original_error is timeout
+        assert "TimeoutExpired" in str(caught.value)
+        assert "attestation missing" in str(caught.value)
+
+    @pytest.mark.parametrize(
+        "attestation",
+        [
+            "missing RESULT",
+            "invalid RESULT bytes",
+            "supervisor exited 124 with CLEANUP UNKNOWN",
+        ],
+    )
+    def test_cleanup_unverified_durably_pauses_only_exact_job(
+        self, cron_env, monkeypatch, attestation
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job
+
+        script = cron_env / "scripts" / "pause.py"
+        script.write_text("print('never')\n")
+        job = create_job(prompt="one", schedule="every 5m", script="pause.py")
+        other = create_job(prompt="two", schedule="every 5m")
+        cleanup = sched_mod.CronScriptCleanupError(
+            f"TimeoutExpired after 1s; cleanup: {attestation}"
+        )
+        monkeypatch.setattr(sched_mod, "_run_job_script", MagicMock(side_effect=cleanup))
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        try:
+            ok, error = sched_mod._run_scheduled_job_script(job, "pause.py")
+            paused = get_job(job["id"])
+            unchanged = get_job(other["id"])
+            assert ok is False
+            assert "cleanup unverified" in error
+            assert paused["enabled"] is False
+            assert paused["state"] == "paused"
+            assert paused["paused_reason"] == paused["last_error"] == error
+            assert "TimeoutExpired" in error and attestation in error
+            assert unchanged["enabled"] is True
+            assert unchanged["state"] == "scheduled"
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+
+    def test_pause_persistence_failure_blocks_next_in_process_spawn(
+        self, monkeypatch
+    ):
+        from cron import jobs as jobs_mod
+        from cron import scheduler as sched_mod
+
+        job = {"id": "cleanup-uncertain", "enabled": True, "state": "scheduled"}
+        cleanup = sched_mod.CronScriptCleanupError("missing cleanup attestation")
+        monkeypatch.setattr(
+            jobs_mod, "update_job", MagicMock(side_effect=OSError("disk unavailable"))
+        )
+        claim = MagicMock()
+        monkeypatch.setattr(sched_mod, "claim_dispatch", claim)
+        try:
+            with pytest.raises(
+                sched_mod.CronScriptCleanupError, match="CRITICAL"
+            ) as caught:
+                sched_mod._pause_job_for_unverified_script_cleanup(job, cleanup)
+            assert job["enabled"] is False
+            assert job["state"] == "paused"
+            assert "disk unavailable" in str(caught.value)
+            assert sched_mod.run_one_job(job) is False
+            claim.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+
+    def test_verified_cleanup_timeout_does_not_pause(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        pause = MagicMock()
+        monkeypatch.setattr(
+            sched_mod,
+            "_run_job_script",
+            MagicMock(return_value=(False, "Script timed out after 1s")),
+        )
+        monkeypatch.setattr(sched_mod, "_pause_job_for_unverified_script_cleanup", pause)
+
+        assert sched_mod._run_scheduled_job_script(
+            {"id": "ordinary-timeout"}, "slow.py"
+        ) == (False, "Script timed out after 1s")
+        pause.assert_not_called()
+
+    def test_next_tick_filters_cleanup_unverified_job_before_advance_or_spawn(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+
+        job = {
+            "id": "quarantined-next-tick",
+            "enabled": True,
+            "state": "scheduled",
+        }
+        advance = MagicMock()
+        run = MagicMock()
+        monkeypatch.setattr(sched_mod, "get_due_jobs", MagicMock(return_value=[job]))
+        monkeypatch.setattr(sched_mod, "advance_next_run", advance)
+        monkeypatch.setattr(sched_mod, "run_one_job", run)
+        monkeypatch.setattr(
+            sched_mod,
+            "_get_lock_paths",
+            MagicMock(return_value=(cron_env / "cron", cron_env / "cron" / "tick.lock")),
+        )
+        try:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_job_ids.add(job["id"])
+            assert sched_mod.tick(verbose=False) == 0
+            advance.assert_not_called()
+            run.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+
+    def test_agent_script_path_pauses_before_agent_spawn(
+        self, cron_env, monkeypatch
+    ):
+        from cron import scheduler as sched_mod
+        from cron.jobs import create_job, get_job
+
+        script = cron_env / "scripts" / "agent_gate.py"
+        script.write_text("print('never')\n")
+        job = create_job(
+            prompt="report", schedule="every 5m", script="agent_gate.py"
+        )
+        agent = MagicMock()
+        monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=agent))
+        monkeypatch.setattr(
+            sched_mod,
+            "_run_job_script",
+            MagicMock(side_effect=sched_mod.CronScriptCleanupError(
+                "TimeoutExpired; cleanup: invalid RESULT"
+            )),
+        )
+        monkeypatch.setattr(sched_mod, "_notify_provider_jobs_changed", MagicMock())
+        try:
+            success, doc, final, error = sched_mod.run_job(job)
+            stored = get_job(job["id"])
+            assert success is False
+            assert final == ""
+            assert "cleanup unverified" in doc
+            assert error == stored["last_error"] == stored["paused_reason"]
+            assert stored["enabled"] is False and stored["state"] == "paused"
+            agent.assert_not_called()
+        finally:
+            with sched_mod._running_lock:
+                sched_mod._cleanup_unverified_job_ids.discard(job["id"])
+
+    def test_all_job_aware_script_callers_use_pause_wrapper(self):
+        import inspect
+        from cron import scheduler as sched_mod
+
+        assert inspect.getsource(sched_mod.run_job).count(
+            "_run_scheduled_job_script(job, script_path)"
+        ) == 2
+        assert inspect.getsource(sched_mod._build_job_prompt).count(
+            "_run_scheduled_job_script(job, script_path)"
+        ) == 1
 
     def test_invalid_protocol_kills_birth_matched_target_before_owner(self, monkeypatch):
         from cron import scheduler as sched_mod
@@ -796,9 +985,10 @@ class TestRunJobScript:
 
         identity = None
         try:
-            success, output = _run_job_script(str(script))
-            assert success is False
-            assert "timed out" in output.lower()
+            with pytest.raises(sched_mod.CronScriptCleanupError) as caught:
+                _run_job_script(str(script))
+            assert "TimeoutExpired" in str(caught.value)
+            assert "supervisor result was missing" in str(caught.value)
             identity = self._read_identity(target_path)
             self._assert_identity_exits(identity)
         finally:

@@ -298,6 +298,10 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+# Process-local fail-closed guard used only when a script cleanup could not be
+# proven.  Durable pause is authoritative; this set prevents another spawn in
+# this process even if persisting that pause fails.
+_cleanup_unverified_job_ids: set[str] = set()
 
 
 def _record_running_marker(job_id: str, running: bool) -> None:
@@ -2100,6 +2104,10 @@ def _read_supervisor_start(fd: int, timeout: float) -> tuple[int, int]:
 class CronScriptCleanupError(RuntimeError):
     """The Linux supervisor could not prove complete descendant cleanup."""
 
+    def __init__(self, message: str, *, original_error: BaseException | None = None):
+        super().__init__(message)
+        self.original_error = original_error
+
 
 def _read_supervisor_status(fd: int, deadline: float) -> bytes:
     """Read the size- and time-bounded supervisor protocol stream."""
@@ -2223,24 +2231,30 @@ def _cleanup_preserving_exception(
     process: subprocess.Popen,
     target_identity: Optional[tuple[int, int]],
     result_fd: int,
-) -> None:
-    """Cleanup without masking the exception already being propagated."""
+) -> CronScriptCleanupError | None:
+    """Return cleanup uncertainty without losing an active exception."""
+    last_error: BaseException | None = None
     for attempt in range(2):
         try:
             _cleanup_linux_supervisor(process, target_identity, result_fd)
-            return
-        except CronScriptCleanupError:
+            return None
+        except CronScriptCleanupError as exc:
             try:
                 logger.exception("Cron script supervisor cleanup was not proven complete")
             except BaseException:
                 pass
-            return
-        except BaseException:
+            return exc
+        except BaseException as exc:
+            last_error = exc
             if attempt == 0:
                 try:
                     logger.exception("Cron script supervisor cleanup failed; retrying")
                 except BaseException:
                     pass
+    return CronScriptCleanupError(
+        f"Cron script cleanup failed while handling another exception: {last_error}",
+        original_error=last_error,
+    )
 
 
 def _run_script_process(
@@ -2311,14 +2325,25 @@ def _run_script_process(
             stdout=stdout,
             stderr=stderr,
         )
-    except BaseException:
-        _cleanup_preserving_exception(process, target_identity, result_fd)
+    except BaseException as active_error:
+        cleanup_error = None
+        if not isinstance(active_error, CronScriptCleanupError):
+            cleanup_error = _cleanup_preserving_exception(
+                process, target_identity, result_fd
+            )
         for fd in (result_fd, result_write_fd):
             if fd >= 0:
                 try:
                     os.close(fd)
                 except BaseException:
                     pass
+        if cleanup_error is not None:
+            raise CronScriptCleanupError(
+                "Cron script cleanup was not verified after "
+                f"{type(active_error).__name__}: {active_error}; "
+                f"cleanup: {cleanup_error}",
+                original_error=active_error,
+            ) from active_error
         raise
 
 
@@ -2438,8 +2463,70 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
 
     except subprocess.TimeoutExpired:
         return False, f"Script timed out after {script_timeout}s: {path}"
+    except CronScriptCleanupError:
+        raise
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+
+
+def _pause_job_for_unverified_script_cleanup(
+    job: dict, cleanup_error: CronScriptCleanupError
+) -> str:
+    """Disable one exact job in memory and durably pause it in the job store."""
+    job_id = str(job["id"])
+    reason = (
+        "Cron script cleanup unverified; job paused before recurrence. "
+        f"{cleanup_error}"
+    )
+    updates = {
+        "enabled": False,
+        "state": "paused",
+        "paused_at": _hermes_now().isoformat(),
+        "paused_reason": reason,
+        "last_error": reason,
+    }
+    with _running_lock:
+        _cleanup_unverified_job_ids.add(job_id)
+    job.update(updates)
+    try:
+        from cron.jobs import update_job
+
+        updated = update_job(job_id, updates)
+        if updated is None:
+            raise RuntimeError("job was not found in the durable cron store")
+        _notify_provider_jobs_changed()
+    except Exception as persist_error:
+        raise CronScriptCleanupError(
+            f"{reason}; CRITICAL: durable pause failed: {persist_error}",
+            original_error=cleanup_error,
+        ) from persist_error
+    return reason
+
+
+def _run_scheduled_job_script(job: dict, script_path: str) -> tuple[bool, str]:
+    """Run one job-owned script, pausing recurrence on unverified cleanup."""
+    job_id = job.get("id")
+    with _running_lock:
+        cleanup_unverified = (
+            job_id is not None
+            and str(job_id) in _cleanup_unverified_job_ids
+        )
+    if cleanup_unverified:
+        return False, str(
+            job.get("last_error")
+            or "Cron script cleanup remains unverified; job is paused"
+        )
+    try:
+        return _run_job_script(script_path)
+    except CronScriptCleanupError as cleanup_error:
+        if job_id is None:
+            raise CronScriptCleanupError(
+                "Cron script cleanup was not verified and the caller supplied "
+                "no job id to pause",
+                original_error=cleanup_error,
+            ) from cleanup_error
+        reason = _pause_job_for_unverified_script_cleanup(job, cleanup_error)
+        return False, reason
 
 
 def _parse_wake_gate(script_output: str) -> bool:
@@ -2495,7 +2582,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_scheduled_job_script(job, script_path)
         script_output = _scan_raw_injected_cron_data(str(script_output or ""), job)
         if success:
             if script_output:
@@ -2873,7 +2960,7 @@ def run_job(
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_scheduled_job_script(job, script_path)
         finally:
             if _prior_cwd is not None:
                 try:
@@ -2962,8 +3049,20 @@ def run_job(
     prerun_script = None
     script_path = job.get("script")
     if script_path:
-        prerun_script = _run_job_script(script_path)
+        prerun_script = _run_scheduled_job_script(job, script_path)
         _ran_ok, _script_output = prerun_script
+        with _running_lock:
+            cleanup_unverified = str(job_id) in _cleanup_unverified_job_ids
+        if cleanup_unverified:
+            now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+            failed_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {now_iso}\n"
+                "**Status:** paused — script cleanup unverified\n\n"
+                f"{_script_output}\n"
+            )
+            return False, failed_doc, "", _script_output
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info(
                 "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
@@ -3758,6 +3857,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    with _running_lock:
+        if str(job["id"]) in _cleanup_unverified_job_ids:
+            logger.critical(
+                "Job '%s' refused: prior script cleanup was not verified",
+                job["id"],
+            )
+            return False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3918,7 +4024,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        if not _consume_interrupted_flag(job["id"]):
+        with _running_lock:
+            cleanup_unverified = str(job["id"]) in _cleanup_unverified_job_ids
+        if not cleanup_unverified and not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], False, str(e))
         return False
 
@@ -3975,6 +4083,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
 
     try:
         due_jobs = get_due_jobs()
+        with _running_lock:
+            due_jobs = [
+                job for job in due_jobs
+                if str(job["id"]) not in _cleanup_unverified_job_ids
+            ]
 
         if verbose and not due_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
