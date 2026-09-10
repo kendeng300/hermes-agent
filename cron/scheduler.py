@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -2039,6 +2040,67 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
+def _run_script_process(
+    argv: list[str],
+    *,
+    timeout: int,
+    cwd: str,
+    env: dict[str, str],
+) -> subprocess.CompletedProcess:
+    """Run one cron script, killing its whole Unix process group on timeout.
+
+    ``subprocess.run`` only kills the direct child when its timeout expires.
+    Cron scripts commonly invoke wrappers which spawn longer-lived commands,
+    so on POSIX the script gets a new session/process group and that group is
+    killed before the wrapper is reaped.  Windows keeps the existing
+    ``subprocess.run`` behavior and hidden-window creation flags.
+    """
+    if sys.platform == "win32":
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env=env,
+            creationflags=windows_hide_flags(),
+        )
+
+    process = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            # start_new_session=True makes the child's PID the process-group
+            # ID.  Use that stable value directly: the wrapper may have
+            # exited while a descendant still holds stdout/stderr open.
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            # Defensive fallback for unusual POSIX environments where group
+            # signalling is unavailable.  The ordinary path above is what
+            # guarantees descendant cleanup.
+            process.kill()
+        process.communicate()
+        raise
+
+    return subprocess.CompletedProcess(
+        argv,
+        process.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2124,15 +2186,11 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
-        popen_kwargs = {"creationflags": windows_hide_flags()} if sys.platform == "win32" else {}
-        result = subprocess.run(
+        result = _run_script_process(
             argv,
-            capture_output=True,
-            text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
             env=_sanitize_subprocess_env(os.environ.copy()),
-            **popen_kwargs,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()

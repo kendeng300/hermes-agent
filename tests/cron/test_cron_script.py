@@ -9,8 +9,11 @@ Tests cover:
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import textwrap
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -194,6 +197,77 @@ class TestRunJobScript:
         success, output = _run_job_script(str(script))
         assert success is False
         assert "timed out" in output.lower()
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+    def test_script_timeout_kills_descendant_process(self, cron_env, monkeypatch):
+        """A timed-out wrapper must not leave its long-running child alive."""
+        import psutil
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+
+        child_pid_path = cron_env / "scripts" / "child.pid"
+        child = cron_env / "scripts" / "child.py"
+        child.write_text("import time\ntime.sleep(30)\n")
+        wrapper = cron_env / "scripts" / "wrapper.py"
+        wrapper.write_text(textwrap.dedent(f"""\
+            import pathlib
+            import subprocess
+            import sys
+            import time
+
+            child = subprocess.Popen([sys.executable, {str(child)!r}])
+            pathlib.Path({str(child_pid_path)!r}).write_text(str(child.pid))
+            time.sleep(30)
+        """))
+
+        success, output = _run_job_script(str(wrapper))
+
+        assert success is False
+        assert "timed out" in output.lower()
+        child_pid = int(child_pid_path.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                child_process = psutil.Process(child_pid)
+                if not child_process.is_running() or child_process.status() == psutil.STATUS_ZOMBIE:
+                    break
+            except psutil.NoSuchProcess:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            pytest.fail(f"timed-out script descendant {child_pid} is still running")
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
+    def test_script_timeout_kills_group_before_reaping(self, monkeypatch):
+        """The timeout path targets the isolated group, then drains its pipes."""
+        from unittest.mock import MagicMock
+        from cron import scheduler as sched_mod
+
+        process = MagicMock()
+        process.pid = 43210
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(cmd=["script"], timeout=1),
+            ("", ""),
+        ]
+
+        monkeypatch.setattr(sched_mod.subprocess, "Popen", MagicMock(return_value=process))
+        killpg = MagicMock()
+        monkeypatch.setattr(sched_mod.os, "killpg", killpg)
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            sched_mod._run_script_process(
+                ["script"], timeout=1, cwd="/", env={}
+            )
+
+        assert sched_mod.subprocess.Popen.call_args.kwargs["start_new_session"] is True
+        killpg.assert_called_once_with(process.pid, signal.SIGKILL)
+        assert process.communicate.call_count == 2
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
