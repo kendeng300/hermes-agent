@@ -9,6 +9,7 @@ Tests cover:
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -482,7 +483,7 @@ class TestRunJobScript:
             sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
 
         assert caught.value is raised
-        cleanup.assert_called_once_with(process, (50, 60))
+        cleanup.assert_called_once_with(process, (50, 60), 15)
 
     @pytest.mark.parametrize(
         "close_error",
@@ -512,7 +513,7 @@ class TestRunJobScript:
             sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
 
         assert caught.value is close_error
-        cleanup.assert_called_once_with(process, None)
+        cleanup.assert_called_once_with(process, None, 100)
 
     def test_cleanup_baseexception_after_success_is_propagated(self, monkeypatch):
         from cron import scheduler as sched_mod
@@ -531,7 +532,7 @@ class TestRunJobScript:
             sched_mod._run_script_process(["script"], timeout=1, cwd="/", env={})
 
         assert caught.value is cleanup_error
-        preserving.assert_called_once_with(process, (50, 60))
+        preserving.assert_called_once_with(process, (50, 60), 15)
 
     def test_active_exception_cleanup_retries_without_masking(self, monkeypatch):
         from cron import scheduler as sched_mod
@@ -540,81 +541,217 @@ class TestRunJobScript:
         cleanup = MagicMock(side_effect=[KeyboardInterrupt(), None])
         monkeypatch.setattr(sched_mod, "_cleanup_linux_supervisor", cleanup)
 
-        sched_mod._cleanup_preserving_exception(process, (50, 60))
+        sched_mod._cleanup_preserving_exception(process, (50, 60), 15)
 
         assert cleanup.call_count == 2
 
-    def test_fallback_validates_birth_and_kills_target_group_before_owner(
-        self, monkeypatch
-    ):
+    def test_invalid_protocol_kills_birth_matched_target_before_owner(self, monkeypatch):
         from cron import scheduler as sched_mod
 
         events = []
         process = MagicMock(pid=40)
         process.poll.return_value = None
         process.terminate.side_effect = lambda: events.append("owner-term-request")
-        process.wait.side_effect = [
-            subprocess.TimeoutExpired("supervisor", 2),
-            subprocess.TimeoutExpired("supervisor", 0.5),
-            None,
-        ]
+        process.wait.side_effect = [subprocess.TimeoutExpired("supervisor", 2), None]
         process.kill.side_effect = lambda: events.append("owner-kill")
-        monkeypatch.setattr(sched_mod, "_linux_process_birth", MagicMock(return_value=60))
-        monkeypatch.setattr(sched_mod.os, "getpgid", MagicMock(return_value=50))
         monkeypatch.setattr(
-            sched_mod.os,
-            "killpg",
-            MagicMock(side_effect=lambda *_args: events.append("target-group-kill")),
+            sched_mod, "_linux_process_probe", MagicMock(side_effect=["LIVE", "LIVE", "GONE"])
         )
+        monkeypatch.setattr(sched_mod.os, "getpgid", MagicMock(return_value=50))
+        monkeypatch.setattr(sched_mod.os, "killpg", MagicMock(
+            side_effect=lambda *_args: events.append("target-group-kill")
+        ))
+        monkeypatch.setattr(sched_mod, "_read_supervisor_status", MagicMock(return_value=b""))
 
-        sched_mod._cleanup_linux_supervisor(process, (50, 60))
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="supervisor result"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
 
         assert events == ["owner-term-request", "target-group-kill", "owner-kill"]
 
-    def test_fallback_rejects_stale_target_identity(self, monkeypatch):
+    def test_fallback_rejects_reused_target_identity(self, monkeypatch):
         from cron import scheduler as sched_mod
 
         process = MagicMock(pid=40)
         process.poll.return_value = None
-        process.wait.side_effect = [
-            subprocess.TimeoutExpired("supervisor", 2),
-            subprocess.TimeoutExpired("supervisor", 0.5),
-            None,
-        ]
-        monkeypatch.setattr(sched_mod, "_linux_process_birth", MagicMock(return_value=61))
+        process.wait.side_effect = [subprocess.TimeoutExpired("supervisor", 2), None]
+        monkeypatch.setattr(sched_mod, "_linux_process_probe", MagicMock(return_value="GONE"))
+        monkeypatch.setattr(sched_mod, "_read_supervisor_status", MagicMock(return_value=b""))
         killpg = MagicMock()
         monkeypatch.setattr(sched_mod.os, "killpg", killpg)
 
-        sched_mod._cleanup_linux_supervisor(process, (50, 60))
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="supervisor result"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
 
         killpg.assert_not_called()
         process.kill.assert_called_once()
+
+    def test_supervisor_exit_124_cleanup_failure_is_not_accepted(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40, returncode=124)
+        process.poll.return_value = 124
+        process.wait.return_value = 124
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_status",
+            MagicMock(return_value=b"CLEANUP UNKNOWN\n"),
+        )
+        monkeypatch.setattr(
+            sched_mod, "_linux_process_probe", MagicMock(return_value="GONE")
+        )
+
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="supervisor result"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
+
+    def test_supervisor_complete_cleanup_protocol_is_accepted(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40, returncode=124)
+        process.poll.return_value = 124
+        process.wait.return_value = 124
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_status",
+            MagicMock(return_value=b"CLEANUP COMPLETE\n"),
+        )
+        monkeypatch.setattr(
+            sched_mod, "_linux_process_probe", MagicMock(return_value="GONE")
+        )
+
+        assert sched_mod._cleanup_linux_supervisor(process, (50, 60), 15) == (
+            b"CLEANUP COMPLETE\n"
+        )
+
+    def test_result_protocol_cannot_override_live_target(self, monkeypatch):
+        from cron import scheduler as sched_mod
+
+        process = MagicMock(pid=40, returncode=0)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        monkeypatch.setattr(
+            sched_mod,
+            "_read_supervisor_status",
+            MagicMock(return_value=b"RESULT 0\n"),
+        )
+        monkeypatch.setattr(
+            sched_mod,
+            "_linux_process_probe",
+            MagicMock(side_effect=["LIVE", "LIVE", "LIVE", "GONE"]),
+        )
+        monkeypatch.setattr(sched_mod.os, "getpgid", MagicMock(return_value=50))
+        killpg = MagicMock()
+        monkeypatch.setattr(sched_mod.os, "killpg", killpg)
+
+        with pytest.raises(sched_mod.CronScriptCleanupError, match="remained live"):
+            sched_mod._cleanup_linux_supervisor(process, (50, 60), 15)
+
+        killpg.assert_called_once_with(50, signal.SIGKILL)
+
+    def test_owner_local_census_error_is_unknown(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        monkeypatch.setattr(
+            supervisor,
+            "_task_children",
+            MagicMock(return_value=(supervisor.Probe.UNKNOWN, set())),
+        )
+
+        state, identities = supervisor._owned_census()
+        assert state is supervisor.Probe.UNKNOWN
+        assert identities == []
+
+    def test_child_stat_error_is_unknown_not_empty(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        root = os.getpid()
+        monkeypatch.setattr(
+            supervisor,
+            "_task_children",
+            MagicMock(return_value=(supervisor.Probe.PRESENT, {43210})),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_read_identity",
+            MagicMock(return_value=(supervisor.Probe.UNKNOWN, None)),
+        )
+
+        state, identities = supervisor._owned_census()
+        assert root != 43210
+        assert state is supervisor.Probe.UNKNOWN
+        assert identities == []
+
+    def test_signal_error_yields_unknown_cleanup(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        identity = supervisor.ProcessIdentity(51, 100, os.getpid(), "S")
+        monkeypatch.setattr(supervisor, "_CLEANUP_SECONDS", 0.03)
+        monkeypatch.setattr(
+            supervisor,
+            "_owned_census",
+            MagicMock(return_value=(supervisor.Probe.PRESENT, [identity])),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_signal_identity",
+            MagicMock(return_value=supervisor.Probe.UNKNOWN),
+        )
+        monkeypatch.setattr(
+            supervisor,
+            "_reap_direct",
+            MagicMock(return_value=supervisor.Probe.PRESENT),
+        )
+
+        assert supervisor._cleanup(MagicMock(pid=50)) is supervisor.Cleanup.UNKNOWN
+
+    def test_reused_pid_is_never_signaled(self, monkeypatch):
+        from cron import script_supervisor as supervisor
+
+        observed = supervisor.ProcessIdentity(51, 100, os.getpid(), "S")
+        reused = supervisor.ProcessIdentity(51, 101, os.getpid(), "S")
+        monkeypatch.setattr(
+            supervisor,
+            "_read_identity",
+            MagicMock(return_value=(supervisor.Probe.PRESENT, reused)),
+        )
+        kill = MagicMock()
+        monkeypatch.setattr(supervisor.os, "kill", kill)
+
+        assert supervisor._signal_identity(observed, signal.SIGKILL) is supervisor.Probe.GONE
+        kill.assert_not_called()
 
     def test_supervisor_stops_tree_before_killing_for_fork_race(self, monkeypatch):
         from cron import script_supervisor as supervisor
 
         events = []
 
-        def _child(name):
-            child = MagicMock()
-            child.is_running.return_value = True
-            child.status.return_value = "running"
-            child.suspend.side_effect = lambda: events.append(f"stop-{name}")
-            child.kill.side_effect = lambda: events.append(f"kill-{name}")
-            return child
-
-        parent = _child("parent")
-        late_child = _child("late-child")
+        parent = supervisor.ProcessIdentity(51, 100, os.getpid(), "S")
+        late_child = supervisor.ProcessIdentity(52, 101, 51, "S")
+        monkeypatch.setattr(supervisor, "_owned_census", MagicMock(side_effect=[
+            (supervisor.Probe.PRESENT, [parent]),
+            (supervisor.Probe.PRESENT, [parent, late_child]),
+            (supervisor.Probe.PRESENT, []),
+            (supervisor.Probe.PRESENT, []),
+        ]))
         monkeypatch.setattr(
             supervisor,
-            "_children",
-            MagicMock(side_effect=[[parent], [parent, late_child], [], []]),
+            "_signal_identity",
+            MagicMock(side_effect=lambda ident, sig: (
+                events.append((ident.pid, sig)) or supervisor.Probe.PRESENT
+            )),
         )
-        monkeypatch.setattr(supervisor, "_reap_orphans", MagicMock())
+        monkeypatch.setattr(
+            supervisor,
+            "_reap_direct",
+            MagicMock(return_value=supervisor.Probe.PRESENT),
+        )
         target = MagicMock(pid=50)
 
-        assert supervisor._cleanup(target) is True
-        assert events == ["stop-parent", "kill-late-child", "kill-parent"]
+        assert supervisor._cleanup(target) is supervisor.Cleanup.COMPLETE
+        assert events == [
+            (51, signal.SIGSTOP),
+            (52, signal.SIGKILL),
+            (51, signal.SIGKILL),
+        ]
 
     def test_normal_path_contains_no_host_wide_process_polling(self):
         import inspect
@@ -622,9 +759,52 @@ class TestRunJobScript:
         from cron import script_supervisor as supervisor
 
         source = inspect.getsource(sched_mod._run_script_process)
-        source += inspect.getsource(supervisor.main)
+        source += inspect.getsource(sched_mod._cleanup_linux_supervisor)
+        source += inspect.getsource(sched_mod._kill_known_target_group)
+        source += inspect.getsource(sched_mod._linux_process_probe)
+        source += inspect.getsource(supervisor)
         assert "process_iter" not in source
+        assert "psutil" not in source
         assert "_ScriptProcessTracker" not in inspect.getsource(sched_mod)
+        assert "/proc/self/task" in source
+        assert 'f"/proc/{pid}/task"' in source
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux subreaper")
+    @pytest.mark.live_system_guard_bypass
+    def test_real_supervisor_crash_after_start_rejects_and_kills_live_target(
+        self, cron_env, monkeypatch
+    ):
+        """Missing RESULT after helper death cannot accept a still-live target."""
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+        target_path = cron_env / "scripts" / "crashed_owner_target.identity"
+        script = cron_env / "scripts" / "crash_owner.py"
+        script.write_text(textwrap.dedent(f"""\
+            import os
+            import pathlib
+            import signal
+            import time
+
+            stat = pathlib.Path(f"/proc/{{os.getpid()}}/stat").read_text()
+            birth = stat.rsplit(")", 1)[1].split()[19]
+            pathlib.Path({str(target_path)!r}).write_text(f"{{os.getpid()}}:{{birth}}")
+            os.kill(os.getppid(), signal.SIGKILL)
+            time.sleep(30)
+        """))
+
+        identity = None
+        try:
+            success, output = _run_job_script(str(script))
+            assert success is False
+            assert "timed out" in output.lower()
+            identity = self._read_identity(target_path)
+            self._assert_identity_exits(identity)
+        finally:
+            identity = identity or self._read_identity_if_present(target_path)
+            if identity is not None:
+                self._kill_identity_if_live(identity)
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""

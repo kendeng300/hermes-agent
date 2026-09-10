@@ -2052,13 +2052,23 @@ def _close_script_pipes(process: subprocess.Popen) -> None:
             pass
 
 
-def _linux_process_birth(pid: int) -> Optional[int]:
-    """Return Linux start-time ticks for *pid*, or None if identity is gone."""
+def _linux_process_probe(pid: int, expected_birth: int) -> str:
+    """Return LIVE, GONE, or UNKNOWN for one exact Linux birth identity."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-        return int(stat.rsplit(")", 1)[1].split()[19])
-    except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
-        return None
+    except (FileNotFoundError, ProcessLookupError):
+        return "GONE"
+    except (PermissionError, OSError):
+        return "UNKNOWN"
+    try:
+        fields = stat.rsplit(")", 1)[1].split()
+        birth = int(fields[19])
+        state = fields[0]
+    except (ValueError, IndexError):
+        return "UNKNOWN"
+    if birth != expected_birth or state == "Z":
+        return "GONE"
+    return "LIVE"
 
 
 def _read_supervisor_start(fd: int, timeout: float) -> tuple[int, int]:
@@ -2087,11 +2097,71 @@ def _read_supervisor_start(fd: int, timeout: float) -> tuple[int, int]:
     return int(pid), int(birth)
 
 
+class CronScriptCleanupError(RuntimeError):
+    """The Linux supervisor could not prove complete descendant cleanup."""
+
+
+def _read_supervisor_status(fd: int, deadline: float) -> bytes:
+    """Read the size- and time-bounded supervisor protocol stream."""
+    import select
+
+    data = bytearray()
+    while len(data) <= 128:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            return bytes(data)
+        chunk = os.read(fd, 129 - len(data))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+    return bytes(data)
+
+
+def _kill_known_target_group(
+    target_identity: Optional[tuple[int, int]], deadline: float
+) -> bool:
+    """Best-effort group assist guarded by exact target birth identity."""
+    if target_identity is None:
+        return False
+    target_pid, target_birth = target_identity
+    state = _linux_process_probe(target_pid, target_birth)
+    if state == "GONE":
+        return True
+    if state != "LIVE":
+        return False
+    try:
+        if os.getpgid(target_pid) != target_pid:
+            return False
+    except (ProcessLookupError, FileNotFoundError):
+        return True
+    except (PermissionError, OSError):
+        return False
+    # Revalidate immediately before the numeric process-group operation.
+    state = _linux_process_probe(target_pid, target_birth)
+    if state != "LIVE":
+        return state == "GONE"
+    try:
+        os.killpg(target_pid, signal.SIGKILL)
+    except (ProcessLookupError, FileNotFoundError):
+        return True
+    except (PermissionError, OSError):
+        return False
+    while time.monotonic() < deadline:
+        state = _linux_process_probe(target_pid, target_birth)
+        if state == "GONE":
+            return True
+        if state == "UNKNOWN":
+            return False
+        time.sleep(0.01)
+    return False
+
+
 def _cleanup_linux_supervisor(
     process: subprocess.Popen,
     target_identity: Optional[tuple[int, int]],
-) -> None:
-    """Boundedly request owned cleanup, then assist group-first/root-last."""
+    result_fd: int,
+) -> bytes:
+    """Require a complete helper protocol; assist target before owner kill."""
     _close_script_pipes(process)
     deadline = time.monotonic() + _SCRIPT_PROCESS_CLEANUP_SECONDS
     if process.poll() is None:
@@ -2099,32 +2169,38 @@ def _cleanup_linux_supervisor(
             process.terminate()
         except (ProcessLookupError, OSError):
             pass
+    exited = False
     try:
         process.wait(timeout=min(2.0, max(0.0, deadline - time.monotonic())))
-        return
+        exited = True
     except (subprocess.TimeoutExpired, OSError):
         pass
 
-    # The target is a distinct session leader.  Its unreaped PID and exact
-    # /proc birth value make this process-group assist immune to PID reuse.
-    if target_identity is not None:
-        target_pid, target_birth = target_identity
-        try:
-            if (
-                _linux_process_birth(target_pid) == target_birth
-                and os.getpgid(target_pid) == target_pid
-            ):
-                os.killpg(target_pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
-    try:
-        process.wait(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
-        return
-    except (subprocess.TimeoutExpired, OSError):
-        pass
+    status = _read_supervisor_status(result_fd, deadline) if exited else b""
+    valid_result = (
+        process.returncode == 0
+        and re.fullmatch(rb"RESULT -?\d+\n", status) is not None
+    )
+    valid_cleanup = process.returncode == 124 and status == b"CLEANUP COMPLETE\n"
+    if valid_result or valid_cleanup:
+        if target_identity is not None:
+            target_state = _linux_process_probe(*target_identity)
+            if target_state == "GONE":
+                return status
+        # A success protocol cannot override a live or unknowable target.
+        _kill_known_target_group(target_identity, deadline)
+        raise CronScriptCleanupError(
+            "Cron script cleanup failed: supervisor reported completion while "
+            "the target remained live or unknown"
+        )
 
-    # The supervisor is the containment owner and is always killed last.
-    if process.poll() is None:
+    # A crashed/nonconforming helper cannot attest to escaped adopted
+    # descendants.  Still kill and wait its known target group before failing
+    # closed; a missing/invalid protocol can never produce an accepted result.
+    target_gone = _kill_known_target_group(target_identity, deadline)
+
+    # If the owner did not exit, kill it only after its known target group.
+    if not exited and process.poll() is None:
         try:
             process.kill()
         except (ProcessLookupError, OSError):
@@ -2133,16 +2209,31 @@ def _cleanup_linux_supervisor(
         process.wait(timeout=max(0.0, deadline - time.monotonic()))
     except (subprocess.TimeoutExpired, OSError):
         pass
+    if not target_gone:
+        raise CronScriptCleanupError(
+            "Cron script cleanup failed: target liveness is unknown or live"
+        )
+    raise CronScriptCleanupError(
+        "Cron script cleanup failed: supervisor result was missing, invalid, "
+        "or incomplete"
+    )
 
 
 def _cleanup_preserving_exception(
     process: subprocess.Popen,
     target_identity: Optional[tuple[int, int]],
+    result_fd: int,
 ) -> None:
     """Cleanup without masking the exception already being propagated."""
     for attempt in range(2):
         try:
-            _cleanup_linux_supervisor(process, target_identity)
+            _cleanup_linux_supervisor(process, target_identity, result_fd)
+            return
+        except CronScriptCleanupError:
+            try:
+                logger.exception("Cron script supervisor cleanup was not proven complete")
+            except BaseException:
+                pass
             return
         except BaseException:
             if attempt == 0:
@@ -2210,10 +2301,7 @@ def _run_script_process(
 
         # Even normal success crosses the same cleanup boundary.  A new
         # BaseException here is cleaned again below, then propagated.
-        _cleanup_linux_supervisor(process, target_identity)
-        status = os.read(result_fd, 64)
-        if process.returncode != 0 or not re.fullmatch(rb"RESULT -?\d+\n", status):
-            raise RuntimeError("Cron script supervisor exited without a result")
+        status = _cleanup_linux_supervisor(process, target_identity, result_fd)
         returncode = int(status.decode("ascii").split()[1])
         os.close(result_fd)
         result_fd = -1
@@ -2224,7 +2312,7 @@ def _run_script_process(
             stderr=stderr,
         )
     except BaseException:
-        _cleanup_preserving_exception(process, target_identity)
+        _cleanup_preserving_exception(process, target_identity, result_fd)
         for fd in (result_fd, result_write_fd):
             if fd >= 0:
                 try:
