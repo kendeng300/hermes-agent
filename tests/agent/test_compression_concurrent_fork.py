@@ -238,6 +238,9 @@ def test_compression_restores_user_turn_when_compressor_drops_all_users(tmp_path
 
 def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypatch) -> None:
     """The owning compression call must keep its lease alive while it runs."""
+    clock = [1_000.0]
+    monkeypatch.setattr("hermes_state.time.time", lambda: clock[0])
+
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
     def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
@@ -252,10 +255,32 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
 
     agent_a = _build_agent_with_db(db, parent_sid)
     agent_a._compression_lock_ttl_seconds = 1.0
-    agent_a._compression_lock_refresh_interval = 0.25
+    agent_a._compression_lock_refresh_interval = 0.1
+
+    compress_entered = threading.Event()
+    release_compress = threading.Event()
+    refresh_entered = threading.Event()
+    release_refresh = threading.Event()
+    refresh_finished = threading.Event()
+    worker_errors = []
+
+    real_refresh = SessionDB.refresh_compression_lock
+
+    def _observed_refresh(self, session_id, holder, ttl_seconds=300.0):
+        refresh_entered.set()
+        if not release_refresh.wait(timeout=10):
+            raise AssertionError("test did not release compression-lock refresh")
+        try:
+            return real_refresh(self, session_id, holder, ttl_seconds=ttl_seconds)
+        finally:
+            refresh_finished.set()
+
+    monkeypatch.setattr(SessionDB, "refresh_compression_lock", _observed_refresh)
 
     def _slow_compress(*_a, **_kw):
-        time.sleep(2.0)
+        compress_entered.set()
+        if not release_compress.wait(timeout=10):
+            raise AssertionError("test did not release compression")
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
             {"role": "user", "content": "tail"},
@@ -265,21 +290,36 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
     def run(agent):
-        agent._compress_context(messages, "sys", approx_tokens=120_000)
+        try:
+            agent._compress_context(messages, "sys", approx_tokens=120_000)
+        except BaseException as exc:
+            worker_errors.append(exc)
 
     t_a = threading.Thread(target=run, args=(agent_a,), name="refresh_owner")
     t_a.start()
-    deadline = time.time() + 2.0
-    while db.get_compression_lock_holder(parent_sid) is None and time.time() < deadline:
-        time.sleep(0.05)
-    assert db.get_compression_lock_holder(parent_sid) is not None
-    time.sleep(1.2)
-    assert db.try_acquire_compression_lock(
-        parent_sid, "refresh_probe", ttl_seconds=1.0
-    ) is False, "live owner lease expired and was reclaimable before compression finished"
-    t_a.join(timeout=10)
+    try:
+        assert compress_entered.wait(timeout=10), "compression worker did not start"
+        assert db.get_compression_lock_holder(parent_sid) is not None
+
+        # Hold the first refresh at its DB boundary, move the shared clock
+        # close to the original expiry, then let the real UPDATE extend it.
+        # Advancing beyond the original expiry afterwards proves the refreshed
+        # lease — without racing a scheduler against sleep-based deadlines.
+        assert refresh_entered.wait(timeout=10), "lease refresher did not run"
+        clock[0] = 1_000.75
+        release_refresh.set()
+        assert refresh_finished.wait(timeout=10), "lease refresh did not finish"
+        clock[0] = 1_001.1
+        assert db.try_acquire_compression_lock(
+            parent_sid, "refresh_probe", ttl_seconds=1.0
+        ) is False, "live owner lease expired and was reclaimable before compression finished"
+    finally:
+        release_refresh.set()
+        release_compress.set()
+        t_a.join(timeout=10)
 
     assert not t_a.is_alive()
+    assert worker_errors == []
     assert _count_children(db, parent_sid) == 1
     assert db.get_compression_lock_holder(parent_sid) is None
 

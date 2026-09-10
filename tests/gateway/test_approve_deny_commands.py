@@ -803,9 +803,14 @@ class TestCrossSessionApprovalIsolation:
             "value — #24100 regression"
         )
 
-    def test_approval_prompt_routes_to_originating_session(self):
+    def test_approval_prompt_routes_to_originating_session(self, monkeypatch):
         """A dangerous command in session A's worker thread notifies
         session A's callback, even though os.environ points at session B."""
+        # This is a routing test, not a smart-approval/provider-discovery test.
+        # Keep the worker on the deterministic manual path so unrelated
+        # auxiliary-provider startup cannot consume the observation deadline.
+        monkeypatch.setattr("tools.approval._get_approval_mode", lambda: "manual")
+
         from tools.approval import (
             check_all_command_guards,
             register_gateway_notify,
@@ -816,7 +821,13 @@ class TestCrossSessionApprovalIsolation:
         )
         notified_a = []
         notified_b = []
-        register_gateway_notify("session-A", lambda d: notified_a.append(d))
+        notified = threading.Event()
+
+        def notify_a(data):
+            notified_a.append(data)
+            notified.set()
+
+        register_gateway_notify("session-A", notify_a)
         register_gateway_notify("session-B", lambda d: notified_b.append(d))
 
         # Concurrent session B clobbered the process-global env var last.
@@ -838,13 +849,10 @@ class TestCrossSessionApprovalIsolation:
             finally:
                 reset_current_session_key(token)
 
-        t = threading.Thread(target=worker_a)
+        t = threading.Thread(target=worker_a, daemon=True)
         t.start()
         try:
-            for _ in range(50):
-                if notified_a or notified_b:
-                    break
-                time.sleep(0.05)
+            assert notified.wait(timeout=10), "approval callback was not invoked"
 
             # The prompt must land in session A (the originator), never B.
             assert len(notified_a) == 1, "approval prompt did not route to session A"
@@ -858,8 +866,10 @@ class TestCrossSessionApprovalIsolation:
         finally:
             os.environ.pop("HERMES_GATEWAY_SESSION", None)
             os.environ.pop("HERMES_EXEC_ASK", None)
+            resolve_gateway_approval("session-A", "deny", resolve_all=True)
             unregister_gateway_notify("session-A")
             unregister_gateway_notify("session-B")
+            t.join(timeout=5)
 
     def test_two_concurrent_sessions_route_to_own_queue_contextvar_only(self):
         """Cross-session isolation driven by contextvars ALONE (#24100).
