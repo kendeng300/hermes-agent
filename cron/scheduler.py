@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -40,7 +41,6 @@ from typing import Any, List, Optional
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
@@ -2004,9 +2004,8 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
-_SCRIPT_PROCESS_POLL_SECONDS = 0.02
 _SCRIPT_PROCESS_CLEANUP_SECONDS = 3.0
-_SCRIPT_SUPERVISOR_GRACE_SECONDS = 1.75
+_SCRIPT_SUPERVISOR_START_SECONDS = 5.0
 
 
 def _get_script_timeout() -> int:
@@ -2042,152 +2041,8 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-class _ScriptProcessTracker:
-    """Track one script's descendants by PID plus kernel birth time.
-
-    A descendant can leave the script's POSIX process group with ``setsid`` or
-    ``setpgid``.  Sampling the ancestry while the wrapper is live keeps a
-    stable psutil identity for those processes; a final process-group census
-    catches ordinary descendants even when the wrapper has already exited.
-    """
-
-    def __init__(self):
-        import psutil
-
-        self._psutil = psutil
-        self._process: Optional[subprocess.Popen] = None
-        self._owned: dict[tuple[int, float], Any] = {}
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self, process: subprocess.Popen) -> None:
-        """Start tracking after all failure-prone imports are complete."""
-        self._process = process
-        self._remember_pid(process.pid)
-        self._thread = threading.Thread(
-            target=self._watch,
-            name=f"cron-script-tree-{process.pid}",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def _remember(self, candidate) -> None:
-        try:
-            identity = (candidate.pid, candidate.create_time())
-        except (self._psutil.NoSuchProcess, self._psutil.AccessDenied, OSError):
-            return
-        with self._lock:
-            self._owned.setdefault(identity, candidate)
-
-    def _remember_pid(self, pid: int) -> None:
-        try:
-            self._remember(self._psutil.Process(pid))
-        except (self._psutil.NoSuchProcess, self._psutil.AccessDenied, OSError):
-            pass
-
-    def _identity_matches(self, candidate, identity: tuple[int, float]) -> bool:
-        try:
-            return (
-                candidate.pid == identity[0]
-                and candidate.create_time() == identity[1]
-                and candidate.is_running()
-                and candidate.status() != self._psutil.STATUS_ZOMBIE
-            )
-        except Exception:
-            return False
-
-    def _capture_descendants(self) -> None:
-        with self._lock:
-            roots = list(self._owned.items())
-        for identity, parent in roots:
-            if not self._identity_matches(parent, identity):
-                continue
-            try:
-                children = parent.children(recursive=True)
-            except (self._psutil.NoSuchProcess, self._psutil.AccessDenied, OSError):
-                continue
-            for child in children:
-                self._remember(child)
-
-    def _capture_posix_group(self) -> None:
-        process = self._process
-        if sys.platform == "win32" or process is None:
-            return
-        # A group ID is safe to use as an ownership boundary only while its
-        # Popen leader is unreaped.  After communicate() has reaped a normally
-        # completed leader, its PID may be reused by an unrelated process.
-        if process.returncode is not None:
-            return
-        root = next(
-            (item for item in self.identities() if item[0][0] == process.pid),
-            None,
-        )
-        if root is None:
-            return
-        try:
-            if root[1].create_time() != root[0][1]:
-                return
-        except Exception:
-            return
-        try:
-            candidates = self._psutil.process_iter(["pid", "create_time"])
-        except Exception:
-            return
-        for candidate in candidates:
-            try:
-                if os.getpgid(candidate.pid) == process.pid:
-                    self._remember(candidate)
-            except (
-                ProcessLookupError,
-                PermissionError,
-                self._psutil.NoSuchProcess,
-                self._psutil.AccessDenied,
-                OSError,
-            ):
-                continue
-
-    def _watch(self) -> None:
-        while not self._stop.wait(_SCRIPT_PROCESS_POLL_SECONDS):
-            self._capture_descendants()
-
-    def capture(self) -> None:
-        try:
-            self._capture_descendants()
-            self._capture_posix_group()
-        except Exception:
-            logger.warning("Could not enumerate cron script descendants", exc_info=True)
-
-    def identities(self) -> list[tuple[tuple[int, float], Any]]:
-        with self._lock:
-            return list(self._owned.items())
-
-    def finish(self) -> list[tuple[tuple[int, float], Any]]:
-        self.capture()
-        self._stop.set()
-        if self._thread is not None and self._thread.ident is not None:
-            self._thread.join(timeout=0.5)
-        self.capture()
-        return self.identities()
-
-
-def _script_process_is_ours(candidate, identity: tuple[int, float]) -> bool:
-    """Return whether *candidate* still has the captured kernel identity."""
-    try:
-        import psutil
-
-        return (
-            candidate.pid == identity[0]
-            and candidate.create_time() == identity[1]
-            and candidate.is_running()
-            and candidate.status() != psutil.STATUS_ZOMBIE
-        )
-    except Exception:
-        return False
-
-
 def _close_script_pipes(process: subprocess.Popen) -> None:
-    """Close scheduler-owned pipe ends without waiting for descendant EOF."""
+    """Best-effort close scheduler-owned pipes without waiting for EOF."""
     for stream in (process.stdout, process.stderr):
         if stream is None:
             continue
@@ -2197,135 +2052,104 @@ def _close_script_pipes(process: subprocess.Popen) -> None:
             pass
 
 
-def _cleanup_script_process(
-    process: subprocess.Popen,
-    tracker: _ScriptProcessTracker,
-) -> bool:
-    """Boundedly hard-kill and reap the identities owned by one script run."""
-    import psutil
+def _linux_process_birth(pid: int) -> Optional[int]:
+    """Return Linux start-time ticks for *pid*, or None if identity is gone."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (FileNotFoundError, PermissionError, OSError, ValueError, IndexError):
+        return None
 
+
+def _read_supervisor_start(fd: int, timeout: float) -> tuple[int, int]:
+    """Read the supervisor's exact target PID/birth handshake boundedly."""
+    import select
+
+    deadline = time.monotonic() + timeout
+    data = bytearray()
+    while b"\n" not in data:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+            raise subprocess.TimeoutExpired(
+                cmd="cron script supervisor start",
+                timeout=timeout,
+            )
+        # Read exactly one line without consuming a fast script's RESULT line.
+        chunk = os.read(fd, 1)
+        if not chunk:
+            raise RuntimeError("cron script supervisor closed its start handshake")
+        data.extend(chunk)
+        if len(data) > 128:
+            raise RuntimeError("cron script supervisor sent an oversized handshake")
+    if not re.fullmatch(rb"START [1-9]\d* [1-9]\d*\n", data):
+        raise RuntimeError("cron script supervisor sent an invalid start handshake")
+    _, pid, birth = data.decode("ascii").strip().split()
+    return int(pid), int(birth)
+
+
+def _cleanup_linux_supervisor(
+    process: subprocess.Popen,
+    target_identity: Optional[tuple[int, int]],
+) -> None:
+    """Boundedly request owned cleanup, then assist group-first/root-last."""
     _close_script_pipes(process)
     deadline = time.monotonic() + _SCRIPT_PROCESS_CLEANUP_SECONDS
-
-    # Stop the direct wrapper first so it cannot create more descendants.
-    # Windows' repo-native tree primitive covers the live ancestry in one
-    # operation.  The stable-identity fixed-point loop below also covers a
-    # captured child that escaped its initial process group/session or whose
-    # wrapper exited before cleanup began.
-    tracker.capture()
-    identities = tracker.identities()
-    root = next((item for item in identities if item[0][0] == process.pid), None)
-    if (
-        sys.platform == "win32"
-        and root is not None
-        and _script_process_is_ours(root[1], root[0])
-    ):
-        def _tree_kill() -> None:
-            try:
-                from gateway.status import terminate_pid
-
-                terminate_pid(process.pid, force=True)
-            except BaseException:
-                logger.warning(
-                    "Could not tree-kill cron script pid %d", process.pid,
-                    exc_info=True,
-                )
-
-        # terminate_pid's native taskkill has its own timeout.  Keep this
-        # cleanup boundary tighter even if taskkill itself stalls.
-        tree_killer = threading.Thread(
-            target=_tree_kill,
-            name=f"cron-script-taskkill-{process.pid}",
-            daemon=True,
-        )
-        tree_killer.start()
-        tree_killer.join(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
-    elif root is not None and _script_process_is_ours(root[1], root[0]):
-        # The POSIX wrapper is the private subreaper helper.  TERM asks it to
-        # kill and reap adopted descendants before it exits.  A short grace
-        # period preserves that containment; the hard fixed-point below is
-        # still the bounded fallback if the helper cannot cooperate.
+    if process.poll() is None:
         try:
-            root[1].terminate()
-        except Exception:
-            logger.warning(
-                "Could not stop cron script supervisor pid %d", process.pid,
-                exc_info=True,
-            )
-        grace_deadline = min(
-            deadline,
-            time.monotonic() + _SCRIPT_SUPERVISOR_GRACE_SECONDS,
-        )
-        while (
-            time.monotonic() < grace_deadline
-            and _script_process_is_ours(root[1], root[0])
-        ):
-            tracker.capture()
-            time.sleep(_SCRIPT_PROCESS_POLL_SECONDS)
-
-    while time.monotonic() < deadline:
-        tracker.capture()
-        identities = tracker.identities()
-        live = [
-            (identity, candidate)
-            for identity, candidate in identities
-            if _script_process_is_ours(candidate, identity)
-        ]
-        if not live:
-            break
-        # Dict insertion order puts the direct wrapper first.  Killing parents
-        # before children closes the fork race; subsequent captures discover
-        # any child created before the signal took effect.
-        for identity, candidate in live:
-            try:
-                candidate.kill()
-            except Exception:
-                logger.warning(
-                    "Could not kill cron script process pid %d", identity[0],
-                    exc_info=True,
-                )
-        time.sleep(_SCRIPT_PROCESS_POLL_SECONDS)
-
-    identities = tracker.finish()
-
+            process.terminate()
+        except (ProcessLookupError, OSError):
+            pass
     try:
-        remaining = max(0.0, deadline - time.monotonic())
-        process.wait(timeout=remaining)
+        process.wait(timeout=min(2.0, max(0.0, deadline - time.monotonic())))
+        return
     except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # The target is a distinct session leader.  Its unreaped PID and exact
+    # /proc birth value make this process-group assist immune to PID reuse.
+    if target_identity is not None:
+        target_pid, target_birth = target_identity
         try:
-            process.kill()
-        except (OSError, ProcessLookupError):
+            if (
+                _linux_process_birth(target_pid) == target_birth
+                and os.getpgid(target_pid) == target_pid
+            ):
+                os.killpg(target_pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
             pass
-        try:
-            process.wait(timeout=0.1)
-        except (subprocess.TimeoutExpired, OSError):
-            pass
-
-    return not any(
-        _script_process_is_ours(candidate, identity)
-        for identity, candidate in identities
-    )
-
-
-def _try_cleanup_script_process(
-    process: subprocess.Popen,
-    tracker: _ScriptProcessTracker,
-) -> bool:
-    """Run cleanup without replacing the exception that triggered it."""
     try:
-        return _cleanup_script_process(process, tracker)
-    except BaseException:
-        logger.exception("Cron script process-tree cleanup failed")
-        _close_script_pipes(process)
+        process.wait(timeout=min(0.5, max(0.0, deadline - time.monotonic())))
+        return
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+    # The supervisor is the containment owner and is always killed last.
+    if process.poll() is None:
         try:
             process.kill()
-        except BaseException:
+        except (ProcessLookupError, OSError):
             pass
+    try:
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+
+
+def _cleanup_preserving_exception(
+    process: subprocess.Popen,
+    target_identity: Optional[tuple[int, int]],
+) -> None:
+    """Cleanup without masking the exception already being propagated."""
+    for attempt in range(2):
         try:
-            process.wait(timeout=0.1)
+            _cleanup_linux_supervisor(process, target_identity)
+            return
         except BaseException:
-            pass
-        return False
+            if attempt == 0:
+                try:
+                    logger.exception("Cron script supervisor cleanup failed; retrying")
+                except BaseException:
+                    pass
 
 
 def _run_script_process(
@@ -2335,32 +2159,22 @@ def _run_script_process(
     cwd: str,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess:
-    """Run one cron script and own every observed descendant to completion."""
-    # Resolve psutil before spawning.  Once Popen succeeds there is always a
-    # tracker available for the finally block, even if watcher startup fails.
-    tracker = _ScriptProcessTracker()
-    result_fd: Optional[int] = None
-    result_write_fd: Optional[int] = None
-    if sys.platform == "win32":
-        process_argv = argv
-        popen_kwargs = {"creationflags": windows_hide_flags()}
-    else:
-        # The ordinary helper process is a Linux child subreaper.  This closes
-        # the ancestry gap left by process groups when a descendant calls
-        # setsid()/setpgid() or double-forks before its wrapper exits.
-        result_fd, result_write_fd = os.pipe()
-        supervisor = Path(__file__).with_name("script_supervisor.py")
-        process_argv = [
-            sys.executable,
-            str(supervisor),
-            str(result_write_fd),
-            "--",
-            *argv,
-        ]
-        popen_kwargs = {
-            "start_new_session": True,
-            "pass_fds": (result_write_fd,),
-        }
+    """Run a script under the Linux subreaper containment contract."""
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "Cron script process-tree containment requires Linux; "
+            f"refusing to spawn on {sys.platform}"
+        )
+
+    result_fd, result_write_fd = os.pipe()
+    supervisor = Path(__file__).with_name("script_supervisor.py")
+    process_argv = [
+        sys.executable,
+        str(supervisor),
+        str(result_write_fd),
+        "--",
+        *argv,
+    ]
     try:
         process = subprocess.Popen(
             process_argv,
@@ -2369,49 +2183,55 @@ def _run_script_process(
             text=True,
             cwd=cwd,
             env=env,
-            **popen_kwargs,
+            start_new_session=True,
+            pass_fds=(result_write_fd,),
         )
     except BaseException:
         for fd in (result_fd, result_write_fd):
-            if fd is not None:
+            try:
                 os.close(fd)
+            except BaseException:
+                pass
         raise
-    if result_write_fd is not None:
-        os.close(result_write_fd)
 
-    cleanup_done = False
+    target_identity: Optional[tuple[int, int]] = None
+    started = time.monotonic()
     try:
-        tracker.start(process)
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except BaseException:
-            _try_cleanup_script_process(process, tracker)
-            cleanup_done = True
-            raise
+        # This close is deliberately inside the post-Popen protected region:
+        # OSError, KeyboardInterrupt, and SystemExit all trigger tree cleanup.
+        os.close(result_write_fd)
+        result_write_fd = -1
+        target_identity = _read_supervisor_start(
+            result_fd,
+            min(float(timeout), _SCRIPT_SUPERVISOR_START_SECONDS),
+        )
+        remaining = max(0.001, float(timeout) - (time.monotonic() - started))
+        stdout, stderr = process.communicate(timeout=remaining)
 
-        if not _try_cleanup_script_process(process, tracker):
-            cleanup_done = True
-            raise RuntimeError("Cron script process tree did not exit cleanly")
-        cleanup_done = True
-        returncode = process.returncode
-        if result_fd is not None:
-            status = os.read(result_fd, 64)
-            if process.returncode != 0 or not re.fullmatch(rb"-?\d+\n", status):
-                raise RuntimeError("Cron script supervisor exited without a result")
-            returncode = int(status)
+        # Even normal success crosses the same cleanup boundary.  A new
+        # BaseException here is cleaned again below, then propagated.
+        _cleanup_linux_supervisor(process, target_identity)
+        status = os.read(result_fd, 64)
+        if process.returncode != 0 or not re.fullmatch(rb"RESULT -?\d+\n", status):
+            raise RuntimeError("Cron script supervisor exited without a result")
+        returncode = int(status.decode("ascii").split()[1])
+        os.close(result_fd)
+        result_fd = -1
         return subprocess.CompletedProcess(
             argv,
             returncode,
             stdout=stdout,
             stderr=stderr,
         )
-    finally:
-        # Every BaseException path after Popen is covered here.  Cleanup never
-        # performs an unbounded communicate().
-        if not cleanup_done:
-            _try_cleanup_script_process(process, tracker)
-        if result_fd is not None:
-            os.close(result_fd)
+    except BaseException:
+        _cleanup_preserving_exception(process, target_identity)
+        for fd in (result_fd, result_write_fd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except BaseException:
+                    pass
+        raise
 
 
 def _run_job_script(script_path: str) -> tuple[bool, str]:
