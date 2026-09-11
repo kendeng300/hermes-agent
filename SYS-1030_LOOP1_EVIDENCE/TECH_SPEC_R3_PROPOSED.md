@@ -2,6 +2,8 @@
 Status: proposed Loop-1 correction; implementation and tests NOT RUN
 Issue: MarketWatch #1030, prerequisite for SYS-1029
 Baseline source reviewed: Hermes `82e0a91352e3f1ac8f3a8fce2beee66d2339a2cc`
+MarketWatch source reviewed: `origin/master` at
+`2c37e4b0c261c911323d2caaeed4741ae73f2884`
 This replaces rejected R2 and authorizes no product-job execution or live mutation.
 ## 1. Quality goals and boundary
 ### CTQ-1 — claim before submit
@@ -44,11 +46,37 @@ remains failure through output, delivery, finalization, command, and exit.
 | `hermes_cli/cron.py::cron_command` | Produces action status but callers discard it. | Return the canary command status. |
 | `hermes_cli/main.py::cmd_cron`, `main` | Discard the nested return value. | Propagate it to process exit. |
 | `gateway/status.py::capture_running_build_identity`, `get_running_build_identity` | No callable currently exposes the identity of the loaded scheduler build. | Capture once in memory at gateway start and expose through existing detailed health; write no state file. |
-| MarketWatch `enforcement/calibration_cron_watchdog.py` | Directly rewrites stale claim status and successor. | Keep its existing scan/report surface but remove every jobs-file mutation; it becomes read-only alerting. |
-Only one tracked MarketWatch watchdog copy exists. There is no tracked
-`scripts/enforcement/calibration_cron_watchdog.py`; this ticket shall not create
-one or claim a parity obligation that source does not contain.
+| `agent/curator_backup.py::_restore_cron_skill_links` | Parses backup outside the lock, then fresh-loads and merges `skill`/`skills` under `_jobs_lock`. | Retain the field-only merge but publish through the sole conservation owner and fail closed when the strict lock is unavailable. |
+| `hermes_cli/backup.py::{run_import,restore_quick_snapshot,restore_cron_jobs_if_emptied}` | The import writes archive members with `open(...,"wb")`; both restore paths can `copy2` a stale whole `cron/jobs.json` without the jobs lock. | Route every jobs member through the exact locked replace-or-refuse contract in §3.1; no raw live-file copy remains. |
+| MarketWatch `utilities/market_holiday_manager.py` and `scripts/utilities/market_holiday_manager.py` | Both byte-identical tracked copies load before locking, lock `jobs.lock` rather than `.jobs.lock`, use a shared `jobs.tmp`, and replace the whole document. | Remove direct storage writes; invoke `cron.jobs.pause_job` or `cron.jobs.resume_job` once per selected ID and report any partial refusal truthfully. |
+| MarketWatch `utilities/holiday_watchdog.py` and `scripts/utilities/holiday_watchdog.py` | Both byte-identical tracked copies have the same pre-lock read, wrong lock name, shared temp, and whole-document replace. | Preserve detection and alerting, but remove automatic mutation. |
+| MarketWatch `enforcement/calibration_cron_watchdog.py` | Loads before its save lock; the save locks `.jobs.lock` only when the lock file already exists and otherwise degrades, then replaces the whole document. | Keep its existing scan/report surface but remove every jobs-file mutation; it becomes read-only alerting. |
+| MarketWatch `utilities/_extract_backup.py` and `scripts/utilities/_extract_backup.py` | The generic fallback extractor opens every archive member destination `wb`, including `cron/jobs.json`, with no jobs lock. | Pre-scan normalized members and refuse the entire fallback extraction if it contains `cron/jobs.json`; the normal restore path uses corrected `hermes import`. |
+The root and shipped holiday-manager, holiday-watchdog, and extractor pairs are
+tracked and byte-identical at the pinned MarketWatch ref. Calibration has only
+the tracked `enforcement/calibration_cron_watchdog.py`; there is no tracked
+`scripts/enforcement/calibration_cron_watchdog.py`, and this ticket creates no
+such twin. The byte-identical `restore.sh` and `scripts/restore.sh` are
+transitive callers of the fallback extractor, not independent storage owners.
 ## 3. Existing jobs lock is the sole mutation boundary
+`cron.jobs._commit_jobs_mutation` is the sole live-document conservation and
+publication owner. It adds no lock or store: it acquires the existing
+`cron.jobs._jobs_lock`, fresh-loads the selected profile's `jobs.json`, applies
+one named semantic mutation to that fresh object, validates the ACTIVE rules
+below, writes through `_save_jobs_unlocked`, and fresh-readback compares the
+complete postimage before returning. A refusal or exception before verified
+readback returns failure and does not authorize execution. No other callable
+opens the live jobs file for writing, copies over it, or calls
+`_save_jobs_unlocked`.
+
+Its internal signature is
+`_commit_jobs_mutation(mutator, *, active_authority)`, where `mutator` receives
+only the fresh in-lock job list and returns `(postimage, result)`, and
+`active_authority` is exactly `PRESERVE`, `CLAIM_CREATE`, `CLAIM_FINALIZE`, or
+`OPERATOR_SKIP`. The owner rejects any changed ACTIVE leaf not permitted by
+that authority before save. It returns `result` only after full postimage
+readback; business APIs retain their existing public return types.
+
 `cron.jobs._jobs_lock` remains the only lock. Its outermost acquisition must:
 1. resolve the selected profile's lock/store and acquire the existing RLock;
 2. open and acquire the existing cross-process lock within its existing bound;
@@ -57,9 +85,14 @@ one or claim a parity obligation that source does not contain.
 4. record exact-store nesting ownership and release only at outermost exit.
 A nested call is legal only when its outer scope owns the same store's
 cross-process lock. Cross-store nesting and process-local-to-strict upgrade are
-rejected. `_save_jobs_unlocked` asserts this ownership. `save_jobs` uses the
-same scope and is safely reentrant; it never provides a lock-free public write.
-Every reachable `jobs.json` writer uses this boundary:
+rejected. `_save_jobs_unlocked` asserts this ownership. The compatibility
+signature is `save_jobs(jobs, *, expected_preimage=_MISSING)`. A caller already
+nested in the same-store strict lock may save its in-lock fresh mutation; an
+outermost call must supply the complete document it previously read as
+`expected_preimage`, which is compared type-strictly with the fresh in-lock
+document before replacement. An outermost call without it or an unequal
+preimage refuses. It never provides a lock-free or blind full-document write.
+Every reachable `jobs.json` mutation uses this boundary:
 - `create_job`, `update_job`, `pause_job`, `resume_job`, `trigger_job`, and
   `remove_job`;
 - `mark_job_run`, `claim_dispatch`, `heartbeat_run_claim`,
@@ -68,8 +101,9 @@ Every reachable `jobs.json` writer uses this boundary:
 - `rewrite_skill_refs`;
 - explicit `cron.jobs.repair_jobs_store` formerly hidden inside `load_jobs`;
 - `agent/curator_backup.py::_restore_cron_skill_links`;
-- `hermes_cli/backup.py::restore_cron_jobs_if_emptied`, which must route
-  through a jobs owner rather than `shutil.copy2` over the live file.
+- `hermes_cli/backup.py::{run_import,restore_quick_snapshot,
+  restore_cron_jobs_if_emptied}`, each of which routes a jobs member through
+  `_commit_jobs_mutation` rather than opening or copying over the live file.
 Strict serialization does not authorize claim loss. While a tagged recurring
 or canary claim is `ACTIVE`, only its exact-claim CAS owner may write result,
 repeat, schedule-successor, or claim fields. `remove_job`, `trigger_job`,
@@ -87,7 +121,101 @@ write fallback. Read-only functions may read without acquiring an exclusive
 lock when they make no correctness decision; claim and canary decisions use a
 locked fresh read.
 
-### 3.1 Recurring selection and preserved one-shot preparation
+### 3.0 Source-complete writer and caller fixed point
+
+The fixed point is derived from the two pinned Git trees, not from this
+proposal's former inventory. The three Hermes production files that contain a
+live-store mutation path are exactly:
+
+1. `cron/jobs.py`: `load_jobs`'s implicit repairs, `save_jobs`, `create_job`,
+   `update_job`, `pause_job`, `resume_job`, `trigger_job`, `remove_job`,
+   `mark_job_run`, `claim_dispatch`, `heartbeat_run_claim`, `advance_next_run`,
+   `set_dispatch_claim_status`, `claim_job_for_fire`,
+   `get_due_jobs/_get_due_jobs_locked`, and `rewrite_skill_refs`;
+2. `agent/curator_backup.py::_restore_cron_skill_links`, called by `rollback`;
+3. `hermes_cli/backup.py::{run_import,restore_quick_snapshot,
+   restore_cron_jobs_if_emptied}`.
+
+The seven MarketWatch production files that directly reach a live-file write
+at the pinned ref are exactly:
+
+1. `utilities/market_holiday_manager.py`;
+2. `scripts/utilities/market_holiday_manager.py`;
+3. `utilities/holiday_watchdog.py`;
+4. `scripts/utilities/holiday_watchdog.py`;
+5. `enforcement/calibration_cron_watchdog.py`;
+6. `utilities/_extract_backup.py`;
+7. `scripts/utilities/_extract_backup.py`.
+
+The transitive Hermes caller closure is: `cron/scheduler.py::{tick,
+run_one_job,_pause_job_for_unverified_script_cleanup,
+_clear_cleanup_fire_claim}`; `cron/scheduler_provider.py::CronScheduler.fire_due`;
+Chronos `fire_due/run_claimed`; `tools/cronjob_tools.py`; `hermes_cli/cron.py`;
+`hermes_cli/console_engine.py`; the profile dashboard in
+`hermes_cli/web_server.py`; the jobs REST handlers in
+`gateway/platforms/api_server.py`; `cron/suggestions.py::accept_suggestion`;
+`hermes_cli/blueprint_cmd.py`; `tools/blueprints.py`; the curator review and
+rollback routes; `hermes_cli/main.py` import/update routes;
+`hermes_cli/cli_commands_mixin.py::_handle_snapshot_command`; the dashboard
+import/upload routes; and the public reexports in `cron/__init__.py`. Each is a
+caller of the one conservation owner, never another publication authority.
+
+The transitive MarketWatch caller closure is the `main` and circuit-breaker
+paths in both holiday modules, calibration watchdog `main`, and root/shipped
+`restore.sh`, whose normal branch calls `hermes import` and whose no-Hermes
+fallback calls `_extract_backup.py`. `recovery/restore_crons_from_manifest.py`
+and `scripts/recovery/restore_crons_from_manifest.py` are tracked readers: even
+`--apply` only prints proposed `cronjob(action='create',...)` calls. Hermes
+`cron.jobs._restore_from_cron_state` is also read-only and has no caller at the
+pinned tree. Snapshot creation, curator backup capture, dump/status, MarketWatch
+gates/monitors/watchers, backup orchestrators, and DR archive validation write
+only non-live artifacts or read the store; they remain outside the writer set.
+
+### 3.1 Import and restore are locked replace-or-refuse
+
+`run_import`, quick-snapshot restore, and emptied-store recovery parse and
+validate the complete candidate jobs member before entering the strict
+mutation owner. The candidate must be a wrapper with a list-valued `jobs` or a
+legacy bare list; every element must be an object with one unique nonempty
+string `id`. Under the lock, the owner fresh-loads and validates the complete
+live document. `run_import` and quick-snapshot restore retain their existing
+whole-member overwrite semantics for the jobs list: if the authority checks
+below pass, their postimage is the exact validated candidate jobs list,
+including candidate row order, changed inactive rows, and deletion of inactive
+live-only rows, serialized once through the existing Hermes jobs wrapper and
+`updated_at` format by `_save_jobs_unlocked`.
+Emptied-store recovery retains its current narrow rule: it recomputes both
+counts from the fresh in-lock live document and the validated snapshot, and
+replaces with that exact candidate jobs list only when the snapshot has strictly more
+jobs. Missing, unreadable, malformed, equal-count, or lower-count input is the
+existing no-action result. No count or replacement decision made before lock
+acquisition is reused.
+
+All three paths refuse the entire jobs-member mutation if replacement would
+delete or change any live row carrying an `ACTIVE` tagged recurring/canary
+claim, any current legacy `fire_claim`, `run_claim`, or `dispatch_claim`, or an
+unknown/malformed claim authority. A candidate row containing any such claim
+also refuses unless it is recursively type-strict equal to the corresponding
+live row; backup bytes never manufacture, change, or clear execution
+authority. Duplicate IDs, malformed rows/documents, and unknown top-level
+shapes refuse before save. Thus inactive backup state keeps the source-existing
+replace behavior, while every live execution authority is conserved or the
+whole jobs member is refused.
+
+“Exactly equal” here is recursive type-strict JSON equality: null, bool,
+number, string, array, and object types cannot substitute for one another;
+array order and complete object key membership/value equality are required.
+This comparison does not define a serialization, digest, or new codec.
+
+Only a fully validated replacement postimage is atomically saved and read back.
+There is no pre-lock job-count decision, unguarded snapshot replacement,
+partial member write, or fallback copy. Other backup members retain their existing behavior,
+but a jobs-member refusal makes the command/report nonzero and explicit. The
+MarketWatch no-Hermes extractor cannot invoke this owner, so it pre-scans the
+archive and refuses the whole extraction before writing any member whenever a
+normalized member path is `cron/jobs.json`.
+
+### 3.2 Recurring selection and preserved one-shot preparation
 
 `cron.jobs._get_due_jobs_locked(raw_jobs, now)` remains the coordinator under
 the existing strict jobs lock and delegates to two disjoint internal owners:
@@ -252,9 +380,20 @@ ChronosExecutionEnvelopeV1={
   hermes_home_realpath:absolute string,
   jobs_file_realpath:absolute string
 }
+ChronosFireRequestV1={
+  schema:"cron-chronos-fire-request-v1",
+  job_id:nonempty string, fire_at:aware exact string
+}
+ChronosAuthProfileV1={
+  schema:"cron-chronos-auth-profile-v1", profile:nonempty string,
+  hermes_home_realpath:absolute string, jobs_file_realpath:absolute string,
+  portal_url:nonempty string, expected_audience:nonempty string,
+  nas_jwks_url:nonempty string, callback_url:nonempty string
+}
 ChronosFireTargetV1={
   schema:"cron-chronos-fire-target-v1",
   envelope:ChronosExecutionEnvelopeV1,
+  auth_profile:ChronosAuthProfileV1,
   job_preimage:object,
   scheduler:ChronosCronScheduler
 }
@@ -263,6 +402,16 @@ ChronosClaimResultV1={
          "LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
   job_postimage:object|null, execution_context:ExecutionContextV1|null,
   execution_envelope:ChronosExecutionEnvelopeV1|null,
+  error:string|null
+}
+AuthenticatedChronosFireResultV1={
+  schema:"cron-authenticated-fire-result-v1",
+  status:"CLAIMED"|"INVALID_REQUEST"|"UNAUTHORIZED"|"GONE"|
+         "DUPLICATE"|"ALREADY_ADVANCED"|"CONFLICT"|"CLAIM_REFUSED"|
+         "UNAVAILABLE"|"COMMIT_UNKNOWN",
+  request:ChronosFireRequestV1|null,
+  target:ChronosFireTargetV1|null,
+  claim:ChronosClaimResultV1|null,
   error:string|null
 }
 ```
@@ -278,52 +427,92 @@ has null postimage, context, and envelope, with null error only for `GONE` and
 persisted claim's `owner_profile` must equal the envelope's paths/profile;
 mismatch is `MALFORMED` and cannot execute. No HTTP branch infers a claim or
 envelope from ambient process state or from an exception.
-## 5. Chronos uses its existing wire
+## 5. Chronos uses its existing wire and one authenticated owner
 No NAS change is required. Provision remains the documented current request
 containing `job_id`, `fire_at`, `agent_callback_url`, and `dedup_key`. Callback
-remains authenticated by the current purpose-scoped NAS JWT and body:
+remains authenticated by the current purpose-scoped NAS JWT and exact body:
 ```json
 {"job_id":"<exact id>","fire_at":"<exact armed timestamp>"}
 ```
-Both ingress handlers strict-parse exactly `job_id` and an aware `fire_at`, then
-call the sole shared read-only owner
-`cron.scheduler_provider.resolve_chronos_fire_target(job_id, fire_at)`, which
-returns one exact in-memory `ChronosFireTargetV1` or a closed
-gone/conflict/malformed/store-failure/provider-unavailable classification over
-configured profile stores. The resolver derives `hermes_home_realpath` from the selected profile,
-derives `jobs_file_realpath` as that exact home's `cron/jobs.json`, rejects any
-nonabsolute/noncanonical/symlink-mismatched relation, and first finds rows by
-exact job ID before classifying the occurrence. A row
-matches the occurrence only when either current
-`next_run_at == fire_at` or its tagged recurring claim has exact
-`scheduled_for == fire_at`.
-- No row with that job ID returns 200 `gone` and executes nothing, preserving
-  the existing no-retry behavior for a removed finite job.
-- More than one profile/store row matching the exact `(job_id,fire_at)`
-  occurrence returns 409 and executes nothing. If no occurrence matches but
-  multiple stores contain the job ID, the result is also 409; no arbitrary
-  profile is selected.
-- One due/current match selects that store and lets `claim_due` invoke exactly
-  the recurring or one-shot atomic owner for the matched schedule class.
-- An exact ACTIVE, NOT_SUBMITTED, or OPERATOR_SKIPPED duplicate returns 200
-  without task creation. When one exact job-ID row exists and no exact claim
-  remains, an authenticated callback whose `fire_at` instant is strictly
-  earlier than current `next_run_at` returns 200 `already_advanced`; it is
-  never replayed because either the atomic claim owner or an explicit later
-  schedule mutation already superseded it. Every other occurrence mismatch is
-  409.
-- A refused/malformed/not-due claim returns 409 without task creation.
-- Lock/store failure returns 503 without task creation.
-- Selected-profile Chronos load, availability, binding, or secret-scope failure
-  returns 503 before claim or task creation.
-- Only a committed claim followed by successful task creation returns 202.
-Invalid authentication returns 401; malformed JSON, extra/missing keys, or an
-invalid field returns 400. Every 400/401 branch performs no store search or
-mutation.
-The claim's due check prevents a valid bearer callback from firing a future
-job early. `_find_cron_job_profile(job_id)` is not used for this route.
+Both HTTP adapters pass the exact Authorization value and raw body bytes to one
+synchronous shared owner off their event loops:
+```python
+cron.scheduler_provider.authenticate_and_claim_chronos_fire(
+    authorization: str, body_bytes: bytes,
+) -> AuthenticatedChronosFireResultV1
+```
+Neither adapter loads cron config, resolves a provider, enumerates profiles, or
+opens a jobs store. The owner applies this exact order:
+
+1. Bound and strict-decode one UTF-8 JSON object with exactly `job_id` and
+   `fire_at`. Duplicate/extra/missing keys, wrong types, empty ID,
+   naive/malformed/non-finite time, or trailing bytes are `INVALID_REQUEST`.
+   Retain the aware `fire_at` spelling byte-for-byte. Parse exactly
+   case-sensitive `Bearer <nonempty-token>` with no second credential;
+   otherwise return `UNAUTHORIZED`. These cuts read no config or jobs store.
+2. Enumerate only `hermes_cli.profiles.profiles_to_serve(True)`. Require unique
+   valid profile names and unique canonical real homes. For each profile,
+   install `hermes_constants.set_hermes_home_override(home)`, call existing
+   read-only `hermes_cli.config.read_raw_config()`, and reset that token in a
+   per-profile `finally` before considering the next profile. A profile is
+   auth-eligible only when
+   raw config says `cron.provider == "chronos"` and contains literal nonempty
+   `cron.chronos.{portal_url,expected_audience,nas_jwks_url,callback_url}`.
+   Absent, unreadable, unparseable, defaulted, or malformed config is
+   ineligible; a structurally ambiguous catalog is `UNAVAILABLE`.
+3. Group eligible profiles by exact byte tuple
+   `(expected_audience,nas_jwks_url,portal_url)`. Obtain the unchanged verifier
+   once with `plugins.cron_providers.chronos.verify.get_fire_verifier()`, then
+   call it once per distinct tuple as
+   `verifier(token=token, expected_audience=expected_audience,
+   jwks_or_key=nas_jwks_url, issuer=portal_url)`. Its asymmetric signature,
+   audience, issuer, exp/nbf, and `purpose="cron_fire"` checks remain
+   authority. If no tuple
+   verifies, return `UNAUTHORIZED` before any `cron/jobs.json` open. Invalid
+   credentials therefore trigger zero jobs-store searches, and ambient A auth
+   can never authorize a B store.
+4. Search only profiles belonging to verified tuples. For each profile, enter
+   its exact home override and then `cron.jobs.use_cron_store(home)`, fresh-read
+   that one store without repair, and reset store then home tokens in a
+   per-profile `finally` before searching another profile. Match exact job
+   ID—never name—and exact raw `fire_at`.
+   A row matches only when current `next_run_at == fire_at` or its tagged claim
+   has exact `scheduled_for == fire_at`. A token valid only for A cannot open
+   B's store. Profiles intentionally sharing one auth tuple are jointly
+   eligible, but zero or multiple exact occurrences never select arbitrarily.
+5. For the unique row, retain the exact `ChronosAuthProfileV1` whose tuple
+   verified the token and construct its envelope. Enter its exact home,
+   `agent.secret_scope.set_secret_scope(build_profile_secret_scope(home))`, and
+   cron-store context; fresh-read `cron.provider` and the four raw Chronos
+   config leaves again. Require `cron.provider == "chronos"`, require every
+   leaf's exact type/string value plus profile/home/store to equal the retained
+   auth profile, and otherwise refuse before provider construction or claim.
+   Load one fresh `ChronosCronScheduler`; require
+   availability and no constructed client; bind the envelope and retained auth
+   profile once; then call its `claim_due`. Only a committed/read-back exact
+   recurring or one-shot claim returns `CLAIMED`. Reset every scope in reverse
+   order in `finally`.
+
+The closed projection is `INVALID_REQUEST -> 400`, `UNAUTHORIZED -> 401`,
+`GONE|DUPLICATE|ALREADY_ADVANCED -> 200`, `CONFLICT|CLAIM_REFUSED -> 409`, and
+`UNAVAILABLE|COMMIT_UNKNOWN -> 503`. Only `CLAIMED` has nonnull target and
+claim; only it proceeds to task creation, and only a returned task permits
+202. `INVALID_REQUEST` alone has null request. `CLAIMED`, `GONE`, `DUPLICATE`,
+and `ALREADY_ADVANCED` have null error; every other status has one nonempty
+bounded error. Both adapters render the same single object: no-task success
+`{status,job_id,fire_at}`, refusal `{error}`, or accepted
+`{status:"accepted",job_id,fire_at}`. No response contains token, secret,
+profile path, or verifier diagnostic.
+
+No exact authorized row is `GONE`; multiple eligible exact occurrences are
+`CONFLICT`; an exact terminal duplicate is `DUPLICATE`; a raw `fire_at`
+strictly older than the sole row's successor with no matching claim is
+`ALREADY_ADVANCED`; other occurrence mismatch or claim refusal is
+`CLAIM_REFUSED`. Provider/config/secret/binding/store failure is `UNAVAILABLE`.
+The claim due check prevents early fire. Dashboard `_find_cron_job_profile`
+remains for ordinary CRUD but is unreachable from this route.
 `CronScheduler.claim_due(job_id, *, fire_at) -> ChronosClaimResultV1` requires
-its receiver's one-shot bound envelope, enters that exact home, secret, and
+its receiver's one-time-bound envelope, enters that exact home, secret, and
 cron-store context, and resets all three in `finally`. It retains the target's
 exact envelope and dispatches inside its selected home/store by the matching
 row's existing schedule class. Recurring uses §4 and validates
@@ -359,37 +548,59 @@ envelope, then invokes `_run_one_job_managed` on the exact postimage; that
 managed owner performs the one matching finalizer described in §7. The helper
 does not enter or reset context and never rereads or re-arms.
 
-After the unique row is selected, the resolver installs
-`hermes_constants.set_hermes_home_override(envelope.hermes_home_realpath)`,
-`agent.secret_scope.set_secret_scope(build_profile_secret_scope(envelope.hermes_home_realpath))`,
-and `cron.jobs.use_cron_store(envelope.hermes_home_realpath)` in that order. In
-that scope it calls `plugins.cron_providers.load_cron_scheduler("chronos")`,
-requires an available `ChronosCronScheduler` whose client is not constructed,
-and calls its one-shot private
-`_bind_execution_envelope(envelope) -> ChronosCronScheduler`. Binding stores
-only the immutable envelope in that new in-memory provider instance; a second
-bind or a preconstructed client refuses. The resolver then resets store,
-secret, and home contexts in reverse order and returns that exact instance in
-the target. It never returns or reuses the handler's ambient provider.
+The binding performed in step 5 is the sole provider construction and bind.
+Inside that already-specified home, secret, and store scope, the shared owner
+calls `plugins.cron_providers.load_cron_scheduler("chronos")`, requires an
+available `ChronosCronScheduler` whose client is not constructed, and calls its
+one-shot private
+`_bind_execution_envelope(envelope, auth_profile) -> ChronosCronScheduler`.
+Binding requires the auth profile's profile/home/jobs fields to equal the
+envelope, stores both immutable objects in that new in-memory provider
+instance, and makes that bound instance's `_get_client` and `_callback_url`
+consume only the retained `portal_url` and `callback_url`; it never re-reads an
+ambient profile's Chronos config. The provider still resolves the selected
+profile's current Nous token only through the freshly installed secret scope.
+A second bind, unequal auth profile, or preconstructed client refuses. Step 5
+then resets store, secret, and home contexts in reverse order and returns that
+exact instance and auth profile in the target. It never returns or reuses
+either handler's ambient provider.
 
 `CronScheduler.run_claimed(result: ChronosClaimResultV1, *, adapters,
 loop) -> ManagedRunOutcomeV1` validates the complete envelope and recurring
 context relation and requires its receiver's immutable bound envelope to equal
-the result envelope. It then installs the same existing home override, profile
-secret scope, and cron-store scope used by the resolver, calls the helper, and
-resets store, secret, and home tokens in reverse order in `finally`. A missing
-or mismatched path, profile, bound envelope, postimage, context, secret scope,
-or active-store identity refuses before execution or mutation. No ambient
+the result envelope and its bound auth profile to equal the target retained by
+the shared owner. It then installs the same existing home override, profile
+secret scope, and cron-store scope used by the shared owner, calls the helper,
+and resets store, secret, and home tokens in reverse order in `finally`. A
+missing or mismatched path, profile, bound envelope, auth profile, postimage,
+context, secret scope, or active-store identity refuses before execution or
+mutation. No ambient
 `HERMES_HOME`, cached provider client, default jobs constant, current dashboard
 profile, or caller-selected store participates.
-`fire_due(job_id, *, fire_at, adapters, loop)` resolves a target, then invokes
-`target.scheduler.claim_due` followed by `target.scheduler.run_claimed` for
-synchronous callers. HTTP handlers likewise invoke `claim_due` synchronously
-and create a task for `run_claimed` on that same target scheduler; no task
-double-claims.
+Trusted synchronous `fire_due(job_id, *, fire_at, adapters, loop)` first derives
+the active cron store's canonical home as
+`cron.jobs._current_cron_store().jobs_file.parent.parent.resolve()` and finds exactly one
+`profiles_to_serve(True)` entry with that canonical home; zero or multiple
+matches return false before a claim. In the exact home, freshly built profile
+secret, and store scopes, all reset in reverse order in `finally`, it reads the
+same four raw Chronos leaves into `ChronosAuthProfileV1`, creates the envelope,
+performs the sole step-5 fresh
+provider load/bind without JWT profile enumeration, and requires the target
+row's exact `(job_id,fire_at)` in that store. It then invokes only that fresh
+`target.scheduler.claim_due` followed by `target.scheduler.run_claimed` and
+projects `outcome.processed`, preserving the non-HTTP boolean ABI. It never
+uses the invoked receiver's cached client or ambient profile as target
+authority. Target/config/claim refusal returns false; a post-finalization
+`ChronosRearmError` remains an exception. Both HTTP
+handlers instead receive the already-claimed result from
+`authenticate_and_claim_chronos_fire` and create a task only for
+`target.scheduler.run_claimed` on that same fresh bound scheduler, exactly as
+`asyncio.create_task(asyncio.to_thread(target.scheduler.run_claimed,
+result.claim, adapters=adapters, loop=loop))`; no adapter re-authenticates,
+reselects, double-claims, or calls the synchronous function on its event loop.
 
 `ChronosCronScheduler.run_claimed` is the sole successor re-arm owner. It
-requires its one-shot bound envelope to equal the result, performs the same
+requires its one-time-bound envelope to equal the result, performs the same
 home, secret, and store context entry as the base method inside one
 `try/finally`, calls `_run_claimed_in_active_store`, and—before any context
 token resets—requires `finalization_status` to be `APPLIED` or `REMOVED` and
@@ -573,11 +784,35 @@ the module entry point exits with it. No layer converts a nonzero result to
 success or prints a second authoritative status.
 ## 8. Deployment and SYS-1029 handoff
 1. Use isolated homes below `/home/linux/.hermes/test/sys1030/`, never production jobs or delivery.
-2. Deploy the single watchdog's read-only-alerting change before claim
-   activation: it may report stale legacy claims but performs no jobs-file
-   mutation. There is no retirement alternative left for the implementer to
-   choose.
-3. Fresh-fetch both remotes; each reviewed candidate must be merge-commit ancestor.
+2. Deploy all seven MarketWatch writer dispositions in §3.0 before claim
+   activation. The two holiday managers retain pause/resume only through
+   `cron.jobs.pause_job` and `cron.jobs.resume_job`; both holiday watchdogs and
+   the sole calibration watchdog
+   may report but not mutate; both fallback extractors refuse a jobs member.
+3. Fresh-fetch and validate exactly these two authorities:
+   ```text
+   Hermes origin URL = https://github.com/kendeng300/hermes-agent.git
+   Hermes source ref = refs/heads/main
+   Hermes tracking ref = refs/remotes/origin/main
+   MarketWatch origin URL = https://github.com/kendeng300/marketwatch.git
+   MarketWatch source ref = refs/heads/master
+   MarketWatch tracking ref = refs/remotes/origin/master
+   ```
+   For each checkout, `git remote get-url --all origin` must exit zero and
+   return exactly one LF-terminated line equal to its literal URL above; URL
+   rewriting, SSH aliases, multiple fetch URLs, missing `.git`, or a
+   different remote name refuses. With stdin `DEVNULL`, timeout 60 seconds,
+   and exact environment
+   `{PATH:os.defpath,LC_ALL:"C",LANG:"C",GIT_OPTIONAL_LOCKS:"0"}`, execute
+   `git -C <checkout> fetch --no-tags origin
+   <source-ref>:<tracking-ref>`. Nonzero, timeout, authentication diagnostic,
+   missing exact source ref, or rejected tracking-ref update refuses and no
+   preexisting local ref is accepted as fresh. Then require exactly one
+   lowercase 40-hex line from
+   `git -C <checkout> rev-parse --verify <tracking-ref>^{commit}` and exit zero
+   from `git -C <checkout> merge-base --is-ancestor <reviewed-candidate-oid>
+   <tracking-tip>`. Record these command outputs only in the operator's normal
+   deployment transcript; create no status file or digest authority.
 4. Preflight the live store read-only. Require builtin scheduling, AMC and
    Daily still paused, CCI/BB/MACD still enabled and scheduled, no malformed or
    active claim, and every enabled target safely beyond the bounded deployment
@@ -631,10 +866,12 @@ success or prints a second authoritative status.
    exposes it as `running_build_identity` without changing the endpoint's
    existing availability status. Read-only deployment verification treats
    `UNAVAILABLE` as failure rather than omitting or reconstructing it and
-   requires candidate ancestor of merge and captured running OID = deployed
-   HEAD = freshly fetched merge, with exact profile/PID/start/executable/module
-   and checkout path. Later checkout movement does not change the captured
-   value. No OID, READY, digest, or identity state file is written.
+   requires candidate ancestor of the exact freshly fetched canonical tip and
+   captured running OID = deployed HEAD = that tip, with exact
+   profile/PID/start/executable/module and checkout path. A failed fetch,
+   wrong URL/ref, or stale pre-fetch tracking value cannot satisfy this check.
+   Later checkout movement does not change the captured value. No OID, READY,
+   digest, or identity state file is written.
 8. Re-read five product rows unchanged; invoke no canary, trigger, pause, resume, or product script.
 9. Hand the exact merge/running evidence and public canary contract to
    SYS-1029. SYS-1029 independently verifies it, runs product canaries and
@@ -645,21 +882,52 @@ only `9e059716170c` and `20c3fd791e82` are paused; `cci_precompute_runner`,
 ## 9. Exact edit and proof inventory
 Hermes production edits: `cron/jobs.py`, `cron/scheduler.py`,
 `cron/scheduler_provider.py`, `plugins/cron_providers/chronos/__init__.py`,
-both cron-fire handlers, `hermes_cli/subcommands/cron.py`, `hermes_cli/cron.py`,
+`gateway/platforms/api_server.py::_handle_cron_fire`,
+`hermes_cli/web_server.py::cron_fire_webhook`,
+`hermes_cli/subcommands/cron.py`, `hermes_cli/cron.py`,
 `hermes_cli/main.py`, `tools/cronjob_tools.py`, `gateway/run.py`,
 `gateway/status.py`, `gateway/platforms/api_server.py`,
 `agent/curator_backup.py`, `hermes_cli/backup.py`, and the Chronos contract doc.
 The NAS provider client and token verifier remain byte-unchanged.
-MarketWatch production edit: only
-`enforcement/calibration_cron_watchdog.py`; no shipped twin is created.
+`hermes_cli.profiles.profiles_to_serve`,
+`hermes_cli.config.read_raw_config`, the `hermes_constants` home overrides,
+`agent.secret_scope`, and `cron.jobs.use_cron_store` are preserved dependencies,
+not new authorities. The two handlers remove direct ambient
+`load_config/get_fire_verifier/resolve_cron_scheduler` calls; dashboard cron
+fire also removes `_find_cron_job_profile` and `_fire_cron_job_for_profile`
+from this route without removing their unrelated CRUD compatibility.
+MarketWatch production edits are exactly the seven direct-writer paths in
+§3.0: root/shipped `market_holiday_manager.py`, root/shipped
+`holiday_watchdog.py`, the sole `enforcement/calibration_cron_watchdog.py`,
+and root/shipped `_extract_backup.py`. Root/shipped `restore.sh` are inspected
+transitive callers and need no content edit once the shared extractor behavior
+is corrected. Root/shipped `recovery/restore_crons_from_manifest.py` remain
+read-only and unchanged.
 Required isolated proofs include:
 - `tests/cron/test_jobs.py::test_due_selection_is_read_only_for_recurring_and_preserves_locked_one_shot_preparation`
   proves recurring selection byte-read-only while one-shot legacy claim
   recovery, exhaustion removal, save/readback, dispatch, and restart remain
   unchanged;
-- two processes contend against every jobs writer; loser writes zero bytes;
+- `tests/cron/test_jobs_crossprocess_lock.py::test_every_jobs_writer_uses_one_strict_conservation_owner`
+  drives every `cron/jobs.py` mutation entry, curator restore, and all three
+  backup restore/import entries through two-process barriers; the lock loser
+  writes zero bytes, no public path reaches `_save_jobs_unlocked`, and an
+  injected lock open/flock/timeout failure leaves exact prior bytes;
 - nested same-store write works, cross-store nesting refuses, public `save_jobs`
   acquires strict ownership, and `_save_jobs_unlocked` without it refuses;
+- `tests/hermes_cli/test_backup.py::test_jobs_import_and_all_restore_paths_replace_or_refuse_under_active_claim`
+  proves exact inactive-row replacement for `run_import` and quick restore;
+  fresh in-lock strictly-greater count replacement for emptied-store recovery;
+  no action for its missing/unreadable/malformed/equal/lower count cases; and
+  whole-member refusal for duplicate IDs, malformed shape, a candidate claim,
+  or deletion/change of any live ACTIVE, legacy, unknown, or malformed claim.
+  A pre-lock concurrent mutation, readback failure, and exact second-call
+  idempotence are covered for all three paths, with no partial jobs-member
+  write;
+- `tests/agent/test_curator_backup.py::test_restore_cron_skill_links_preserves_active_and_concurrent_fields`
+  and `tests/cron/test_rewrite_skill_refs.py::test_rewrite_preserves_active_execution_envelope`
+  mutate a non-skill field at the barrier and prove only intended skill leaves
+  change under the same conservation owner;
 - successor null, exception, malformed, and nonfuture leave the row unchanged;
 - claim save occurs before submit and before Chronos task creation/202;
 - a proved pre-API refusal becomes `NOT_SUBMITTED`; enqueue-then-raise and every
@@ -673,6 +941,21 @@ Required isolated proofs include:
   change at the immediate pre-save recheck;
 - Chronos exact `(job_id,fire_at)` has zero/one/multiple profile fixtures;
 - duplicate callback produces no second task;
+- `tests/gateway/test_cron_fire_webhook.py` and
+  `tests/hermes_cli/test_cron_fire_dashboard.py` run the same complete status,
+  response-body, claim, and task-creation table against both adapters. A valid
+  A token with a B body cannot open or mutate B; a valid B token while ambient
+  config/provider/secrets are A claims, executes, finalizes, and re-arms only
+  B. Invalid/expired/wrong-purpose/wrong-audience tokens and malformed headers
+  produce zero jobs-store opens; strict body cases cover duplicate/extra/
+  missing keys and malformed, naive, before/equal/after `fire_at` values;
+- `tests/cron/test_scheduler_provider.py::test_authenticate_then_selects_only_verified_profile_stores`
+  covers zero/one/multiple profiles, same and different auth tuples, one
+  verifier invocation per distinct tuple, ineligible raw configs, and exact ID
+  rather than name. An instrumented jobs-file opener proves no store is opened
+  until at least one tuple verifies. A barrier mutates each raw auth-profile
+  leaf after token verification but before provider binding; the owner refuses
+  rather than combining old authentication with new provider configuration;
 - `tests/cron/test_scheduler_provider.py::test_claimed_chronos_envelope_pins_profile_home_and_store`
   creates profile A and B with the same job ID and distinct `jobs.json` bytes,
   then exercises recurring and one-shot claims through both HTTP handlers and
@@ -685,7 +968,13 @@ Required isolated proofs include:
   after a valid B claim, preloads A's provider client and secrets, and proves
   only B's fresh bound provider/client/secrets remain authoritative; reusing,
   rebinding, or swapping the target scheduler refuses with zero execution and
-  zero re-arm;
+  zero re-arm. Context probes prove home, secret, store, provider, and receiver
+  bindings survive background handoff and are reset without leaking after
+  recurring and one-shot completion through either adapter. After successful
+  binding, mutating ambient or on-disk portal/callback config cannot change the
+  retained bound client/callback values; changing the selected profile's Nous
+  secret is observed only through that profile's freshly installed secret
+  scope, never another profile or process-global environment;
 - `tests/cron/test_jobs.py::test_claim_job_for_fire_public_bool_and_internal_postimage`
   proves the public signature/boolean behavior is unchanged while the internal
   owner returns the exact committed one-shot postimage, and exact `fire_at`
@@ -707,8 +996,34 @@ Required isolated proofs include:
   including the source-existing `LEGACY_ALREADY_HANDLED` true no-op; legacy
   `run_one_job` returns `processed` while canary and Chronos consume `overall`;
 - legacy one-shot success, failure, exhaustion, and restart remain unchanged;
-- MarketWatch watchdog fixtures prove stale-legacy alerts while the input
-  `jobs.json` remains byte-identical and tagged recurring claims are ignored;
+- MarketWatch `tests/test_market_holiday_manager.py` and
+  `scripts/tests/test_market_holiday_manager.py` prove the direct `_save_jobs`
+  path is gone, each selected ID calls exactly one of `cron.jobs.pause_job` and
+  `cron.jobs.resume_job`, ACTIVE/current-row
+  refusal is retained, unrelated rows remain exact, and one refusal is
+  reported rather than hidden by later successes;
+- MarketWatch `tests/test_holiday_watchdog.py` and
+  `scripts/tests/test_holiday_watchdog.py` prove both watchdog copies are
+  read-only for threshold/no-threshold and stale/concurrent documents;
+- `tests/test_sys770_cron_silent_skip.py` proves calibration stale-legacy
+  alerts while `jobs.json` remains byte-identical and tagged recurring claims
+  are ignored;
+- MarketWatch `tests/test_extract_backup.py::test_jobs_member_refuses_entire_fallback_before_any_write`
+  runs both extractor modules with root, prefixed, traversal-normalized, and
+  ordinary archives; either spelling of `cron/jobs.json` refuses before any
+  member write, while an archive without it retains existing extraction;
+- `tests/test_restore_backup_fallback.py::test_both_restore_entrypoints_cannot_bypass_jobs_owner`
+  exercises root and shipped `restore.sh`: the Hermes-present route reaches
+  corrected `run_import`, and the fallback refuses a jobs member with exact
+  prior files unchanged;
+- Hermes `tests/cron/test_jobs_writer_fixed_point.py::test_tracked_live_writer_and_caller_closure`
+  performs the source-level reverse walk for the three Hermes direct-writer
+  files, their callers, and Hermes reader-only exclusions; MarketWatch
+  `tests/test_jobs_writer_fixed_point.py::test_tracked_live_writer_and_caller_closure`
+  independently does the same for its seven direct-writer files, restore
+  callers, and reader-only exclusions. Adding an unowned `open`, `copy`,
+  `json.dump`, or replace edge to a live `jobs.json` fails with its
+  repository-qualified path;
 - `tests/gateway/test_status.py::test_running_build_identity_is_captured_once_from_loaded_scheduler`
   checks PID/start/executable/module/checkout/OID, moving-checkout stability,
   different-profile recapture refusal without replacement, typed unavailable
@@ -718,7 +1033,14 @@ Required isolated proofs include:
   checks the exact authenticated available/unavailable schema without changing
   the endpoint's existing health status;
 - `tests/gateway/test_status_command.py::test_deployment_identity_rejects_each_mismatch`
-  rejects each profile/PID/start/executable/path/OID mismatch.
+  rejects each profile/PID/start/executable/path/OID mismatch;
+- `tests/gateway/test_status_command.py::test_canonical_remote_and_ref_are_freshly_verified`
+  uses a scripted command runner with no network to cover both literal HTTPS
+  URLs and refs, then mutates one URL, adds a second URL, substitutes SSH,
+  removes/renames the source ref, makes fetch fail, leaves a stale local
+  tracking ref, returns malformed/multiple tip lines, and makes the reviewed
+  candidate not an ancestor; every negative refuses even when a previously
+  cached tracking ref has the expected OID.
 Tests must be self-contained below `/home/linux/.hermes/test/sys1030/`, use no
 network, live gateway, production store, live delivery, `/tmp`, systemd, new
 xdist control, new mutex, process scan, or product script. They run through the
@@ -726,7 +1048,7 @@ repository-required wrapper unchanged.
 ## 10. R2 disposition
 | R2 | R3 disposition |
 |---|---|
-| 01 | Retained: strict existing-lock fixed point over every writer. |
+| 01 | Closed from source: three Hermes and seven MarketWatch direct-writer files, every transitive caller, and reader-only exclusions route to one strict `.jobs.lock` conservation owner or lose mutation authority. |
 | 02 | Removed correction-induced codec: exact captured JSON object and type-strict comparison need no digest. |
 | 03 | Retained: validate successor before atomic mutation. |
 | 04 | Closed: preserve documented `{job_id,fire_at}` while every claimed path carries and re-enters one immutable selected profile/home/store envelope; no NAS rewrite. |
@@ -743,7 +1065,7 @@ repository-required wrapper unchanged.
 | 15 | Retained: one command result and exact shell exit propagation. |
 | 16 | Retained: configured running-process identity, not checkout-only evidence. |
 | 17 | Corrected census: disposition the one real watchdog; do not invent a twin. |
-| 18 | Retained: fresh canonical-remote ancestry immediately before deployment proof. |
+| 18 | Closed literally: exact HTTPS origins and `refs/heads/main`/`refs/heads/master` are fetched into exact tracking refs; wrong URL/ref, failed fetch, stale cache, malformed tip, and failed ancestry refuse. |
 | 19 | Removed: five-job mutation/resume contradicts live state and belongs to SYS-1029. |
 ## 11. Five-question authority gate
 Every normative operation must answer all five questions before authorship:
