@@ -1,10 +1,10 @@
-# SYS-1030 — R3 proposed technical specification
-Status: proposed Loop-1 correction; implementation and tests NOT RUN
+# SYS-1030 — R4 proposed technical specification
+Status: proposed Loop-1 R4 correction; implementation and tests NOT RUN
 Issue: MarketWatch #1030, prerequisite for SYS-1029
 Baseline source reviewed: Hermes `82e0a91352e3f1ac8f3a8fce2beee66d2339a2cc`
 MarketWatch source reviewed: `origin/master` at
 `2c37e4b0c261c911323d2caaeed4741ae73f2884`
-This replaces rejected R2 and authorizes no product-job execution or live mutation.
+This replaces rejected R2/R3 and authorizes no product-job execution or live mutation.
 ## 1. Quality goals and boundary
 ### CTQ-1 — claim before submit
 Every recurring builtin or Chronos occurrence and its successor are durably
@@ -16,7 +16,10 @@ preserving enabled, pause, schedule, successor, repeat, execution, and extension
 A pre-run script failure precedes agent/session/model/provider construction and
 remains failure through output, delivery, finalization, command, and exit.
 ### Non-goals
-- No redesign of finite one-shot claims, repeat accounting, or recovery.
+- No change to the public finite one-shot APIs, ordinary finite terminal/removal
+  behavior, or business-result semantics. Scheduled one-shots do gain the same
+  exact nonexpiring occurrence authority and process-local lifecycle identity as
+  every other scheduled route; this is the minimum claim-before-submit closure.
 - No SYS-666 or other MarketWatch product-acceptance redesign.
 - No production product canary, pause, resume, trigger, or schedule change.
 - No five-job release cohort. SYS-1029 owns its product canaries and resume.
@@ -30,14 +33,14 @@ remains failure through output, delivery, finalization, command, and exit.
 |---|---|---|
 | `cron/jobs.py::_jobs_lock` | File-lock timeout/error/unavailability degrades to process-local locking. | All jobs-file writers fail closed unless the existing cross-process lock is held. |
 | `cron/jobs.py::load_jobs` | A read can auto-repair and write malformed input. | Reading is side-effect free; repair is an explicit locked mutation. |
-| `cron/jobs.py::_get_due_jobs_locked` | Due selection mixes recurring selection with existing one-shot `run_claim` and exhaustion preparation. | Split the paths: recurring selection is read-only, while locked one-shot preparation and its current recovery/exhaustion contract are preserved. |
+| `cron/jobs.py::_get_due_jobs_locked` | Due selection mixes recurring selection with lease-based one-shot `run_claim` and exhaustion preparation. | Split the paths: recurring selection is read-only; one-shot preparation atomically writes a tagged nonexpiring exact claim plus finite-repeat postimage while preserving public APIs and terminal behavior. |
 | `cron/jobs.py::advance_next_run` | Advance and legacy claim are separate from the returned due snapshot and submit. | Recurring scheduled callers use the new atomic claim owner. |
 | `cron/scheduler.py::tick` | Calls due, advances separately, then submits; submit status is best effort. | Claim first, then submit the exact claimed snapshot. |
 | `cron/scheduler.py::_submit_with_guard`, `close_cron_admission_for_shutdown` | In-memory identity is only `job_id`, and shutdown does not linearize against submit/start. | Use the existing `_running_lock` to close admission and snapshot exact contexts before drain or cleanup; no later unadmitted business start is possible. |
-| `cron/scheduler.py::run_one_job` | Calls existing one-shot `claim_dispatch`, then run/output/delivery/finalization. | Preserve its exact boolean ABI and one-shot behavior; factor the same route into `_run_one_job_managed`, which accepts recurring/canary context and returns the typed outcome. |
+| `cron/scheduler.py::run_one_job` | Calls lease-based one-shot `claim_dispatch`, then run/output/delivery/finalization; whitespace failure is classified after output/delivery. | Preserve its exact boolean ABI; factor the route into `_run_one_job_managed`, which accepts every scheduled context and returns the total content/output/delivery/finalization product. |
 | `cron/scheduler.py::run_job` | Agent construction can follow failed script output. | A failed pre-run returns failure before agent/session/provider work. |
-| `cron/scheduler.py::_pause_job_for_unverified_script_cleanup`, `_clear_cleanup_fire_claim` | Cleanup quarantine is keyed/cleared by job ID and cannot conserve a future canary claim. | Use the exact managed context: INCOMPLETE/UNKNOWN persist pause diagnostics while retaining ACTIVE; canary never reaches generic clear/finalize/retry. |
-| `cron/scheduler.py::get_running_job_ids`, `mark_running_jobs_interrupted` | Project only job ID and resample after the global process kill. | Keep the job-ID view only for compatibility; shutdown snapshots exact contexts immediately before each kill and interruption consumes only that immutable snapshot. |
+| `cron/scheduler.py::_pause_job_for_unverified_script_cleanup`, `_clear_cleanup_fire_claim` | Cleanup quarantine is keyed/cleared by job ID, overwrites a canary's original pause fields, and can clear its exact claim. | Use the exact context: INCOMPLETE/UNKNOWN preserve the canary pause quartet and ACTIVE claim byte-for-byte; the diagnostic has a separate result leaf and generic clear/finalize/retry is unreachable. |
+| `cron/scheduler.py::get_running_job_ids`, `mark_running_jobs_interrupted` | Project only job ID, omit one-shots, and resample after the global process kill. | Keep the job-ID view only for compatibility; one lifecycle-scoped registry snapshots every exact context and cleanup phase before teardown, and interruption cannot compete with cleanup/finalization. |
 | `cron/scheduler_provider.py::CronScheduler.fire_due` | Claims Chronos by job ID without scheduled time. | Accept and claim exact `fire_at`. |
 | `plugins/cron_providers/chronos/__init__.py::ChronosCronScheduler.run_claimed` | `fire_due` currently owns successor `_arm_one_shot`. | Become the sole post-finalization successor re-arm owner for synchronous and HTTP paths. |
 | `plugins/cron_providers/chronos/_nas_client.py` | Already provisions `job_id` and exact `fire_at`. | Preserve this wire unchanged. |
@@ -46,13 +49,13 @@ remains failure through output, delivery, finalization, command, and exit.
 | `hermes_cli/web_server.py::cron_fire_webhook` | Finds a profile by job ID alone and returns 202 before claim. | Match exactly one profile/store by `(job_id,fire_at)` and claim before task/202. |
 | `hermes_cli/cron.py::cron_command` | Produces action status but callers discard it. | Return the canary command status. |
 | `hermes_cli/main.py::cmd_cron`, `main` | Discard the nested return value. | Propagate it to process exit. |
-| `cron/scheduler.py::_capture_loaded_scheduler_build_identity`, `gateway.status.capture_running_build_identity`, `read_live_running_build_identity` | No always-available deployment verifier binds loaded scheduler bytes to the live gateway; optional detailed health and current `HEAD` are insufficient. | Always publish a typed available/unavailable observation without changing ordinary startup, then require the strict CLI verifier for SYS-1030 acceptance and SYS-1029 handoff. |
+| loaded-build/status paths | The scheduler-only observation omits store, resolver, selected-provider, HTTP/manual entry modules and conflates messaging `served_profiles` with cron ownership. | For controlled deployment only, attest the complete exact cron activation tuple and loaded module closure before atomically opening cron admission; ordinary startup stays unchanged. |
 | `agent/curator_backup.py::_restore_cron_skill_links` | Parses backup outside the lock, then fresh-loads and merges `skill`/`skills` under `_jobs_lock`. | Retain the field-only merge but publish through the sole conservation owner and fail closed when the strict lock is unavailable. |
-| `hermes_cli/backup.py::{run_import,restore_quick_snapshot,restore_cron_jobs_if_emptied}` | The import writes archive members with `open(...,"wb")`; both restore paths can `copy2` a stale whole `cron/jobs.json` without the jobs lock. | Route every jobs member through the exact locked replace-or-refuse contract in §3.1; no raw live-file copy remains. |
+| `hermes_cli/backup.py::{run_import,restore_quick_snapshot,restore_cron_jobs_if_emptied}` | Import writes archive members with `open(...,"wb")`; root and `profiles/<name>/cron/jobs.json` can bypass their selected store lock. | Preflight the whole archive, route each root/named jobs member through its own exact conservation owner without nested store locks, and report partial/unknown truth. |
 | MarketWatch `utilities/market_holiday_manager.py` and `scripts/utilities/market_holiday_manager.py` | Both byte-identical tracked copies load before locking, lock `jobs.lock` rather than `.jobs.lock`, use a shared `jobs.tmp`, and replace the whole document. | Remove direct storage writes; invoke `cron.jobs.pause_job` or `cron.jobs.resume_job` once per selected ID and report any partial refusal truthfully. |
 | MarketWatch `utilities/holiday_watchdog.py` and `scripts/utilities/holiday_watchdog.py` | Both byte-identical tracked copies have the same pre-lock read, wrong lock name, shared temp, and whole-document replace. | Preserve detection and alerting, but remove automatic mutation. |
 | MarketWatch `enforcement/calibration_cron_watchdog.py` | Loads before its save lock; the save locks `.jobs.lock` only when the lock file already exists and otherwise degrades, then replaces the whole document. | Keep its existing scan/report surface but remove every jobs-file mutation; it becomes read-only alerting. |
-| MarketWatch `utilities/_extract_backup.py` and `scripts/utilities/_extract_backup.py` | The generic fallback extractor opens every archive member destination `wb`, including `cron/jobs.json`, with no jobs lock. | Pre-scan normalized members and refuse the entire fallback extraction if it contains `cron/jobs.json`; the normal restore path uses corrected `hermes import`. |
+| MarketWatch `utilities/_extract_backup.py` and `scripts/utilities/_extract_backup.py` | The generic fallback extractor opens every archive destination `wb`, including root or named-profile jobs stores, with no jobs lock. | Pre-scan normalized members and refuse the entire fallback extraction if any root or named-profile jobs destination exists; normal restore uses corrected `hermes import`. |
 The root and shipped holiday-manager, holiday-watchdog, and extractor pairs are
 tracked and byte-identical at the pinned MarketWatch ref. Calibration has only
 the tracked `enforcement/calibration_cron_watchdog.py`; there is no tracked
@@ -96,8 +99,8 @@ preimage refuses. It never provides a lock-free or blind full-document write.
 Every reachable `jobs.json` mutation uses this boundary:
 - `create_job`, `update_job`, `pause_job`, `resume_job`, `trigger_job`, and
   `remove_job`;
-- `mark_job_run`, `claim_dispatch`, `heartbeat_run_claim`,
-  `set_dispatch_claim_status`, and the new recurring/canary claim owners;
+- `mark_job_run`, compatibility `claim_dispatch`/`heartbeat_run_claim`,
+  `set_dispatch_claim_status`, and the recurring/one-shot/canary claim owners;
 - `advance_next_run` for remaining compatible callers;
 - `rewrite_skill_refs`;
 - explicit `cron.jobs.repair_jobs_store` formerly hidden inside `load_jobs`;
@@ -105,8 +108,8 @@ Every reachable `jobs.json` mutation uses this boundary:
 - `hermes_cli/backup.py::{run_import,restore_quick_snapshot,
   restore_cron_jobs_if_emptied}`, each of which routes a jobs member through
   `_commit_jobs_mutation` rather than opening or copying over the live file.
-Strict serialization does not authorize claim loss. While a tagged recurring
-or canary claim is `ACTIVE`, only its exact-claim CAS owner may write result,
+Strict serialization does not authorize claim loss. While a tagged recurring,
+one-shot, or canary claim is `ACTIVE`, only its exact-claim CAS owner may write result,
 repeat, schedule-successor, or claim fields. `remove_job`, `trigger_job`,
 `resume_job`, repair, restore, and any context-free `mark_job_run` targeting
 that row refuse before writing. `pause_job` may only add the exact pause leaves;
@@ -173,72 +176,150 @@ gates/monitors/watchers, backup orchestrators, and DR archive validation write
 only non-live artifacts or read the store; they remain outside the writer set.
 
 ### 3.1 Import and restore are locked replace-or-refuse
+`hermes_cli.backup.normalize_jobs_archive_members(zf) ->
+JobsArchivePreflightResultV1` completes a read-only pass before any archive
+member is written. It applies current `_detect_prefix`: `.hermes/` or
+`hermes/` is stripped only when every nondirectory member shares that one first
+component. It then rejects absolute paths, backslashes, empty/`.`/`..`
+components, symlink/nonregular entries, and duplicate normalized
+destinations. The complete live-jobs predicate is exactly:
 
-`run_import`, quick-snapshot restore, and emptied-store recovery parse and
-validate the complete candidate jobs member before entering the strict
-mutation owner. The candidate must be a wrapper with a list-valued `jobs` or a
-legacy bare list; every element must be an object with one unique nonempty
-string `id`. Under the lock, the owner fresh-loads and validates the complete
-live document. `run_import` and quick-snapshot restore retain their existing
-whole-member overwrite semantics for the jobs list: if the authority checks
-below pass, their postimage is the exact validated candidate jobs list,
-including candidate row order, changed inactive rows, and deletion of inactive
-live-only rows, serialized once through the existing Hermes jobs wrapper and
-`updated_at` format by `_save_jobs_unlocked`.
-Emptied-store recovery retains its current narrow rule: it recomputes both
-counts from the fresh in-lock live document and the validated snapshot, and
-replaces with that exact candidate jobs list only when the snapshot has strictly more
-jobs. Missing, unreadable, malformed, equal-count, or lower-count input is the
-existing no-action result. No count or replacement decision made before lock
-acquisition is reused.
+- `cron/jobs.json` -> default Hermes-root store;
+- `profiles/<name>/cron/jobs.json` -> that named-profile store, where `name`
+  matches `^[a-z0-9][a-z0-9_-]{0,63}$` and is an existing valid profile or the
+  archive also contains that profile's `config.yaml` or `.env`.
 
-All three paths refuse the entire jobs-member mutation if replacement would
-delete or change any live row carrying an `ACTIVE` tagged recurring/canary
-claim, any current legacy `fire_claim`, `run_claim`, or `dispatch_claim`, or an
-unknown/malformed claim authority. A candidate row containing any such claim
-also refuses unless it is recursively type-strict equal to the corresponding
-live row; backup bytes never manufacture, change, or clear execution
-authority. Duplicate IDs, malformed rows/documents, and unknown top-level
-shapes refuse before save. Thus inactive backup state keeps the source-existing
-replace behavior, while every live execution authority is conserved or the
-whole jobs member is refused.
+`_external/**` is never a jobs store. An otherwise valid named member with no
+existing/archive-defined profile is `UNKNOWN_PROFILE`. Every jobs member must
+pass the complete wrapper-or-bare-list, unique nonempty ID, row-shape, and
+tagged/legacy claim-authority validation before the first archive write.
 
-“Exactly equal” here is recursive type-strict JSON equality: null, bool,
-number, string, array, and object types cannot substitute for one another;
-array order and complete object key membership/value equality are required.
-This comparison does not define a serialization, digest, or new codec.
+```text
+JobsArchiveMemberV1={
+  normalized_path:canonical relative string,
+  profile:nonempty string,
+  jobs_file_realpath:absolute canonical string,
+  candidate_jobs:list[object]
+}
+JobsArchivePreflightResultV1={
+  schema:"hermes-jobs-archive-preflight-v1",
+  status:"VALIDATED"|"REFUSED_NO_WRITE",
+  members:list[JobsArchiveMemberV1], error:null|nonempty string
+}
+JobsArchiveStoreResultV1={
+  profile:nonempty string,
+  jobs_file_realpath:absolute canonical string,
+  status:"UNCHANGED"|"REPLACED"|"REFUSED_NO_WRITE"|"COMMIT_UNKNOWN",
+  before_count:nonnegative integer|null,
+  after_count:nonnegative integer|null,
+  error:null|nonempty string
+}
+JobsArchiveImportResultV1={
+  schema:"hermes-jobs-archive-import-result-v1",
+  status:"COMPLETE"|"REFUSED_NO_WRITE"|"PARTIAL"|"COMMIT_UNKNOWN",
+  stores:list[JobsArchiveStoreResultV1], error:null|nonempty string
+}
+```
 
-Only a fully validated replacement postimage is atomically saved and read back.
-There is no pre-lock job-count decision, unguarded snapshot replacement,
-partial member write, or fallback copy. Other backup members retain their existing behavior,
-but a jobs-member refusal makes the command/report nonzero and explicit. The
-MarketWatch no-Hermes extractor cannot invoke this owner, so it pre-scans the
-archive and refuses the whole extraction before writing any member whenever a
-normalized member path is `cron/jobs.json`.
+VALIDATED has a sorted unique members list (possibly empty for a non-jobs archive)
+and null error;
+REFUSED_NO_WRITE has an empty list and nonempty error. Members are ordered
+default first then named profiles lexically and contain only fully validated
+candidate rows.
 
-### 3.2 Recurring selection and preserved one-shot preparation
+For a store, UNCHANGED/REPLACED have nonnull before/after counts and null
+error; REFUSED_NO_WRITE has known before count when a store was opened, null
+after count, and nonempty error; COMMIT_UNKNOWN has its known before count,
+null after count, and nonempty error. COMPLETE has only successful store rows
+and null aggregate error. REFUSED_NO_WRITE has no committed store row and one
+error. PARTIAL has at least one verified successful row followed by one known
+refusal row and one error. COMMIT_UNKNOWN ends with exactly one unknown row and
+one error. Empty/mixed/contradictory products are invalid.
+
+`hermes_cli.backup.apply_imported_jobs_members(preflight)` orders default first
+and named profiles lexically. For each store it installs
+`use_cron_store(home)` and invokes
+`_commit_jobs_mutation(import_member_mutator, active_authority=PRESERVE)` under
+that store's `.jobs.lock`; `import_member_mutator` is the lexical closure over
+that validated member and selected store. Two store locks
+are never nested. Exact readback is required for `UNCHANGED|REPLACED`.
+Known refusal before any store or non-jobs member write is `REFUSED_NO_WRITE`.
+A later refusal after a verified store commit is `PARTIAL` and lists every
+verified postimage. Replace/readback uncertainty is `COMMIT_UNKNOWN` and stops
+the sequence. Earlier stores are neither rolled back nor described as one
+cross-store transaction. The CLI is nonzero for every non-COMPLETE result.
+
+Whole-member replace retains current inactive-row semantics, but refuses any
+change/deletion of ACTIVE tagged recurring, scheduled-one-shot, or canary
+authority; any legacy, unknown, or malformed claim also blocks. Candidate
+claim bytes never manufacture or alter authority. Recursive equality is
+type-strict JSON equality, including scalar types, Unicode code points, map
+keys, and list order; it creates no digest or codec.
+
+`restore_quick_snapshot` and `restore_cron_jobs_if_emptied` remain one explicit
+current-home store each; curator `_restore_cron_skill_links` remains a
+field-only current-home merge. Both MarketWatch fallback `safe_extract`
+owners, reached by root/shipped `restore.sh`, apply the same normalization and
+refuse the entire archive before opening any destination when either jobs
+predicate matches. They exit 2 with one `JOBS_OWNER_REQUIRED` diagnostic.
+
+### 3.2 Recurring selection and exact scheduled one-shot preparation
 
 `cron.jobs._get_due_jobs_locked(raw_jobs, now)` remains the coordinator under
 the existing strict jobs lock and delegates to two disjoint internal owners:
 
 ```text
 cron.jobs._select_due_recurring_locked(raw_jobs, now) -> list[dict]
-cron.jobs._prepare_due_one_shots_locked(raw_jobs, now) -> tuple[list[dict], bool]
+cron.jobs._prepare_due_one_shots_locked(raw_jobs, now) -> OneShotDueBatchV1
 ```
 
 `_select_due_recurring_locked` validates and selects recurring rows without
 changing the jobs document. It does not repair recurrence, advance
-`next_run_at`, create a claim, or save. `_prepare_due_one_shots_locked`
-preserves the current one-shot contract under the same lock: it retains
-`_recoverable_oneshot_run_at`, `_oneshot_run_claim_ttl_seconds`,
-`_job_running_in_this_process`, legacy `run_claim={"at":...,"by":...}`
-creation/recovery, finite-run exhaustion removal, and the single final
-save/readback when `changed=true`. The coordinator returns the union only
-after any one-shot mutation is durably saved and read back. A malformed
-recurring row refuses recurring selection and remains for explicit repair; it
-cannot suppress or partially save one-shot preparation. Existing one-shot
-dispatch, heartbeat, `mark_job_run`, exhaustion, and restart semantics are
-unchanged. No jobs schema or one-shot state is added.
+`next_run_at`, create a claim, or save. Scheduled one-shots instead use one
+tagged authority in the existing `run_claim` (builtin) or `fire_claim`
+(Chronos) member:
+
+```text
+OneShotExecutionClaimV1={
+  schema:"cron-oneshot-execution-claim-v1", claim_id:UUID4,
+  job_id:nonempty string,
+  mode:"BUILTIN_ONESHOT"|"CHRONOS_ONESHOT",
+  scheduled_for:aware exact string, claimed_at:aware string,
+  owner_profile:nonempty string, owner_pid:positive integer,
+  owner_start_ticks:positive integer,
+  repeat_completed_before:nonnegative integer|null,
+  repeat_completed_after:positive integer|null,
+  status:"ACTIVE"|"OPERATOR_SKIPPED", terminal_error:string|null
+}
+OneShotDueBatchV1={
+  status:"PREPARED"|"UNCHANGED"|"MALFORMED"|"LOCK_UNAVAILABLE"|
+         "COMMIT_UNKNOWN",
+  jobs:list[dict], claims:list[OneShotExecutionClaimV1],
+  error:string|null
+}
+```
+
+PREPARED has nonempty equal-length jobs/claims and null error; UNCHANGED has
+both lists empty and null error. Every failure has both lists empty and one
+nonempty error. No claim appears without its byte-equal job postimage.
+
+ACTIVE requires null terminal error; OPERATOR_SKIPPED requires nonempty error.
+The repeat pair is simultaneously null for an unlimited/nonfinite route or
+simultaneously nonnull with `after=before+1<=times`. Under the existing strict
+lock, the owner validates the one-shot, allocates its UUID, increments finite
+`repeat.completed` exactly once, saves claim plus repeat postimage once, and
+returns only committed/read-back snapshots. Exhaustion before allocation
+retains the existing terminal removal. Unknown/malformed/foreign claim bytes
+refuse unchanged. ACTIVE never ages out, is overwritten, or automatically
+replayed; `_oneshot_run_claim_ttl_seconds` and generic heartbeat are legacy
+read compatibility only and cannot classify a tagged claim.
+
+The coordinator returns selected recurring rows and exact one-shot postimages
+only after the one-shot batch readback. A malformed recurring row refuses its
+route without partially saving a one-shot mutation. Public `get_due_jobs()`
+still returns a list and public `claim_dispatch(...) -> bool` retains its
+source meaning; builtin tick consumes the private typed batch and does not
+claim/increment a prepared one-shot a second time.
 
 The public due path samples `now` once, acquires that same strict lock, calls
 the explicit `cron.jobs.repair_jobs_store` owner, then fresh-loads the stored
@@ -249,10 +330,14 @@ and recurring selection never do so implicitly. A stale but otherwise valid
 recurring `next_run_at` is not fast-forwarded by selection: it is selected
 with its exact stored
 `scheduled_for`, and §4.2 atomically persists the successor with the claim.
-Thus the split neither drops the current repair cases nor advances a stale
-recurrence before its occurrence has durable authority. Tests cover
-missing-successor repair, timezone migration, and stale catch-up in addition
-to one-shot recovery.
+Thus the split neither drops current repair cases nor advances a stale
+recurrence before durable authority. A source-proved refusal before any
+submit/task API may exact-CAS the one-shot postimage to its preimage, including
+the finite repeat count. API entry, lost acknowledgement, commit uncertainty,
+or process death retains ACTIVE. Only exact dead-owner operator skip consumes
+the occurrence into existing last-result/exhaustion/removal behavior; it never
+replays it. Public finite terminal behavior and return signatures remain
+unchanged.
 ## 4. Recurring occurrence claim
 ### 4.1 Timestamp and identity
 `scheduled_for` and `next_run_after` are exact persisted aware ISO-8601 strings.
@@ -307,81 +392,152 @@ a later exact due occurrence.
 An `ACTIVE` claim is never aged out, replayed, recovered by a watchdog, or
 overwritten by a later occurrence.
 ### 4.3 Submit and run
-Builtin `tick` and Chronos call `claim_recurring_occurrence` before any call to
-`ThreadPoolExecutor.submit`, `asyncio.create_task`, or `asyncio.to_thread`.
-Only the exact returned postclaim snapshot may be admitted. The sole process-
-local owner is:
+Builtin, Chronos, scheduled one-shot, manual-compatible, and canary routes all
+enter one lifecycle-scoped process-local owner after their exact claim and
+before submit/task/inline start:
+
+```text
+CronExecutionLifecycleV1={
+  lifecycle_id:UUID4, state:"OPEN"|"CLOSED"|"DRAINED",
+  records:map[ExecutionKeyV1,ExecutionRecordV1]
+}
+ExecutionKeyV1=(jobs_file_realpath,job_id,mode,claim_id)
+ExecutionPhaseV1="REGISTERED"|"WORKER_STARTED"|
+  "SCRIPT_CLEANUP_PENDING"|"CLEANUP_COMPLETE"|"CLEANUP_UNCERTAIN"|
+  "EFFECTS_STARTED"|"FINALIZING"|"RELEASED"
+ExecutionRecordV1={
+  key:ExecutionKeyV1, context:ExecutionContextV2,
+  phase:ExecutionPhaseV1, shutdown_requested:bool,
+  cleanup_status:"NOT_APPLICABLE"|"COMPLETE"|"INCOMPLETE"|"UNKNOWN",
+  release_owner:"OUTER_PREWORKER"|"WORKER"|null
+}
+```
+
+This replaces lifecycle decisions by `_running_job_ids`,
+`_cleanup_unverified_jobs`, and `_interrupted_job_ids`; their public/job-ID
+views remain compatibility projections only. It uses the existing
+`_running_lock`, is never serialized, and is not result/retry authority. A new
+lifecycle opens only after the predecessor is CLOSED, DRAINED, and empty. The
+shared teardown bound is the source-existing gateway outer drain bound, 65.0
+seconds; expiry never implies cleanup success or claim absence.
+
 ```python
 cron.scheduler.admit_and_start_managed_execution(
-    context: ExecutionContextV1, job_postimage: object, starter: Callable,
+    context: ExecutionContextV2, job_postimage: object, starter: Callable,
 ) -> CronAdmissionResultV1
 ```
-It uses the existing `_running_lock`; it adds no mutex or durable authority.
-While holding that lock it validates the complete context/postimage relation.
-If admission is `CLOSED`, it does not call `starter` and returns
-`PRE_API_REFUSED`. If admission is `OPEN`, it registers the exact context and
-postimage before entering `starter`, then calls the submit/create-task or
-inline-start primitive before releasing the lock. A returned handle/token is
-`STARTED`. An exception after API entry is `SUBMIT_UNKNOWN`: the durable claim
-remains `ACTIVE`, the exact registration remains until its wrapper removes it
-or the process exits, and no caller calls it `NOT_SUBMITTED`. Registration
-precedes the worker's first business action; the wrapper removes only its
-byte-equal context in `finally`.
+Under `_running_lock` it validates exact context/postimage/claim equality. If
+CLOSED it does not call `starter` and returns PRE_API_REFUSED. If OPEN it
+registers before entering the API. Returned handle/token is STARTED. Any
+exception after API entry is SUBMIT_UNKNOWN: the durable claim and record stay
+ACTIVE until the exact worker wrapper releases or the process exits.
 
-The gateway's first shutdown operation is:
+Every starter, including both HTTP adapters, runs exactly:
+
 ```python
-cron.scheduler.close_cron_admission_for_shutdown()
-    -> tuple[ExecutionContextV1, ...]
-cron.scheduler.snapshot_running_managed_executions()
-    -> tuple[ExecutionContextV1, ...]
-cron.scheduler.mark_running_jobs_interrupted(
-    reason: str, *, identities: tuple[ExecutionContextV1, ...],
-) -> tuple[ExecutionContextV1, ...]
+cron.scheduler.run_registered_execution(
+    context: ExecutionContextV2, job_postimage: object,
+    *, adapters=None, loop=None,
+) -> ManagedRunOutcomeV2
+cron.scheduler.run_registered_http_execution(
+    context: ExecutionContextV2, job_postimage: object,
+    *, scheduler: CronScheduler, adapters=None, loop=None,
+) -> Awaitable[ManagedRunOutcomeV2]
 ```
-`close_cron_admission_for_shutdown` takes `_running_lock`, changes the one
-process-lifetime admission value `OPEN -> CLOSED`, and returns a sorted
-immutable snapshot. It is called at the start of
-`gateway.run.GatewayRunner.stop::_stop_impl`, before notification, drain, or
-any cleanup. Admission is never reopened in that process. Close winning the
-lock means no starter/API/business action occurs; a recurring claim then uses
-the exact `mark_recurring_not_submitted` CAS. Admission winning means its exact
-context is necessarily in the shutdown snapshot and may start only as an
-already-admitted member of that snapshot.
 
-Drain tests current exact contexts, not a count or job-ID set. Immediately
-before each existing `process_registry.kill_all()` call, shutdown takes one
-fresh immutable exact-context snapshot; after the kill it passes that same
-snapshot to `mark_running_jobs_interrupted` and never resamples. Thus an
-occurrence leaving after the snapshot or a later occurrence cannot be marked
-for another cut. The compatibility `get_running_job_ids()` is only a projection
-of current contexts and owns no interruption/finalization decision.
+At its first instruction it takes `_running_lock` and changes its byte-equal
+record REGISTERED -> WORKER_STARTED. A missing/released record or a CLOSED
+record with shutdown requested performs no business action. Its `finally`
+changes only that record to RELEASED and removes it once. Builtin submit,
+trusted synchronous Chronos, and both HTTP `to_thread` calls use this wrapper,
+never raw `run_claimed`.
 
-`mark_running_jobs_interrupted` considers only the supplied contexts. Under the
-strict jobs lock, each member may update/finalize only its matching tagged
-`ACTIVE` claim and only after the corresponding containment result is known.
-An absent, changed, foreign, or later claim causes no write. A canary or
-recurring context with `INCOMPLETE|UNKNOWN` cleanup takes only the quarantine
-transition in §6; it cannot be cleared or finalized by interruption. Thus the
-pre-kill snapshot, exact claim CAS, and cleanup classification select one
-successor without a job-ID-only fallback.
+For HTTP, the outer coroutine owns a `worker_started` token and task handle.
+Cancellation/error before worker entry removes REGISTERED while retaining the
+durable ACTIVE claim unless non-entry is proved and its exact rollback commits.
+After worker entry, outer cancellation does not release: the thread wrapper
+remains sole owner through finalization/re-arm and release. A thread arriving
+after its pre-start record was removed sees that fact under `_running_lock`
+and performs zero business action. Both host lifecycles retain and drain the
+outer tasks; success, error, cancellation, and re-arm failure each yield one
+release.
 
-The worker's first scheduler action fresh-reads and requires the same
-`job_id`, `claim_id`, mode, owner profile/PID/start-ticks, `scheduled_for`, and
-`ACTIVE` status and requires its exact registered context. Only then may it
-enter the unchanged business route. There is no claimed-to-dispatched CAS and
-no second start barrier: the admission critical section is the one start cut.
-Only `PRE_API_REFUSED` may become `NOT_SUBMITTED`. Every exception after
-calling a submit/task API, cancellation, lost acknowledgement, or process
-death is ambiguous and remains `ACTIVE`.
-Failure to persist `NOT_SUBMITTED` also leaves `ACTIVE` and blocks recurrence.
-Exact successful or failed completion applies the existing `mark_job_run`
-last-result and repeat effects and removes only the matching `ACTIVE` claim in
-one strict transaction. If the unchanged finite-repeat rule removes the job,
-job removal and the final result are the existing single terminal cut. A
-missing, changed, or foreign claim prevents every finalization write. Existing
-finite one-shot
-`claim_dispatch`, repeat counting, removal, and restart behavior are otherwise
-unchanged.
+Every host's first teardown operation is:
+```python
+cron.scheduler.close_cron_admission_for_shutdown(lifecycle_id: UUID4)
+    -> tuple[ExecutionContextV2, ...]
+cron.scheduler.snapshot_running_managed_executions()
+    -> tuple[ExecutionContextV2, ...]
+cron.scheduler.mark_running_jobs_interrupted(
+    reason: str, *, identities: tuple[ExecutionContextV2, ...],
+) -> tuple[ExecutionContextV2, ...]
+```
+Close atomically changes OPEN -> CLOSED, marks every record
+`shutdown_requested`, and returns one sorted immutable snapshot. Close winning
+means no registration/API/worker effect follows. Admission winning means the
+exact context is in that snapshot. At `GatewayRunner.stop`, dashboard lifespan
+exit, desktop-process exit, or startup abort, close precedes provider stop,
+task cancellation, drain, process cleanup, and status teardown.
+
+Shutdown never directly finalizes WORKER_STARTED or SCRIPT_CLEANUP_PENDING.
+The worker publishes cleanup phase under `_running_lock`; COMPLETE lets that
+worker apply one interrupted exact finalizer, while INCOMPLETE/UNKNOWN permits
+only §6 quarantine. If the bounded drain expires while cleanup is pending,
+shutdown atomically sets CLEANUP_UNCERTAIN/UNKNOWN and invokes the same exact
+quarantine. Thus cleanup uncertainty wins without a competing generic writer.
+For a started non-script context whose worker cannot complete, shutdown leaves
+ACTIVE; owner death plus explicit skip is the only later successor. No global
+kill count is containment truth.
+
+Gateway `start_gateway` and `GatewayRunner` share this exact lifecycle.
+Dashboard `_lifespan` creates it before exposing any webhook, including when
+`HERMES_DESKTOP` is absent. Its `finally` closes admission, sets the desktop
+ticker stop event, calls provider `stop` if constructed, cancels only
+not-started HTTP tasks, boundedly awaits started tasks and ticker, classifies
+pending cleanup UNKNOWN/quarantines, marks DRAINED, and only then continues
+unrelated PTY/app teardown. The Electron primary/profile Python processes each
+own their separate lifecycle. Startup abort invokes the same idempotent close;
+a closed predecessor is never reopened. CLI tick/manual/canary create one
+command-scoped lifecycle and close/drain it in the command's outer `finally`,
+so command exit cannot strand a registered in-process worker.
+
+Immediately before an existing process cleanup, teardown uses one immutable
+snapshot and never resamples job IDs afterward. An absent, changed, foreign,
+or later claim causes no store write. Exact successful/failed completion
+updates current last-result/repeat behavior and removes only its claim in one
+strict transaction; legal finite removal is that same terminal cut. There is
+no claimed-to-dispatched CAS. Only a proved pre-API refusal can become
+NOT_SUBMITTED or exact one-shot rollback; all post-API uncertainty remains
+ACTIVE.
+
+The complete source-derived route set is: builtin recurring tick; builtin
+scheduled one-shot; trusted synchronous Chronos recurring and scheduled
+one-shot; gateway-API Chronos recurring and scheduled one-shot; dashboard-HTTP
+Chronos recurring and scheduled one-shot; paused canary; and compatible manual
+fire. CLI tick is the builtin owner, not an eleventh route. Every scheduled
+route carries an exact claim/context; manual compatibility carries a context
+when it owns a claim but changes no public ABI.
+
+Every route uses the same cut/restart table:
+
+| Cut | Sole result/postimage | Cold successor |
+|---|---|---|
+| preclaim | no mutation/API/effect | ordinarily eligible |
+| postclaim, preregistration | only proved pre-API recurring NOT_SUBMITTED or exact one-shot rollback; otherwise ACTIVE | terminal/rolled back eligible; ACTIVE blocked |
+| postregistration, pre-API | close winner starts nothing and applies the same proved disposition | same |
+| API entered/ack unknown | ACTIVE; no NOT_SUBMITTED/replay | blocked |
+| accepted, preworker | canceled wrapper either proves no worker and exact-disposes or retains ACTIVE | terminal or blocked |
+| worker started, pre-effect | shutdown request produces exact interrupted successor; crash retains ACTIVE | terminal or blocked |
+| cleanup pending/classified | COMPLETE permits interrupted finalizer; INCOMPLETE/UNKNOWN only quarantine | quarantined ACTIVE blocked |
+| result/output/delivery | §7 product retained; shutdown cannot turn failure into success | exact final or ACTIVE |
+| finalizer pre/post commit | accept exact postimage only; uncertainty fresh-reads exact pre/post | terminal or ACTIVE |
+| release | exact record removed once | jobs row is sole restart truth |
+
+Outer HTTP cancellation and underlying worker exit are different cuts. Same-
+process, shutdown-generation, and cold-restart generations cross all cleanup
+values. No equivalence collapse may combine gateway/dashboard, recurring/
+one-shot, API/worker, default/named store, or cleanup/shutdown unless source
+proves identical owner, read set, write set, and result projection.
 
 ```python
 cron.jobs.mark_recurring_not_submitted(
@@ -389,14 +545,16 @@ cron.jobs.mark_recurring_not_submitted(
     reason: Literal["CALLER_SHUTTING_DOWN_BEFORE_SUBMIT"],
 ) -> ClaimDispositionResultV1
 cron.jobs.finalize_recurring_occurrence(job_id, claim_id, *, success, error, delivery_error) -> ClaimDispositionResultV1
+cron.jobs.rollback_oneshot_before_submit(job_id, claim_id, exact_preimage) -> ClaimDispositionResultV1
+cron.jobs.finalize_oneshot_occurrence(job_id, claim_id, *, outcome:ManagedRunOutcomeV2) -> ClaimDispositionResultV1
 ```
-Both are strict exact-claim CAS owners; no generic writer performs either cut.
+These are strict exact-claim CAS owners; no generic writer performs either cut.
 The sole `NOT_SUBMITTED` reason is reachable only from the closed-admission
 `PRE_API_REFUSED` result. Pool/task API exceptions, including a synchronous
 closed-pool/closed-loop error after API entry, are never mapped to it.
 ### 4.4 Explicit skip of an ambiguous claim
 ```python
-cron.jobs.skip_active_recurring_claim(
+cron.jobs.skip_active_scheduled_claim(
     job_id: str, claim_id: str, *, reason: str,
 ) -> ClaimDispositionResultV1
 ```
@@ -408,9 +566,10 @@ the operator. PID reuse, inaccessible or unknown liveness, or a matching owner
 refuses and leaves `ACTIVE`. A successful skip is an explicit operator
 acceptance that the business outcome is unknown; it never proves nonexecution
 or successful cleanup and no product acceptance may consume it as success.
-The exact transaction changes only `ACTIVE` to `OPERATOR_SKIPPED`. It does not
-execute or replay the occurrence and does not move `next_run_at`, which was
-already advanced in the original claim transaction.
+For recurring it changes only ACTIVE to OPERATOR_SKIPPED and does not move the
+already-advanced successor. For a one-shot it atomically consumes that exact
+unknown occurrence into the existing failed/skipped last-result and finite
+completion/removal postimage. Neither branch executes or replays it.
 
 ### 4.5 Closed internal results and execution context
 These are internal return values, not persisted authorities:
@@ -421,22 +580,27 @@ RecurringClaimResultV1={
   claim:RecurringClaimV1|null, job_postimage:object|null, error:string|null
 }
 ClaimDispositionResultV1={
-  status:"APPLIED"|"NOT_FOUND"|"STALE_CLAIM"|"INVALID_TRANSITION"|
+  status:"APPLIED"|"ALREADY_QUARANTINED"|"NOT_FOUND"|"STALE_CLAIM"|"INVALID_TRANSITION"|
          "LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
   claim_id:UUID4, error:string|null
 }
-ExecutionContextV1={
-  schema:"cron-execution-context-v1",
-  mode:"BUILTIN_RECURRING"|"CHRONOS_RECURRING"|"CANARY",
-  jobs_file_realpath:absolute string, owner_profile:nonempty string,
+ExecutionContextV2={
+  schema:"cron-execution-context-v2", lifecycle_id:UUID4,
+  ingress:"BUILTIN_TICK"|"CLI_TICK"|"CHRONOS_SYNC"|
+    "CHRONOS_GATEWAY_HTTP"|"CHRONOS_DASHBOARD_HTTP"|
+    "MANUAL_TOOL"|"CANARY_CLI",
+  mode:"BUILTIN_RECURRING"|"CHRONOS_RECURRING"|
+    "BUILTIN_ONESHOT"|"CHRONOS_ONESHOT"|"MANUAL"|"CANARY",
+  jobs_file_realpath:absolute canonical string, owner_profile:nonempty string,
   job_id:nonempty string, claim_id:UUID4,
+  claim_field:"recurring_claim"|"run_claim"|"fire_claim",
   owner_pid:positive integer, owner_start_ticks:positive integer,
-  scheduled_for:aware string|null
+  scheduled_for:aware string|null, exact_job_postimage:object
 }
 CronAdmissionResultV1={
   status:"STARTED"|"PRE_API_REFUSED"|"SUBMIT_UNKNOWN"|
          "INVALID_CONTEXT",
-  context:ExecutionContextV1, error:string|null
+  context:ExecutionContextV2, error:string|null
 }
 ChronosExecutionEnvelopeV1={
   schema:"cron-chronos-execution-envelope-v1",
@@ -464,7 +628,8 @@ ChronosFireTargetV1={
 ChronosClaimResultV1={
   status:"CLAIMED"|"GONE"|"DUPLICATE"|"CONFLICT"|"MALFORMED"|
          "LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
-  job_postimage:object|null, execution_context:ExecutionContextV1|null,
+  claim:RecurringClaimV1|OneShotExecutionClaimV1|null,
+  job_postimage:object|null, execution_context:ExecutionContextV2|null,
   execution_envelope:ChronosExecutionEnvelopeV1|null,
   error:string|null
 }
@@ -483,16 +648,16 @@ Only `CLAIMED` has nonnull `claim` and `job_postimage` and null `error`; every
 other claim status has both payloads null and a nonempty error. Only `APPLIED`
 has null disposition error; every other disposition has a nonempty error.
 `COMMIT_UNKNOWN` never licenses submit, retry, finalization, or execution.
-Only Chronos `CLAIMED` has a nonnull postimage, a nonnull immutable execution
-envelope, and null error. Its execution context is nonnull for recurring work
-and null for the unchanged legacy one-shot route; every other Chronos status
+Only Chronos `CLAIMED` has a nonnull postimage, immutable envelope, and exact
+nonnull execution context for recurring or scheduled one-shot work; every other status
 has null postimage, context, and envelope, with null error only for `GONE` and
 `DUPLICATE`. For a recurring claim, the context's `jobs_file_realpath` and the
 persisted claim's `owner_profile` must equal the envelope's paths/profile;
 mismatch is `MALFORMED` and cannot execute. No HTTP branch infers a claim or
 envelope from ambient process state or from an exception.
-For `ExecutionContextV1`, recurring modes require nonnull `scheduled_for`
-equal to the claim; `CANARY` requires null `scheduled_for`. Every field is
+For `ExecutionContextV2`, every scheduled mode requires nonnull
+`scheduled_for` equal to its claim; CANARY and compatible MANUAL require null.
+Every field is
 copied from the committed exact claim and selected store, never supplied by an
 operator. `STARTED` alone has null admission error; every other admission
 result has one nonempty error. `PRE_API_REFUSED` proves the starter was not
@@ -586,36 +751,55 @@ remains for ordinary CRUD but is unreachable from this route.
 its receiver's one-time-bound envelope, enters that exact home, secret, and
 cron-store context, and resets all three in `finally`. It retains the target's
 exact envelope and dispatches inside its selected home/store by the matching
-row's existing schedule class. Recurring uses §4 and validates
-that the returned `ExecutionContextV1`, claim owner profile, postimage ID, and
-jobs-file path equal the envelope before returning `CLAIMED`.
+row's existing schedule class. Recurring and scheduled one-shot use §4 and
+validate the returned `ExecutionContextV2`, claim owner profile, postimage ID,
+and jobs-file path against the envelope before returning `CLAIMED`.
 
 The one-shot branch uses the internal exact-postimage owner:
 ```text
-cron.jobs._claim_job_for_fire_postimage(
-  job_id, *, expected_fire_at:aware string|null,
-  claim_ttl_seconds:int=300
+cron.jobs._claim_scheduled_oneshot_for_fire(
+  job_id, *, expected_fire_at:aware string
 ) -> OneShotFireClaimResultV1
 OneShotFireClaimResultV1={
   status:"CLAIMED"|"NOT_FOUND"|"DISABLED"|"PAUSED"|"DUPLICATE"|
-         "FIRE_AT_MISMATCH"|"LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
-  job_postimage:object|null, error:string|null
+         "FIRE_AT_MISMATCH"|"MALFORMED_AUTHORITY"|"LOCK_UNAVAILABLE"|
+         "COMMIT_UNKNOWN",
+  claim:OneShotExecutionClaimV1|null,
+  job_preimage:object|null, job_postimage:object|null,
+  execution_context:ExecutionContextV2|null, error:string|null
+}
+ManualFireClaimResultV1={
+  status:"CLAIMED"|"NOT_FOUND"|"DISABLED"|"PAUSED"|"DUPLICATE"|
+         "MALFORMED_AUTHORITY"|"LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
+  legacy_claim:object|null, job_postimage:object|null,
+  execution_context:ExecutionContextV2|null, error:string|null
 }
 ```
-With nonnull `expected_fire_at`, it revalidates exact one-shot
+It revalidates exact one-shot
 `next_run_at == expected_fire_at` under the selected store's strict lock before
-performing the existing fire-claim mutation and returns the committed/read-back
-postimage. Only `CLAIMED` has nonnull postimage and null error. Public
+allocating the tagged claim, applying the one finite-repeat increment, and
+returning the committed/read-back postimage and exact context. Only `CLAIMED`
+has nonnull claim/preimage/postimage/context and null error. Every other row
+has null payloads and nonempty error. For the manual result, CLAIMED alone has
+nonnull legacy claim/postimage/context and null error; every other row has null
+payloads and nonempty error. The actual manual-tool path uses
+`cron.jobs._claim_manual_fire_postimage(job_id,claim_ttl_seconds) ->
+ManualFireClaimResultV1`, which returns the exact legacy claim postimage plus a
+nonpersistent MANUAL `ExecutionContextV2`; its finalizer type-strictly compares
+that stored legacy claim before the existing mark. Its context claim_id is an
+in-process UUID tied to `exact_job_postimage.fire_claim`, never a durable claim
+or restart selector. Public
 `cron.jobs.claim_job_for_fire(job_id, *, claim_ttl_seconds=300) -> bool`
-retains its signature and behavior by delegating with
-`expected_fire_at=null` and projecting only `status == "CLAIMED"`; it exposes
-neither the postimage nor the envelope. This adds no one-shot state or
-transition and introduces no unlocked `get_job` reread.
+retains its signature and legacy boolean behavior by projecting this private
+result; `tools.cronjob_tools._execute_job_now` consumes the typed result rather
+than rereading. This compatibility claim is not a scheduled automatic route.
+No scheduled tagged ACTIVE claim is subject to its TTL. There is no unlocked
+`get_job` reread.
 
 `CronScheduler._run_claimed_in_active_store(result, *, adapters, loop) ->
-ManagedRunOutcomeV1` accepts only `CLAIMED`, verifies that the already-active
+ManagedRunOutcomeV2` accepts only CLAIMED, verifies that the already-active
 profile, Hermes home, and jobs-file realpath exactly equal the immutable
-envelope, then invokes `_run_one_job_managed` on the exact postimage; that
+envelope, then invokes `run_registered_execution` on the exact postimage; that
 managed owner performs the one matching finalizer described in §7. The helper
 does not enter or reset context and never rereads or re-arms.
 
@@ -637,7 +821,7 @@ exact instance and auth profile in the target. It never returns or reuses
 either handler's ambient provider.
 
 `CronScheduler.run_claimed(result: ChronosClaimResultV1, *, adapters,
-loop) -> ManagedRunOutcomeV1` validates the complete envelope and recurring
+loop) -> ManagedRunOutcomeV2` validates the complete envelope and scheduled
 context relation and requires its receiver's immutable bound envelope to equal
 the result envelope and its bound auth profile to equal the target retained by
 the shared owner. It then installs the same existing home override, profile
@@ -658,26 +842,30 @@ same four raw Chronos leaves into `ChronosAuthProfileV1`, creates the envelope,
 performs the sole step-5 fresh
 provider load/bind without JWT profile enumeration, and requires the target
 row's exact `(job_id,fire_at)` in that store. For recurring work it invokes
-only that fresh `target.scheduler.claim_due`, passes the exact context and
+only that fresh `target.scheduler.claim_due`; scheduled one-shot uses the exact
+one-shot owner above. Both pass the exact context and
 postimage through `admit_and_start_managed_execution` with an inline-start
-token, and on `STARTED` calls `target.scheduler.run_claimed`; the wrapper
-exact-releases the context in `finally`. It projects `outcome.processed`,
+token, and on STARTED call `run_registered_execution`; that wrapper invokes
+the bound scheduler and exact-releases in `finally`. It projects `outcome.processed`,
 preserving the non-HTTP boolean ABI. It never
 uses the invoked receiver's cached client or ambient profile as target
 authority. Target/config/claim refusal returns false; a post-finalization
 `ChronosRearmError` remains an exception. Both HTTP
 handlers instead receive the already-claimed result from
-`authenticate_and_claim_chronos_fire`. For recurring work they pass its exact
+`authenticate_and_claim_chronos_fire`. For recurring and scheduled one-shot they pass its exact
 context/postimage and a starter that performs
-`asyncio.create_task(asyncio.to_thread(target.scheduler.run_claimed,
-result.claim, adapters=adapters, loop=loop))` to the admission owner. Only
+`asyncio.create_task(cron.scheduler.run_registered_http_execution(
+context, result.claim.job_postimage, scheduler=target.scheduler,
+adapters=adapters, loop=loop))` to
+the admission owner; that coroutine delegates to `to_thread` with
+`run_registered_execution` and implements the pre/post-worker release rule in
+§4.3. Only
 `STARTED` permits 202; `PRE_API_REFUSED` exact-CASes the recurring claim to
-`NOT_SUBMITTED`, while `SUBMIT_UNKNOWN` leaves ACTIVE and returns 503. No
+NOT_SUBMITTED or exact-rolls back a one-shot, while SUBMIT_UNKNOWN leaves
+ACTIVE and returns 503. No
 adapter re-authenticates, reselects, double-claims, or calls the synchronous
-function on its event loop. The unchanged legacy one-shot branch fabricates no
-`ExecutionContextV1`, but still checks CLOSED before task/API entry and uses
-its existing exact stored fire claim; its public ABI, repeat, and recovery stay
-unchanged.
+function on its event loop. One-shot public signatures and finite terminal
+behavior stay unchanged; lease recovery and context omission do not.
 
 `ChronosCronScheduler.run_claimed` is the sole successor re-arm owner. It
 requires its one-time-bound envelope to equal the result, performs the same
@@ -758,7 +946,7 @@ Unicode code points, identical map key sets, list order, and finite-float
 `float.hex()` values, so booleans do not equal integers and `-0.0` does not
 equal `0.0`; the strict JSON reader rejects NaN and infinities.
 After committed claim readback, the CLI builds the exact CANARY
-`ExecutionContextV1` and passes it, the `B+C2` postimage, and an inline-start
+`ExecutionContextV2` and passes it, the `B+C2` postimage, and an inline-start
 token to `admit_and_start_managed_execution`. `PRE_API_REFUSED` starts no
 business action and leaves C2 ACTIVE for exact operator disposition;
 `SUBMIT_UNKNOWN` does the same. Only `STARTED` invokes
@@ -789,49 +977,59 @@ state. Unknown or malformed `fire_claim` values refuse.
 cron.jobs.claim_paused_job_canary(job_id) -> CanaryClaimResultV1
 cron.jobs.finalize_paused_job_canary(job_id, claim_id, *, success, error, delivery_error) -> ClaimDispositionResultV1
 cron.jobs.quarantine_active_execution_after_cleanup_uncertain(
-  context:ExecutionContextV1, *,
+  context:ExecutionContextV2, *,
   cleanup_status:Literal["INCOMPLETE","UNKNOWN"],
-  paused_at:aware string, reason:nonempty string,
+  diagnostic:nonempty string,
 ) -> ClaimDispositionResultV1
 ```
 The canary claim owner derives profile, PID, and birth ticks itself exactly as
 the recurring owner does; no CLI argument can supply execution identity.
 The quarantine owner is an exact-claim CAS under the existing strict jobs
-lock. For a canary it may set only `enabled=false`, `state="paused"`,
-`paused_at`, `paused_reason`, and `last_error`; it preserves every other field
-of `B`, and C2 byte-for-byte with status ACTIVE. In particular C2's embedded
-`captured_job=B` is never rewritten; only the named outer-row pause and
-diagnostic leaves may differ from B.
-For recurring execution it applies the same pause/reason leaves while retaining
-the exact ACTIVE recurring claim. It never clears a fire claim, finalizes,
-completes/removes, advances/re-arms, or retries. A CAS, save, or readback
-uncertainty remains conservative ACTIVE and is surfaced as critical failure.
-After restart, the durable ACTIVE claim blocks another canary, recurrence,
-resume, or trigger. Only the explicit exact dead-owner skip may change it to
-OPERATOR_SKIPPED.
+lock. For a canary it preserves `enabled`, `state`, `paused_at`, and
+`paused_reason` byte-for-byte from B, preserves every other business field,
+and retains C2 byte-for-byte ACTIVE. C2's embedded `captured_job=B` is never
+rewritten. Only outer `last_error` may receive the bounded cleanup diagnostic;
+an exact replay with that same diagnostic is ALREADY_QUARANTINED and makes no
+write, while any unequal retry refuses.
+For recurring or scheduled one-shot execution, first quarantine may set the
+ordinary pause quartet and last_error while retaining its exact ACTIVE claim;
+an already-quarantined row is accepted only byte-identically. It never clears
+a claim, finalizes, completes/removes, advances/re-arms, or retries. CAS, save,
+or readback uncertainty remains conservative ACTIVE and is surfaced as
+critical failure.
+After restart, durable ACTIVE blocks another canary, scheduled occurrence,
+resume, or trigger. Only the explicit exact dead-owner skip may consume it.
 ## 7. Pre-run, managed outcome, and legacy ABI
 The internal source of execution truth is:
 ```text
 cron.scheduler._run_one_job_managed(
   job, *, adapters=None, loop=None, verbose=False,
-  execution_context:ExecutionContextV1|null=None
-) -> ManagedRunOutcomeV1
-ManagedRunOutcomeV1={
-  schema:"cron-managed-run-outcome-v1", job_id:nonempty string,
-  execution_context:ExecutionContextV1|null,
+  execution_context:ExecutionContextV2|null=None
+) -> ManagedRunOutcomeV2
+ContentStatusV1="NONEMPTY"|"WHITESPACE_EMPTY"|"EMPTY_RESPONSE"|"FAILED"
+DeliveryResultV2={
+  status:"NOT_CONFIGURED"|"SUPPRESSED"|"SUPPRESSED_EMPTY"|
+         "DELIVERED"|"FAILED"|"NOT_REQUESTED",
+  error:string|null
+}
+ManagedRunOutcomeV2={
+  schema:"cron-managed-run-outcome-v2", job_id:nonempty string,
+  execution_context:ExecutionContextV2|null,
   admitted:bool, processed:bool,
   cleanup_status:"NOT_APPLICABLE"|"COMPLETE"|"INCOMPLETE"|"UNKNOWN",
   pre_run_status:"NOT_CONFIGURED"|"SUCCESS"|"FAILED",
   agent_status:"NOT_APPLICABLE"|"NOT_RUN"|"SUCCESS"|"FAILED",
+  content_status:ContentStatusV1,
   output_status:"NOT_REQUESTED"|"SAVED"|"FAILED",
   output_path:absolute string|null,
-  delivery_status:"NOT_CONFIGURED"|"SUPPRESSED"|"DELIVERED"|"FAILED",
+  delivery_status:DeliveryResultV2.status,
   delivery_error:string|null,
   finalization_status:"NOT_ATTEMPTED"|"APPLIED"|"REMOVED"|"FAILED",
   error:string|null,
   overall:"REFUSED"|"LEGACY_ALREADY_HANDLED"|"PRE_RUN_FAILED"|
-          "CLEANUP_UNVERIFIED"|"AGENT_FAILED"|"OUTPUT_FAILED"|
-          "DELIVERY_FAILED"|"FINALIZATION_FAILED"|
+          "CLEANUP_UNVERIFIED"|"SHUTDOWN_INTERRUPTED"|"AGENT_FAILED"|
+          "EMPTY_RESPONSE"|"OUTPUT_FAILED"|"DELIVERY_FAILED"|
+          "FINALIZATION_FAILED"|
           "SUCCESS"
 }
 ```
@@ -853,36 +1051,39 @@ Its exact internal constructor is
 `CronScriptCleanupError(message, *, cleanup_status:Literal["INCOMPLETE",
 "UNKNOWN"], original_error:BaseException|null=None)`; every construction site
 must supply the tag from the protocol classification above.
-`admitted=false` requires `processed=false`, neutral/not-attempted stage
-values, and `overall=REFUSED`, except for the one source-existing legacy
+`admitted=false` requires `processed=false`, cleanup NOT_APPLICABLE, pre-run
+NOT_CONFIGURED, agent NOT_APPLICABLE, content FAILED, output/delivery
+NOT_REQUESTED, finalization NOT_ATTEMPTED, and `overall=REFUSED`, except for the one source-existing legacy
 no-op: when `claim_dispatch` proves a `None`-context one-shot was already
 handled or removed, the exact tuple is `admitted=false`, `processed=true`, all
 stages neutral/not-attempted,
 `error="legacy one-shot already handled or removed"`, and
-`overall=LEGACY_ALREADY_HANDLED`. That variant is illegal for recurring or
+`overall=LEGACY_ALREADY_HANDLED`; its stage tuple is the same neutral tuple.
+That variant is illegal for scheduled managed or
 canary context and performs no effect or finalization. `processed` preserves
 the legacy boolean ABI exactly: true includes that historical handled no-op
 and a route that processed the job even if its business result failed; false
 means admission or execution machinery prevented processing in every other
 case.
 
-Managed recurring and canary owners pass exact `ExecutionContextV1` to this
-callable. `None` preserves the complete legacy one-shot/manual path without a
-fabricated claim ID. Running, cleanup, quarantine, interruption, output,
+Every scheduled owner and canary passes exact `ExecutionContextV2` to this
+callable. `None` preserves only the compatible unscheduled/manual path without
+a fabricated claim ID. Running, cleanup, quarantine, interruption, output,
 delivery, and finalization keys for managed calls are
 `(jobs_file_realpath,job_id,mode,claim_id)`. The callable selects exactly one
-finalizer: recurring invokes `finalize_recurring_occurrence`, canary invokes
-`finalize_paused_job_canary`, and `None` invokes unchanged `mark_job_run`.
+finalizer: recurring, scheduled one-shot, and canary invoke their exact-claim
+owners, while `None` invokes compatible `mark_job_run`.
 A managed context never invokes `claim_dispatch` or a second finalizer.
-Canary bypasses `_clear_cleanup_fire_claim`; recurring cannot invoke job-ID-only
+Canary bypasses `_clear_cleanup_fire_claim`; no scheduled route invokes job-ID-only
 claim cleanup. `INCOMPLETE|UNKNOWN` instead invokes only
 `quarantine_active_execution_after_cleanup_uncertain`, sets
-`overall=CLEANUP_UNVERIFIED`, leaves output/delivery not requested/suppressed
+`overall=CLEANUP_UNVERIFIED`, leaves output and delivery NOT_REQUESTED
 and finalization NOT_ATTEMPTED, and returns nonzero with the exact ACTIVE claim
 retained. It cannot fall through to an ordinary finalizer even if shutdown
-also marks the exact context interrupted. Store-side finalizers refuse to
-remove an ACTIVE claim whose exact cleanup-quarantine pause is present, so
-cleanup uncertainty wins in either interleaving.
+also marks the exact context interrupted. The lifecycle phase prevents ordinary
+finalization while cleanup is pending or uncertain; store finalizers
+independently refuse the exact ACTIVE quarantine postimage. Cleanup uncertainty
+therefore wins before and after its CAS.
 For a configured script, `run_job` calls the existing supervised script path
 before importing or constructing `AIAgent`, opening `SessionDB`, resolving a
 model/provider, or building an agent prompt. Script failure returns through
@@ -892,23 +1093,53 @@ SYS-1030 does not reinterpret SYS-666 or make generic canary PASS prove a
 MarketWatch report. SYS-1029 performs its own product-output acceptance.
 Pre-run FAILED requires agent NOT_RUN. Agent NOT_APPLICABLE is
 legal only for the existing script-only/no-agent route after pre-run success.
-NOT_CONFIGURED, NOT_APPLICABLE, NOT_REQUESTED, and SUPPRESSED are neutral, not
-failures. Any FAILED stage makes the command nonzero; delivery success cannot
-mask an earlier failure. `LEGACY_ALREADY_HANDLED` is selected only by its
-closed tuple above and does not participate in failure dominance. Failure
-dominance is refusal, cleanup-unverified, finalization, output,
-pre-run, agent, delivery, then success. Every stage is
-retained even when a higher-priority failure determines `overall`. Invalid or
-contradictory tuples are rejected and never finalized as success.
+The legal content/output/delivery product is total:
+
+| Upstream/content | Output | Delivery | Overall rule |
+|---|---|---|---|
+| exact intentional-silence sentinel produced by the existing `wakeAgent=false` or script-only route | `SAVED` or source-compatible `NOT_REQUESTED` | `SUPPRESSED` | SUCCESS unless another stage failed |
+| agent success with zero bytes | `SAVED` | `SUPPRESSED_EMPTY` | EMPTY_RESPONSE |
+| agent success with whitespace-only bytes | `SAVED` | `SUPPRESSED_EMPTY` | EMPTY_RESPONSE |
+| nonempty success/failure diagnostic, no configured target | `SAVED` | `NOT_CONFIGURED` | preserve upstream result |
+| nonempty eligible body, provider succeeds | `SAVED` | `DELIVERED` | preserve upstream result |
+| nonempty eligible body, provider fails | `SAVED` | `FAILED` | DELIVERY_FAILED only absent earlier failure |
+| any body whose output save fails | `FAILED` | `NOT_REQUESTED` | OUTPUT_FAILED |
+| refusal or cleanup uncertainty before output | `NOT_REQUESTED` | `NOT_REQUESTED` | preserve earlier failure |
+
+WHITESPACE_EMPTY is one or more whitespace bytes; EMPTY_RESPONSE is zero
+bytes. Both are failures even when output is SAVED, and delivery is the
+independent fact SUPPRESSED_EMPTY. FAILED content is a nonempty diagnostic and
+never fabricates agent success; a precontent refusal also carries FAILED with
+output/delivery NOT_REQUESTED. NOT_CONFIGURED, NOT_APPLICABLE,
+NOT_REQUESTED, and SUPPRESSED are neutral facts, not DELIVERED aliases.
+Invalid combinations—including DELIVERED without SAVED/nonempty eligible
+content, delivery error outside FAILED, output path outside SAVED, or SUCCESS
+with empty content—are rejected before success finalization.
+
+Aggregate dominance is REFUSED, CLEANUP_UNVERIFIED, SHUTDOWN_INTERRUPTED,
+FINALIZATION_FAILED, OUTPUT_FAILED, PRE_RUN_FAILED, AGENT_FAILED,
+EMPTY_RESPONSE, DELIVERY_FAILED, then SUCCESS. Every lower-priority stage is
+retained. LEGACY_ALREADY_HANDLED remains only its closed no-effect tuple.
+Cleanup INCOMPLETE/UNKNOWN always selects CLEANUP_UNVERIFIED and exact ACTIVE
+quarantine even when shutdown is requested.
+
+`cron.scheduler._deliver_result_typed(job, content: str, *,
+content_status: ContentStatusV1, adapters=None, loop=None) ->
+DeliveryResultV2` is the sole
+internal delivery producer. Any existing Optional-string helper is only a
+compatibility projection; `None` no longer represents both delivered success
+and absent configuration.
 
 The public compatibility ABI remains source-exact:
 ```text
 cron.scheduler.run_one_job(job, *, adapters=None, loop=None, verbose=False) -> bool
 ```
-It calls `_run_one_job_managed(..., execution_context=None)` and returns only
+It calls `_run_one_job_managed(job, adapters=adapters, loop=loop,
+verbose=verbose, execution_context=None)` for compatible
+unscheduled/manual callers and returns only
 `outcome.processed`. Existing callers therefore retain their current meaning:
 true means processing completed, not that the job business result succeeded.
-Managed recurrence, the canary, and Chronos consume the typed internal result.
+Every scheduled route, the canary, and Chronos consume the typed result.
 The canary maps only `overall=SUCCESS` to exit 0; Chronos consumes the outcome
 before applying its sole successor re-arm rule in §5 and does not mutate it.
 The canary command reports one compact result containing job ID, claim ID,
@@ -925,194 +1156,222 @@ returns it, `main` returns it, and
 the module entry point exits with it. No layer converts a nonzero result to
 success or prints a second authoritative status.
 ## 8. Deployment and SYS-1029 handoff
-### 8.1 Loaded-code and live-process identity
-`cron.scheduler` owns one import-time observation, not a lifecycle store:
+### 8.1 Controlled activation and complete loaded-code identity
+`CronDeploymentExpectationV1` is an opt-in in-memory launch value:
 ```text
-LoadedSchedulerBuildIdentityV1={
-  schema:"hermes-loaded-scheduler-build-v1",
-  scheduler_module_realpath:absolute string,
-  checkout_root_realpath:absolute string,
-  git_oid:40 lowercase hex
+H40=exactly 40 lowercase hexadecimal characters
+CronProcessRoleV1="GATEWAY"|"DASHBOARD"|"DESKTOP_PRIMARY"|
+  "DESKTOP_PROFILE"|"CLI_TICK"|"CLI_MANUAL"
+CronDeploymentExpectationV1={
+  schema:"hermes-cron-deployment-expectation-v1", expected_git_oid:H40,
+  expected_process_role:CronProcessRoleV1,
+  expected_profile:nonempty string,
+  expected_home_realpath:absolute canonical string,
+  expected_jobs_file_realpath:absolute canonical string,
+  expected_provider_name:nonempty lowercase string
 }
-LoadedSchedulerBuildResultV1={
-  schema:"hermes-loaded-scheduler-build-result-v1",
-  status:"AVAILABLE"|"UNAVAILABLE",
-  identity:LoadedSchedulerBuildIdentityV1|null,
-  reason:null|"MODULE_PATH_UNAVAILABLE"|"MODULE_NOT_REGULAR"|
-    "UNSTABLE_MODULE"|"CHECKOUT_UNAVAILABLE"|"DIRTY_CHECKOUT"|
-    "MODULE_UNTRACKED"|"MODULE_BLOB_MISMATCH"|"GIT_TIMEOUT"|"GIT_FAILED"
-}
-cron.scheduler._capture_loaded_scheduler_build_identity()
-  -> LoadedSchedulerBuildResultV1
-cron.scheduler.get_loaded_scheduler_build_identity()
-  -> LoadedSchedulerBuildResultV1
 ```
-Capture runs exactly once while `cron.scheduler` is imported; the result is
-then immutable in that module. It resolves `__file__`, requires an ordinary
-nonsymlink file, records `(st_dev,st_ino,st_size,st_mtime_ns)`, and with stdin
-`DEVNULL`, timeout 5.0 seconds, and exact environment
-`{PATH:os.defpath,LC_ALL:"C",LANG:"C",GIT_OPTIONAL_LOCKS:"0"}` runs only:
-```text
-git -C <module-parent> rev-parse --show-toplevel
-git -C <checkout> rev-parse --verify HEAD^{commit}
-git -C <checkout> status --porcelain=v1 -z --untracked-files=all
-git -C <checkout> ls-files --error-unmatch -- <relative-module-path>
-git -C <checkout> hash-object -- <scheduler-module-realpath>
-git -C <checkout> rev-parse --verify HEAD:<relative-module-path>
-```
-The root and module paths must be canonical, the module strictly below the
-root, status stdout zero bytes, and the two blob OIDs one equal lowercase
-40-hex LF line. The post-command lstat tuple must equal the pre-command tuple.
-Command/shape/timeout failures return the corresponding `UNAVAILABLE` reason.
-Blob values are compared and discarded. `git_oid` identifies code observed by
-the executing imported module, not a later `HEAD`. Import may continue on
-failure. `AVAILABLE` and `UNAVAILABLE` are observations only and neither is a
-gateway-readiness, adapter, cron-provider, or scheduler-admission condition.
+`gateway run`, `dashboard`, `serve`, `cron tick`, `cron run`, and canary accept
+the same six all-or-none `--cron-deployment-expect-{oid,role,profile,home,
+jobs-file,provider}` flags. Partial/duplicate/malformed/relative/extra values
+are argparse exit 2. Parsers pass one immutable object in memory; no env,
+config, file, READY marker, or runtime status is expectation authority.
 
-`GatewayRunner.start` obtains exact
-`launch_profile=get_active_profile_name() or "default"` after the event loop
-and PID exist and before adapter readiness or cron-provider startup, then
-calls `gateway.status.capture_running_build_identity(launch_profile)` exactly
-once. It consumes only the immutable loaded result; it never invokes Git or
-reconstructs an OID:
+Without the expectation, `CronExecutionLifecycleV1` initializes OPEN and
+ordinary packaged, dirty, non-Git, non-Linux, gateway, dashboard, desktop,
+provider, messaging, and manual behavior is unchanged. With it, the same
+lifecycle initializes CLOSED before adapter/API/provider construction.
+`verify_and_open_activation(expected, observed)` under `_running_lock` changes
+CLOSED -> OPEN only for exact VERIFIED while shutdown is absent; mismatch,
+unavailability, or shutdown remains CLOSED. Every claim-capable route calls
+`require_admission(route,activation_id:UUID4|null)` before jobs-store open, claim,
+registration, provider start, task/thread/Popen, or HTTP 202. Closed gateway/
+dashboard HTTP is 503; controlled cron commands exit 4; the tool returns its
+structured failure. Messaging, readiness, health, and non-cron APIs remain
+ordinary. With no expectation, OPEN accepts null observation identity; with an
+expectation, only its matching VERIFIED activation ID passes. `served_profiles`
+is never cron authority.
+
 ```text
-RunningBuildIdentityV2={
-  schema:"hermes-running-build-identity-v2",
-  launch_profile:nonempty string,
+LoadedCronModuleV1={
+  role:"PROCESS_ENTRY"|"STORE"|"ORCHESTRATOR"|"RESOLVER"|
+    "PROVIDER_LOADER"|"SELECTED_PROVIDER"|"HTTP_OWNER"|"MANUAL_OWNER",
+  module_name:nonempty dotted string,
+  module_realpath:absolute canonical string,
+  checkout_root_realpath:absolute canonical string,
+  relative_path:canonical repository-relative string,
+  git_oid:H40, git_blob_oid:H40
+}
+CronActivationIdentityV1={
+  schema:"hermes-cron-activation-identity-v1", activation_id:UUID4,
+  process_role:CronProcessRoleV1,
   pid:positive integer, process_start_ticks:positive integer,
-  executable_realpath:absolute string,
-  loaded_scheduler:LoadedSchedulerBuildIdentityV1
+  executable_realpath:absolute canonical string,
+  profile:nonempty string, home_realpath:absolute canonical string,
+  jobs_file_realpath:absolute canonical string,
+  provider_name:nonempty lowercase string,
+  routes:nonempty sorted unique list of "BUILTIN_TICK"|"PROVIDER_SYNC"|
+    "GATEWAY_CHRONOS_HTTP"|"DASHBOARD_CHRONOS_HTTP"|"CLI_TICK"|
+    "CLI_MANUAL"|"CANARY",
+  modules:nonempty list[LoadedCronModuleV1]
 }
-RunningBuildIdentityResultV2={
-  schema:"hermes-running-build-identity-result-v2",
-  status:"AVAILABLE"|"UNAVAILABLE",
-  identity:RunningBuildIdentityV2|null,
-  reason:null|"PROFILE_UNAVAILABLE"|"PROCESS_ID_UNAVAILABLE"|
-    "PROCESS_START_UNAVAILABLE"|"EXECUTABLE_UNAVAILABLE"|
-    "LOADED_SCHEDULER_UNAVAILABLE"
+CronActivationResultV1={
+  schema:"hermes-cron-activation-result-v1",
+  status:"VERIFIED"|"UNAVAILABLE"|"MISMATCH",
+  identity:CronActivationIdentityV1|null,
+  reason:null|"PROCESS_IDENTITY_UNAVAILABLE"|"MODULE_UNAVAILABLE"|
+    "MODULE_NOT_REGULAR"|"MODULE_UNTRACKED"|"DIRTY_CHECKOUT"|
+    "MODULE_BLOB_MISMATCH"|"MIXED_CHECKOUT"|"MIXED_OID"|
+    "PROVIDER_AMBIGUOUS"|"EXPECTATION_MISMATCH"|"SHUTDOWN_CLOSED"
 }
-```
-It adds the live PID, Linux `/proc/<pid>/stat` field 22, and
-`/proc/<pid>/exe`, then passes the typed result to existing
-`write_runtime_status(running_build_identity=...)`. Every later status write
-preserves that member; restart replaces it. A missing loaded observation or an
-exception while adding process evidence is caught and published as typed
-`UNAVAILABLE` with `LOADED_SCHEDULER_UNAVAILABLE` or the corresponding exact
-process reason. It must not alter ordinary gateway readiness, adapter startup,
-cron-provider startup, or scheduler admission. This keeps packaged/non-Git,
-dirty development, non-Linux, and transient-Git-failure startup behavior
-unchanged while making the evidence failure visible.
-The existing runtime status file is an observation transport only: no
-scheduler, claim, repair, resume, or recovery path reads it, and a stale record
-is never accepted. No new file/store/READY/VCS authority is created.
-
-The strict deployment reader and result are:
-```text
-gateway.status.read_live_running_build_identity(
-  *, required_served_profile:str, expected_git_oid:str
-) -> GatewayBuildIdentityCheckV1
-GatewayBuildIdentityCheckV1={
-  schema:"hermes-gateway-build-identity-check-v1",
+CronActivationCheckV1={
+  schema:"hermes-cron-activation-check-v1",
   status:"VERIFIED"|"NOT_RUNNING"|"UNAVAILABLE"|"MISMATCH",
-  required_served_profile:nonempty string,
-  expected_git_oid:40 lowercase hex,
-  identity:RunningBuildIdentityV2|null,
+  identity:CronActivationIdentityV1|null,
   reason:null|"RUNTIME_STATUS_MISSING"|"RUNTIME_STATUS_INVALID"|
-    "GATEWAY_NOT_RUNNING"|"PID_REUSED"|"PROCESS_IDENTITY_UNREADABLE"|
-    "GATEWAY_COMMAND_MISMATCH"|"BUILD_UNAVAILABLE"|
-    "PROFILE_NOT_SERVED"|"OID_MISMATCH"
+    "PROCESS_NOT_RUNNING"|"PID_REUSED"|"PROCESS_IDENTITY_UNREADABLE"|
+    "COMMAND_MISMATCH"|"ACTIVATION_UNAVAILABLE"|"EXPECTATION_MISMATCH"
 }
 ```
-On controlled Linux it requires runtime state `running`, a live PID, fresh
-`/proc/<pid>/{stat,cmdline,exe}`, exact PID/start/executable equality,
-`looks_like_gateway_runtime_command_line`, the requested cron profile in
-`{identity.launch_profile} union runtime.served_profiles`, and frozen loaded
-OID equal to `expected_git_oid`. Missing/unreadable evidence fails closed; no
-persisted-command fallback exists. Only `VERIFIED` has nonnull identity and
-null reason. Other rows have null identity except `MISMATCH`, which may return
-the observed identity, and exactly one reason.
 
-The always-available CLI owner is
-`hermes_cli/gateway.py::gateway_build_identity_command`, parsed in
-`hermes_cli/subcommands/gateway.py` and propagated by
-`hermes_cli/main.py::cmd_gateway`:
+VERIFIED alone has nonnull identity and null reason. UNAVAILABLE has null
+identity and one availability reason. MISMATCH may carry the observed identity
+and has exactly one mismatch reason. For `CronActivationCheckV1`, VERIFIED has
+nonnull identity/null reason; NOT_RUNNING and UNAVAILABLE have null identity
+and one matching reason; MISMATCH may return observed identity and has one
+mismatch reason. No other combination is constructible.
+
+`cron.scheduler_provider.resolve_and_capture_cron_activation(
+expectation:CronDeploymentExpectationV1|null, *, process_role,profile,home,
+jobs_file,routes) -> CronActivationResultV1` is the sole constructor. Under the
+exact profile/home/store scope, after one provider is resolved but before it
+starts or claims, it eagerly imports and attests applicable modules: always
+`cron.jobs` STORE, `cron.scheduler` ORCHESTRATOR, and
+`cron.scheduler_provider` RESOLVER/ builtin SELECTED_PROVIDER; named providers
+also include `plugins.cron_providers` PROVIDER_LOADER and exact
+`provider.__class__.__module__` (Chronos concrete module); each reachable
+process/HTTP/manual entry is included under its role.
+
+Every module must be an ordinary nonsymlink file with stable pre/post
+`(st_dev,st_ino,st_size,st_mtime_ns)`, canonical tracked path, empty porcelain
+including untracked, and `hash-object(file)==HEAD:<relative_path>`. All rows
+share one checkout and H40 HEAD. Provider instance/class/module is unique and
+equals `provider_name`; aliases deduplicate only for identical module object,
+canonical path, blob, and OID. Missing/stale/mixed/ambiguous evidence is never
+partial VERIFIED.
+
+Gateway activation binds only its launch profile/home/jobs/provider. Messaging
+secondary adapters do not activate cron. Each Electron primary or pooled
+profile `serve` process has its own activation. A plain dashboard has no local
+ticker but its Chronos HTTP ingress is an activation route. Dashboard-selected
+HTTP, CLI tick/manual/canary each capture their exact scoped activation before
+claim. Existing runtime status may mirror the observation, but claims/retry/
+restore never read it as authority. The exact gateway verifier is:
+
 ```text
-hermes --profile <gateway-launch-profile> gateway build-identity \
-  --require-served-profile <cron-profile> --expect-oid <40hex>
+gateway.status.read_live_cron_activation(
+  expectation:CronDeploymentExpectationV1
+) -> CronActivationCheckV1
+hermes --profile <launch-profile> gateway build-identity \
+  --expect-oid <H40> --require-role GATEWAY \
+  --require-profile <cron-profile> --require-home <absolute-home> \
+  --require-jobs-file <absolute-jobs-file> --require-provider <name>
 ```
-It prints exactly one compact sorted-key `GatewayBuildIdentityCheckV1` plus LF
-and no other stdout. Exit is `0=VERIFIED`, `3=NOT_RUNNING`, `4=UNAVAILABLE`,
-`5=MISMATCH`; argparse remains 2. It works when the optional API Server is
-disabled. `GET /health/detailed`, when configured, may mirror the result but
-is never the deployment verifier or prerequisite.
+
+It fresh-checks owner-local PID/start/cmdline/executable and exact activation,
+prints one compact sorted-key `CronActivationCheckV1` plus LF, and exits 0
+VERIFIED, 3 NOT_RUNNING, 4 UNAVAILABLE, 5 MISMATCH; argparse remains 2.
+Optional API health may mirror but never substitutes.
 
 ### 8.2 Canonical source, deployed bytes, activation, and rollback
-One operator uses isolated proof homes below
-`/home/linux/.hermes/test/sys1030/`; no production job or delivery is run.
-Fresh-fetch and validate exactly:
+One operator uses isolated proof homes below `/home/linux/.hermes/test/sys1030/`;
+no production job or delivery is run. Fresh-fetch from exactly:
 ```text
 Hermes origin URL = https://github.com/kendeng300/hermes-agent.git
 Hermes source ref = refs/heads/main
 Hermes tracking ref = refs/remotes/origin/main
+Hermes candidate ref = refs/heads/fix/sys1030
+Hermes candidate tracking ref = refs/remotes/origin/fix/sys1030
 MarketWatch origin URL = https://github.com/kendeng300/marketwatch.git
 MarketWatch source ref = refs/heads/master
 MarketWatch tracking ref = refs/remotes/origin/master
+MarketWatch candidate ref = refs/heads/fix/sys1030
+MarketWatch candidate tracking ref = refs/remotes/origin/fix/sys1030
 ```
-For each source checkout, `git remote get-url --all origin` must exit zero and
-return one LF-terminated line equal byte-for-byte to its literal URL. URL
-rewriting, SSH alias, multiple URL, absent `.git`, or another remote name
-refuses. With stdin `DEVNULL`, timeout 60 seconds, and environment
-`{PATH:os.defpath,LC_ALL:"C",LANG:"C",GIT_OPTIONAL_LOCKS:"0"}`, execute
-`git -C <source> fetch --no-tags origin <source-ref>:<tracking-ref>`.
-Nonzero/timeout/auth diagnostic/missing ref/rejected tracking update refuses;
-no stale tracking ref substitutes. Define from one lowercase 40-hex LF line:
+Each origin is one exact LF-terminated URL; SSH/rewriting/multiple/absent Git
+refuses. With stdin DEVNULL, 60-second timeout, and
+`{PATH:os.defpath,LC_ALL:"C",LANG:"C",GIT_OPTIONAL_LOCKS:"0"}`, fetch each
+candidate ref and canonical ref without stale fallback. Define:
 ```text
-Mmw = git -C <MW-source> rev-parse --verify refs/remotes/origin/master^{commit}
-Mh  = git -C <Hermes-source> rev-parse --verify refs/remotes/origin/main^{commit}
-Dmw = git -C /home/linux/.hermes/scripts rev-parse --verify HEAD^{commit}
-Dh  = git -C /home/linux/.hermes/hermes-agent rev-parse --verify HEAD^{commit}
+GitReleaseIdentityV1={
+  repository:"HERMES"|"MARKETWATCH", origin_url:literal HTTPS URL,
+  candidate_ref:full refs/heads string,
+  canonical_ref:"refs/heads/main"|"refs/heads/master",
+  tracking_candidate_ref:full refs/remotes/origin string,
+  tracking_canonical_ref:full refs/remotes/origin string,
+  candidate_oid:H40, reviewed_remote_oid:H40,
+  merged_oid:H40, deployed_oid:H40
+}
+Hermes: Ch=candidate; Rh=fresh remote candidate; Mh=fresh merged main;
+        Dh=deployed HEAD; R=each live role identity
+MarketWatch: Cmw=candidate; Rmw=fresh remote candidate;
+             Mmw=fresh merged master; Dmw=deployed HEAD
 ```
-The reviewed correction commits must be ancestors of `Mmw` and `Mh`.
+The exact reviewed identities satisfy `Ch==Rh`, `Cmw==Rmw`; approval names
+those OIDs. QA names exact merged `Mh/Mmw`; `Rh<=Mh` and `Rmw<=Mmw` are
+ancestor-or-equal. Clean deployments require `Dh==Mh`, `Dmw==Mmw`, empty
+porcelain including untracked, and exact deployed tracked blobs. Every live
+role-module R equals Dh. Ancestry alone, clean HEAD alone, scheduler-only
+identity, or messaging health never substitutes. `evidence_only_exclusions=[]`.
 
-The only valid order is:
+The source-derived host evidence is:
+```text
+ExecutorHostV1={
+  role:CronProcessRoleV1, entrypoint:nonempty qualified name,
+  resident:bool, claim_routes:nonempty sorted unique list,
+  owner_stop_proof:nonempty qualified owner
+}
+ExecutorHostEvidenceV1={
+  role:CronProcessRoleV1, status:"STOPPED"|"VERIFIED",
+  pid:positive integer|null, process_start_ticks:positive integer|null,
+  activation:CronActivationIdentityV1|null
+}
+```
+Exact host rows are:
 
-1. Freeze `Mmw` and `Mh` using the source checks above. Capture the current
-   deployed `Dmw_pre` and `Dh_pre` only for ordinary operator rollback.
-2. Preflight the live store read-only: builtin scheduling, AMC and Daily remain
-   paused, CCI/BB/MACD remain enabled/scheduled, no malformed/ACTIVE claim, and
-   enabled targets lie beyond the bounded deployment window. Otherwise stop
-   before deployment and mutate no job.
-3. Deploy MarketWatch first from the reviewed canonical bytes. Before any
-   Hermes restart/provider start require `Dmw==Mmw`, zero bytes from
-   `git -C /home/linux/.hermes/scripts status --porcelain=v1 -z
-   --untracked-files=all`, all seven §3.0 writer paths tracked at `Dmw`, and the
-   writer fixed-point plus targeted writer/watchdog/restore proofs against
-   those deployed bytes. Old/dirty/untracked-shadow/missing writer evidence
-   refuses. Recheck the equality and cleanliness immediately before Hermes
-   activation; a TOCTOU change refuses.
-4. Only after step 3, deploy Hermes, require `Dh==Mh` and equally empty
-   porcelain output, then restart the configured gateway. This restart/provider
-   startup is the first activation point for corrected recurring claims.
-5. Invoke the public build-identity command and require exit 0 with frozen
-   `identity.loaded_scheduler.git_oid==Dh==Mh`, exact launch profile, and exact
-   product cron profile served. Checkout equality without this live result is
-   failure.
-6. Re-read the five product rows without mutation. Hand
-   `{Mmw,Dmw,Mh,Dh,GatewayBuildIdentityCheckV1}` and the public canary contract
-   in the ordinary deployment transcript to SYS-1029. SYS-1029 alone runs
-   product canaries/observations and decides product-job resume.
+| Role | Entrypoint/routes | Existing stop proof |
+|---|---|---|
+| GATEWAY | `gateway.run.start_gateway`; builtin, provider sync, gateway Chronos HTTP | gateway PID/start/lock owner |
+| DASHBOARD | `hermes_cli.web_server.start_server/_lifespan`; dashboard Chronos HTTP | foreground/supervisor child handle |
+| DESKTOP_PRIMARY | Electron `startHermes` -> `hermes serve`; builtin, provider sync, dashboard HTTP | `hermesProcess` handle |
+| DESKTOP_PROFILE | Electron `spawnPoolBackend` -> `hermes --profile P serve`; same routes | `backendPool[P].process` handle |
+| CLI_TICK | `hermes_cli.cron` tick | invoking process handle |
+| CLI_MANUAL | `tools.cronjob_tools._execute_job_now` plus canary | invoking process handle |
 
-If a source, preflight, deployment, clean-tree, writer, startup, or live check
-fails, perform no claim/canary/resume/product action. Before Hermes activation,
-the corrected MarketWatch writer disposition may safely remain deployed; an
-operator rollback to `Dmw_pre` is permitted only after the same read-only
-no-ACTIVE-claim check. After ordinary Hermes startup, a failed or unavailable
-build-identity check leaves its readiness, adapters, providers, and scheduler
-behavior unchanged but withholds SYS-1030 deployment acceptance and every
-SYS-1029 handoff. The operator may retain the safer MarketWatch writers and
-redeploy/restart only the exact clean `Dh_pre` or corrected `Mh` through the
-same checks; never mix an old MarketWatch writer tree with active new claim
-semantics. No automated rollback or local lifecycle record is introduced.
+STOPPED requires null process fields and the existing role owner to terminate
+and wait its exact known PID/start/child handle. VERIFIED requires all process
+fields and matching activation. The resident set is gateway, standalone
+dashboard, Electron desktop primary, and every Electron profile backend; no
+host scan is allowed. Gateway verification never covers dashboard/desktop.
+CLI tick/manual/canary are nonresident and are not invoked during deployment.
+
+The only valid order is: (1) bind fresh candidate/review identities; (2) merge
+and QA exact Mh/Mmw; (3) read-only no-ACTIVE/no-due store preflight; (4) close
+and drain every resident host; (5) deploy MW first and prove Dmw==Mmw, the
+seven writers/callers and clean tree; (6) deploy Hermes and prove Dh==Mh;
+(7) start each intended host with its controlled expectation and cron CLOSED;
+(8) capture complete activation and atomically OPEN only on VERIFIED, then
+start provider; (9) strict live CLI proves every R==Dh; (10) reread stores
+without mutation and hand `{Ch,Rh,Mh,Dh,Cmw,Rmw,Mmw,Dmw,activations}` to
+SYS-1029. SYS-1030 performs no product canary/pause/resume.
+
+Failure before OPEN leaves hosts stopped or cron CLOSED and causes zero claim.
+Stop an exact controlled process by owner PID/start evidence. Manual rollback
+deploys the previously reviewed clean pair only while admission is CLOSED,
+contexts DRAINED, and no ACTIVE claim exists, then repeats the same verification.
+After OPEN, close/drain first. Never reset a claim, mix an old MW writer with
+new claim semantics, or restart unverified bytes. Ordinary launch without an
+expectation remains non-gating.
 
 Current production state is an observation, not a desired-state manifest:
 only `9e059716170c` and `20c3fd791e82` are paused; `cci_precompute_runner`,
@@ -1123,7 +1382,8 @@ Hermes production edits: `cron/jobs.py`, `cron/scheduler.py`,
 `gateway/platforms/api_server.py::_handle_cron_fire`,
 `hermes_cli/web_server.py::cron_fire_webhook`,
 `hermes_cli/subcommands/cron.py`, `hermes_cli/cron.py`,
-`hermes_cli/subcommands/gateway.py`, `hermes_cli/gateway.py`,
+`hermes_cli/subcommands/gateway.py`, `hermes_cli/subcommands/dashboard.py`,
+`hermes_cli/gateway.py`,
 `hermes_cli/main.py`, `tools/cronjob_tools.py`, `gateway/run.py`,
 `gateway/status.py`, `gateway/platforms/api_server.py`,
 `agent/curator_backup.py`, `hermes_cli/backup.py`, and the Chronos contract doc.
@@ -1142,14 +1402,49 @@ and root/shipped `_extract_backup.py`. Root/shipped `restore.sh` are inspected
 transitive callers and need no content edit once the shared extractor behavior
 is corrected. Root/shipped `recovery/restore_crons_from_manifest.py` remain
 read-only and unchanged.
+
+### 9.1 R4 source-derived manifests and fixed point
+
+Expected membership comes from independent pinned-source walks, never this
+proposal or generated tests. Exact hosts are gateway (`start_gateway`),
+desktop dashboard (`web_server._lifespan`), gateway API Chronos, dashboard HTTP
+Chronos, and manual/CLI owners. Exact routes are the ten routes in §4.3. Exact
+module seed is `cron/jobs.py`, `cron/scheduler.py`,
+`cron/scheduler_provider.py`, provider loader and selected provider,
+`gateway/run.py`, `gateway/platforms/api_server.py`,
+`hermes_cli/web_server.py`, `hermes_cli/cron.py`, `hermes_cli/main.py`,
+`hermes_cli/gateway.py`, both gateway/dashboard parser modules, and
+`tools/cronjob_tools.py`. Store/archive closure additionally contains
+`agent/curator_backup.py`, `hermes_cli/backup.py`, and the seven MarketWatch
+writers plus both restore callers.
+
+The conserved resource identity is `(profile,canonical home,canonical
+jobs-file,provider,host route)` over default and every valid named profile.
+Archive forms are root, accepted common prefix plus root, and named-profile
+jobs paths from §3.1. Cuts are preclaim; postclaim/preregistration;
+postregistration/pre-API; API-entered/unknown; accepted/preworker;
+worker-started; result-created; cleanup-classified; pre/post-quarantine;
+shutdown close/snapshot/containment; pre/post-finalizer; pre/post-release; and
+cold restart. Outer HTTP cancellation and thread completion remain distinct.
+
+Perform a forward walk from every host/route through claim, admission,
+execution, output/delivery, finalization, release, shutdown, archive,
+deployment, and handoff. Independently reverse-walk from every jobs write,
+submit/start, result/output/delivery, release, interruption/finalization,
+archive destination, provider-start/admission-open, deployed/running identity,
+and acceptance sink. Iterate union to exact set equality. Each reachable cell
+records `{host,route,module,store/profile,archive form,cut,generation,preimage,
+sole owner,postimage,typed result/exit,consumer,negative test}`. An exclusion
+names its source locator and reachability proof. Equivalence requires the same
+owner/read-set/write-set/result and retains entry/exit witnesses plus MC/DC.
 Required isolated proofs include:
-- `tests/cron/test_scheduler_shutdown.py::test_shutdown_admission_cut_is_total_for_builtin_chronos_and_canary`
-  runs BUILTIN_RECURRING, CHRONOS_RECURRING, and CANARY across barriers before/
-  after claim save, context registration, API entry, API acceptance, and first
-  business action. Close-before-admit calls no starter; admit-before-close is
-  in the exact snapshot; synchronous API error is `SUBMIT_UNKNOWN`, never
-  `NOT_SUBMITTED`; deleting the shared lock/registration/context leaf makes the
-  test RED;
+- `tests/cron/test_scheduler_shutdown.py::test_all_modes_share_one_lifecycle_and_exact_shutdown_cut`
+  runs builtin/Chronos recurring and scheduled one-shot, both HTTP hosts,
+  canary, and compatible manual fire across claim, registration, API,
+  cancellation, first-effect, cleanup, finalization, release, and restart
+  barriers. Close-before-admit calls no starter; admit-before-close is in the
+  exact snapshot; post-API error is never NOT_SUBMITTED. Deleting the lock,
+  context leaf, worker-owned release, or cleanup phase makes the test RED;
 - `tests/gateway/test_cron_active_work_drain.py::test_shutdown_kill_uses_pre_kill_exact_context_snapshot`
   barriers immediately before `kill_all`, removes occurrence N and admits no
   successor after close, and proves `mark_running_jobs_interrupted` receives
@@ -1159,7 +1454,8 @@ Required isolated proofs include:
 - `tests/cron/test_canary.py::test_cleanup_result_conserves_active_canary_across_restart`
   covers COMPLETE/INCOMPLETE/UNKNOWN and every quarantine save/readback/restart
   cut. COMPLETE uses the ordinary exact finalizer; INCOMPLETE/UNKNOWN return
-  exit 3, preserve the pause plus byte-exact ACTIVE claim/captured base, and
+  exit 3, preserve each original enabled/state/paused_at/paused_reason leaf plus
+  byte-exact ACTIVE claim/captured base, and
   refuse a second canary/resume after cold read. Routing canary through
   `_clear_cleanup_fire_claim` is the mutation RED;
 - `tests/cron/test_jobs.py::test_operator_skipped_second_canary_has_exact_base_and_postimage`
@@ -1167,10 +1463,11 @@ Required isolated proofs include:
   final postimage. It mutates each non-C1 field, installs a foreign claim, and
   covers pre/post/unknown commit plus restart; comparing against the C1-bearing
   row or deleting arbitrary claim data is RED;
-- `tests/cron/test_jobs.py::test_due_selection_is_read_only_for_recurring_and_preserves_locked_one_shot_preparation`
-  proves recurring selection byte-read-only while one-shot legacy claim
-  recovery, exhaustion removal, save/readback, dispatch, and restart remain
-  unchanged;
+- `tests/cron/test_jobs.py::test_scheduled_oneshot_claim_and_repeat_postimage_are_exact_for_builtin_and_chronos`
+  proves recurring selection byte-read-only and both one-shot fields receive
+  one tagged claim plus exact finite increment before submit. Pre-API rollback,
+  post-API ACTIVE retention, malformed refusal, no TTL replay, operator skip,
+  terminal removal, cold restart, and unchanged public booleans are crossed;
 - `tests/cron/test_jobs_crossprocess_lock.py::test_every_jobs_writer_uses_one_strict_conservation_owner`
   drives every `cron/jobs.py` mutation entry, curator restore, and all three
   backup restore/import entries through two-process barriers; the lock loser
@@ -1178,15 +1475,12 @@ Required isolated proofs include:
   injected lock open/flock/timeout failure leaves exact prior bytes;
 - nested same-store write works, cross-store nesting refuses, public `save_jobs`
   acquires strict ownership, and `_save_jobs_unlocked` without it refuses;
-- `tests/hermes_cli/test_backup.py::test_jobs_import_and_all_restore_paths_replace_or_refuse_under_active_claim`
-  proves exact inactive-row replacement for `run_import` and quick restore;
-  fresh in-lock strictly-greater count replacement for emptied-store recovery;
-  no action for its missing/unreadable/malformed/equal/lower count cases; and
-  whole-member refusal for duplicate IDs, malformed shape, a candidate claim,
-  or deletion/change of any live ACTIVE, legacy, unknown, or malformed claim.
-  A pre-lock concurrent mutation, readback failure, and exact second-call
-  idempotence are covered for all three paths, with no partial jobs-member
-  write;
+- `tests/hermes_cli/test_backup.py::test_import_normalizes_default_and_named_profile_jobs_members`
+  crosses root/two named stores, both prefixes, duplicate-normalized target,
+  traversal, bad/unknown profile, malformed member, ACTIVE conflict,
+  concurrent mutation, second-store refusal, and readback uncertainty. It
+  proves per-store COMPLETE/PARTIAL/COMMIT_UNKNOWN without false cross-store
+  atomicity. Quick/emptied restore retain their one current-store rules;
 - `tests/agent/test_curator_backup.py::test_restore_cron_skill_links_preserves_active_and_concurrent_fields`
   and `tests/cron/test_rewrite_skill_refs.py::test_rewrite_preserves_active_execution_envelope`
   mutate a non-skill field at the barrier and prove only intended skill leaves
@@ -1212,6 +1506,14 @@ Required isolated proofs include:
   B. Invalid/expired/wrong-purpose/wrong-audience tokens and malformed headers
   produce zero jobs-store opens; strict body cases cover duplicate/extra/
   missing keys and malformed, naive, before/equal/after `fire_at` values;
+- those two files also prove the registered worker wrapper releases once on
+  success, execution error, re-arm error, cancellation before worker entry,
+  and outer cancellation after worker entry; the latter retains registration
+  until the real thread exits;
+- `tests/hermes_cli/test_web_server.py::test_dashboard_lifespan_closes_and_drains_ticker_and_http`
+  covers desktop ticker present/absent and hosted webhook work, asserting
+  close-before-stop/cancel, provider stop, bounded join, UNKNOWN quarantine,
+  and zero admission after close;
 - `tests/cron/test_scheduler_provider.py::test_authenticate_then_selects_only_verified_profile_stores`
   covers zero/one/multiple profiles, same and different auth tuples, one
   verifier invocation per distinct tuple, ineligible raw configs, and exact ID
@@ -1240,8 +1542,11 @@ Required isolated proofs include:
   scope, never another profile or process-global environment;
 - `tests/cron/test_jobs.py::test_claim_job_for_fire_public_bool_and_internal_postimage`
   proves the public signature/boolean behavior is unchanged while the internal
-  owner returns the exact committed one-shot postimage, and exact `fire_at`
-  mismatch writes zero bytes;
+  manual owner returns exact legacy postimage/context;
+  `tests/tools/test_cronjob_run_immediate.py::test_manual_fire_uses_exact_registered_context`
+  proves the actual tool consumes it through release with no reread. The
+  scheduled Chronos owner returns its tagged claim/context and exact
+  `fire_at` mismatch writes zero bytes;
 - `tests/cron/test_scheduler_provider.py::test_chronos_run_claimed_rearms_exactly_once_after_finalization`
   uses a mocked NAS/`_arm_one_shot` boundary to prove synchronous and HTTP
   paths use the same owner, re-arm the exact successor once after exact
@@ -1255,10 +1560,14 @@ Required isolated proofs include:
   after pre-run failure;
 - command exit survives parser through process boundary;
 - `tests/cron/test_scheduler.py::test_managed_run_outcome_failure_dominance_and_legacy_bool_wrapper`
-  exercises every legal stage/null combination and failure dominance,
+  exercises every legal content/output/delivery/finalization row and invalid
+  complement, including zero-byte and whitespace-only SAVED plus
+  SUPPRESSED_EMPTY and nonzero EMPTY_RESPONSE, and failure dominance,
   including the source-existing `LEGACY_ALREADY_HANDLED` true no-op; legacy
   `run_one_job` returns `processed` while canary and Chronos consume `overall`;
-- legacy one-shot success, failure, exhaustion, and restart remain unchanged;
+- scheduled one-shot success/failure/exhaustion/removal remain behaviorally
+  unchanged, while tagged ACTIVE blocks TTL restart/replay and exact context
+  participates in shutdown;
 - MarketWatch `tests/test_market_holiday_manager.py` and
   `scripts/tests/test_market_holiday_manager.py` prove the direct `_save_jobs`
   path is gone, each selected ID calls exactly one of `cron.jobs.pause_job` and
@@ -1271,11 +1580,10 @@ Required isolated proofs include:
 - `tests/test_sys770_cron_silent_skip.py` proves calibration stale-legacy
   alerts while `jobs.json` remains byte-identical and tagged recurring claims
   are ignored;
-- MarketWatch `tests/test_extract_backup.py::test_jobs_member_refuses_entire_fallback_before_any_write`
-  runs both extractor modules with root, prefixed, traversal-normalized, and
-  ordinary archives; either spelling of `cron/jobs.json` refuses before any
-  member write, while an archive without it retains existing extraction;
-- `tests/test_restore_backup_fallback.py::test_both_restore_entrypoints_cannot_bypass_jobs_owner`
+- MarketWatch `tests/test_extract_backup.py::test_root_and_named_jobs_members_refuse_both_fallbacks_before_any_write`
+  runs both extractors with root, prefixed, named-profile, duplicate, traversal,
+  and ordinary archives; any jobs destination refuses before every write;
+- `tests/test_restore_backup_fallback.py::test_root_and_shipped_restore_cannot_bypass_named_profile_jobs_owner`
   exercises root and shipped `restore.sh`: the Hermes-present route reaches
   corrected `run_import`, and the fallback refuses a jobs member with exact
   prior files unchanged;
@@ -1287,49 +1595,42 @@ Required isolated proofs include:
   callers, and reader-only exclusions. Adding an unowned `open`, `copy`,
   `json.dump`, or replace edge to a live `jobs.json` fails with its
   repository-qualified path;
-- `tests/gateway/test_status.py::test_running_build_observation_does_not_gate_ordinary_startup`
-  disables API registration and proves `GatewayRunner.start` consumes and
-  publishes exactly one typed observation before ordinary readiness/provider
-  startup. Non-Git packaged, dirty development, non-Linux, and transient Git
-  failure cases each publish `UNAVAILABLE`, preserve ordinary adapter/provider/
-  scheduler behavior, make the CLI exit 4, and produce zero SYS-1030 acceptance
-  or SYS-1029 handoff. A mutation that suppresses the observation, blocks
-  ordinary startup on it, or accepts it for deployment is RED;
-- `tests/gateway/test_status.py::test_running_build_rejects_old_loaded_code_after_clean_head_moves`
-  imports from OID A then moves clean `HEAD` to B, dirties the loaded module at
-  B, moves the module outside its checkout, changes/stages/adds untracked
-  content, and mutates each Git output/lstat. Only stable ordinary tracked bytes
-  equal to `HEAD:<path>` are AVAILABLE; a HEAD-only comparison is RED;
-- `tests/gateway/test_status.py::test_running_build_identity_is_captured_once_from_loaded_scheduler`
-  covers PID/start/executable/profile, later-checkout stability,
-  different-profile recapture refusal, every typed unavailable result, and no
-  new file. Existing runtime-status writes preserve the one observation;
-- `tests/hermes_cli/test_gateway.py::test_build_identity_command_is_available_without_api_server`
-  proves exact JSON/stdout/exits 0/3/4/5 and argparse 2 with API disabled, then
-  mutates runtime state, PID/start/executable/cmdline, launch/served profile,
-  and OID. A stale status record or persisted command never passes;
-- `tests/gateway/test_api_server.py::test_health_detailed_mirrors_running_build_identity_without_owning_acceptance`
-  checks the optional observer without making API configuration a deployment
-  prerequisite;
-- `tests/gateway/test_status_command.py::test_canonical_remote_and_ref_are_freshly_verified`
-  uses a scripted command runner with no network to cover both literal HTTPS
-  URLs and refs, then mutates one URL, adds a second URL, substitutes SSH,
-  removes/renames the source ref, makes fetch fail, leaves a stale local
-  tracking ref, returns malformed/multiple tip lines, and makes the reviewed
-  candidate not an ancestor; every negative refuses even when a previously
-  cached tracking ref has the expected OID.
+- `tests/gateway/test_status.py::test_controlled_deployment_verifies_before_cron_admission`
+  barriers provider resolution, module capture, OPEN, provider start, HTTP
+  claim, and task. Every mismatch gives zero jobs-file open/write/start/task/
+  202 while messaging/readiness remains healthy; absent opt-in proves ordinary
+  startup unchanged;
+- `tests/cron/test_scheduler_provider.py::test_full_loaded_claim_module_set_one_oid_and_selected_provider`
+  mutates/removes each role module, swaps/aliases provider, mixes checkout/OID/
+  blob, and moves HEAD after import. Any omitted module or HEAD-only comparison
+  is RED;
+- `tests/gateway/test_status.py::test_cron_activation_profile_store_is_not_messaging_served_profiles`
+  proves launch A with messaging A+B certifies only A; B needs its own exact
+  dashboard/desktop identity. Gateway/dashboard HTTP and manual-tool tests
+  prove CLOSED refuses before profile/store open, task, and 202;
+- `tests/gateway/test_executor_host_manifest.py::test_every_source_claim_host_is_stopped_or_exactly_attested`
+  proves exact host-set equality and owner-local stop/join without scans;
+  `apps/desktop/electron/backend-command.test.ts` covers primary/pool handles,
+  controlled argv, and stale pool backend RED;
+- `tests/gateway/test_status_command.py::test_candidate_review_merge_deploy_running_equalities`
+  mutates Ch!=Rh, Cmw!=Rmw, stale/failed fetch, nonancestor merge, QA on another
+  OID, dirty/untracked, D!=M, and any R!=Dh. Optional API absence cannot weaken
+  the public CLI;
 - MarketWatch `tests/test_sys1030_deployment_identity.py::test_deployed_marketwatch_identity_precedes_hermes_activation`
   parameterizes stale ref, wrong URL/ref, `Dmw!=Mmw`, dirty tracked/staged or
   untracked shadow writer, missing writer, and a barrier changing the checkout
   between proof and activation. Each returns nonzero with zero Hermes restart,
   provider start, claim, canary, or resume. Reversing Dmw proof and activation
   is the mutation RED;
+- one end-to-end barrier crosses controlled verification and Systems teardown:
+  shutdown-before-verify never opens; verify-before-shutdown opens once then
+  close/drain wins; no second controller or finalizer exists;
 Tests must be self-contained below `/home/linux/.hermes/test/sys1030/`, use no
 network, live gateway, production store, live delivery, `/tmp`, systemd, new
 xdist control, new mutex, process scan, or product script. They run through the
 repository-required wrapper unchanged.
 ## 10. R2 disposition
-| R2 | R3 disposition |
+| R2 | R4 disposition |
 |---|---|
 | 01 | Closed from source: three Hermes and seven MarketWatch direct-writer files, every transitive caller, and reader-only exclusions route to one strict `.jobs.lock` conservation owner or lose mutation authority. |
 | 02 | Removed correction-induced codec: exact captured JSON object and type-strict comparison need no digest. |
@@ -1337,18 +1638,18 @@ repository-required wrapper unchanged.
 | 04 | Closed: preserve documented `{job_id,fire_at}` while every claimed path carries and re-enters one immutable selected profile/home/store envelope; no NAS rewrite. |
 | 05 | Retained: claim before task creation and 202. |
 | 06 | Retained: `ACTIVE` blocks every later same-job occurrence. |
-| 07 | Superseded safely: claim commit precedes submit, so no post-submit CAS or start barrier exists. |
+| 07 | Superseded safely: claim commit precedes submit and there is no claimed-to-dispatched CAS; the process-local worker-entry acknowledgement only closes lifecycle ownership. |
 | 08 | Reduced: atomic exact paused-row snapshot; caller digest is not an issue requirement. |
-| 09 | Closed with F3/F4: exact context is registered before start and reaches shutdown, cleanup quarantine, interruption, output/delivery, and exact finalization; cleanup uncertainty retains ACTIVE. |
+| 09 | Closed with R4 F2/F3/F8/F9: every scheduled context reaches release, shutdown, quarantine, interruption, output/delivery, and exact finalization; uncertainty retains ACTIVE. |
 | 10 | Retained without a new run ABI: pre-run failure dominates existing route result. |
-| 11 | Retained compactly: saved output, suppression/no delivery, and delivery error stay distinguishable. |
-| 12 | Preserved by non-redesign: finite removal is a legal existing terminal. |
+| 11 | Closed by the total content/output/delivery product, including saved whitespace/empty plus independent suppressed-empty failure. |
+| 12 | Preserved: tagged exact one-shot authority retains legal finite removal and public APIs while eliminating TTL replay. |
 | 13 | Returned to SYS-1029 product ownership; generic canary does not certify SYS-666 completeness. |
 | 14 | Retained: malformed/unknown claims refuse before execution. |
 | 15 | Retained: one command result and exact shell exit propagation. |
-| 16 | Closed with F1/F2: mandatory CLI verifies live PID/start/executable/profile and immutable loaded clean scheduler bytes; optional API health and current HEAD alone are insufficient. |
+| 16 | Closed by controlled full-module activation and live PID/start/executable/profile/store/provider proof; optional API/current HEAD alone are insufficient. |
 | 17 | Corrected census: disposition the one real watchdog; do not invent a twin. |
-| 18 | Closed with F6: exact HTTPS origins/refs are freshly fetched, reviewed commits are ancestors, clean deployed `Dmw=Mmw` precedes clean Hermes `Dh=Mh`, and live loaded OID verification precedes acceptance. |
+| 18 | Closed by exact candidate==remote-review, QA-bound merge, deployed equality, and every running role OID, with MW proof before Hermes activation. |
 | 19 | Removed: five-job mutation/resume contradicts live state and belongs to SYS-1029. |
 ## 11. Five-question authority gate
 Every normative operation must answer all five questions before authorship:
@@ -1364,19 +1665,25 @@ Every normative operation must answer all five questions before authorship:
 Any `no`, undefined noun, silent fallback, ambiguous overwrite, product-state
 mutation, or invented external authority blocks the candidate.
 
-### 11.1 Independent six-family and prior-closure control
+### 11.1 Independent twelve-family and prior-closure control
 Expected owner/caller/cut sets are independently derived from the pinned source,
 not copied from this proposal. Before application, the exact correction bytes
 must make each paired mutation fail:
 
 | Family | GREEN | Paired RED |
 |---|---|---|
-| F1 strict deployment verifier | API disabled still gets one typed observation; unavailable evidence preserves ordinary startup, makes the CLI exit 4, and blocks only SYS-1030 acceptance/SYS-1029 handoff. | Delete/bypass publication, gate readiness/provider on UNAVAILABLE, or accept UNAVAILABLE for deployment. |
-| F2 loaded bytes | Stable ordinary tracked scheduler bytes equal `HEAD:<path>` and yield one immutable loaded identity. | A-loaded/B-HEAD, dirty/staged/untracked module, outside-checkout module, or HEAD-only comparison. |
-| F3 shutdown admission | CLOSED linearizes against registration/API/start; an admitted exact context is snapshotted and only it is interrupted/finalized. | Remove close lock/registration/context leaf, resample after kill, or mark N+1 from N's cut. |
-| F4 cleanup uncertainty | INCOMPLETE/UNKNOWN preserves pause and byte-exact ACTIVE claim across cold restart; second execution refuses. | Route canary through generic clear/finalizer or treat unknown as complete. |
-| F5 second canary | `P -> B+C2 -> claim-free B+authorized result leaves` exactly. | Compare against C1-bearing P, delete a foreign claim, restore/nest C1, or accept stale B. |
-| F6 deployed MarketWatch | Fresh canonical source, clean `Dmw=Mmw`, seven deployed writers, then clean Hermes activation/live proof. | Stale/wrong source, dirty/shadow/missing writer, mismatch/TOCTOU, or activation-before-proof. |
+| F1 pause conservation | INCOMPLETE/UNKNOWN preserves original enabled/state/paused_at/paused_reason and ACTIVE through restart. | Change/drop a pause leaf or write diagnostics into it. |
+| F2 scheduled one-shot authority | Builtin/Chronos one-shots have tagged nonexpiring claims, exact contexts, and unchanged public/finite terminal behavior. | TTL reclaim, missing context, malformed overwrite, post-API replay, foreign clear. |
+| F3 HTTP release | Both handlers retain exact registration until actual worker exit and release once on every result. | Omit/double release or release a live thread on outer cancellation. |
+| F4 product truth | Every legal content/output/delivery/finalization tuple and invalid complement is explicit. | Empty/whitespace success, SAVED conflated with suppression, or later stage masking earlier failure. |
+| F5 controlled deploy admission | Controlled cron stays CLOSED until full verification; failure yields zero provider/claim/task/202 while ordinary startup stays unchanged. | Open/start before verification or leave controlled cron open after failure. |
+| F6 module closure | Every applicable loaded claim-path module has one checkout/OID/blob and selected-provider identity. | Replace/omit one module, mix OIDs, alias/swap provider. |
+| F7 activation tuple | Exact process role/profile/home/jobs/provider/routes/PID/start are bound; messaging profiles do not substitute. | Swap/drop one leaf or use served_profiles alone. |
+| F8 cleanup × shutdown | One phase/claim successor makes COMPLETE terminal and INCOMPLETE/UNKNOWN quarantine. | Shutdown/generic finalizer clears before or after UNKNOWN CAS. |
+| F9 host teardown | Gateway, desktop/dashboard, HTTP, and manual hosts close before admission and drain exact work. | Delete one host close/drain or admit immediately after close. |
+| F10 archive namespace | Root/prefixed/named jobs members use selected strict owner or fallback refuses before all writes. | Duplicate/traversal/A-B basename swap or unowned named-store write. |
+| F11 executor hosts | Each resident source-derived host is owner-stopped or exactly attested. | Leave stale gateway/dashboard/desktop role executable. |
+| F12 Git chain | C==remote review, QA-bound merge, D==M, every R==D for Hermes and MW ordering. | Break one equality/ancestry/QA/deploy/live edge or use stale ref. |
 
 The same whole-document pass conserves all 17 actionable R2 families: R2-01
 strict writer fixed point and ACTIVE conservation; 02 injective JSON comparison;
@@ -1393,15 +1700,18 @@ SYS-1029-only acceptance/resume. R2-07 remains superseded by claim-before-submit
 without a claimed-to-dispatched CAS. R2-13 remains SYS-1029-owned. Neither may
 silently re-enter scope.
 
-## 12. Round-3 release rule
-The bounded R3b target is the normalized formal result `6 -> 0` while all 17
+## 12. Round-4 release rule
+The bounded R4 target is the independently normalized result `13 raw -> 12
+families -> 0` while all 17
 prior actionable closures remain green. Each GREEN above must fail under its
 paired RED; declaration presence or proposal-derived expected sets do not pass.
 Any surviving/new family, optional proof route, P0 recurrence, new authority
 boundary, claim replay, lock degradation, product mutation, or false success
 stops the batch and resets review.
 Loop 1 remains specification-only. Loop 2 may implement only after one exact
-candidate receives all required independent approvals. Tests remain NOT RUN in
+candidate receives Systems, Architecture, and Six-Sigma panel approval plus an
+independent source-derived audit with 100% ownership/cell/product/mutation
+coverage. Tests remain NOT RUN in
 this document. SYS-1030 closes only after its reviewed implementation is
 merged, deployed, and the configured running Hermes identity is proven. That
 event unblocks—but does not perform—SYS-1029 product canaries and resume.
