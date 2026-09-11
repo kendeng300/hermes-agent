@@ -46,7 +46,7 @@ remains failure through output, delivery, finalization, command, and exit.
 | `hermes_cli/web_server.py::cron_fire_webhook` | Finds a profile by job ID alone and returns 202 before claim. | Match exactly one profile/store by `(job_id,fire_at)` and claim before task/202. |
 | `hermes_cli/cron.py::cron_command` | Produces action status but callers discard it. | Return the canary command status. |
 | `hermes_cli/main.py::cmd_cron`, `main` | Discard the nested return value. | Propagate it to process exit. |
-| `cron/scheduler.py::_capture_loaded_scheduler_build_identity`, `gateway.status.capture_running_build_identity`, `read_live_running_build_identity` | No mandatory production verifier binds loaded scheduler bytes to the live gateway; optional detailed health and current `HEAD` are insufficient. | Capture the clean tracked loaded module once, transport it through existing runtime status, and verify live PID/start/executable/profile/OID through an always-available CLI before activation. |
+| `cron/scheduler.py::_capture_loaded_scheduler_build_identity`, `gateway.status.capture_running_build_identity`, `read_live_running_build_identity` | No always-available deployment verifier binds loaded scheduler bytes to the live gateway; optional detailed health and current `HEAD` are insufficient. | Always publish a typed available/unavailable observation without changing ordinary startup, then require the strict CLI verifier for SYS-1030 acceptance and SYS-1029 handoff. |
 | `agent/curator_backup.py::_restore_cron_skill_links` | Parses backup outside the lock, then fresh-loads and merges `skill`/`skills` under `_jobs_lock`. | Retain the field-only merge but publish through the sole conservation owner and fail closed when the strict lock is unavailable. |
 | `hermes_cli/backup.py::{run_import,restore_quick_snapshot,restore_cron_jobs_if_emptied}` | The import writes archive members with `open(...,"wb")`; both restore paths can `copy2` a stale whole `cron/jobs.json` without the jobs lock. | Route every jobs member through the exact locked replace-or-refuse contract in §3.1; no raw live-file copy remains. |
 | MarketWatch `utilities/market_holiday_manager.py` and `scripts/utilities/market_holiday_manager.py` | Both byte-identical tracked copies load before locking, lock `jobs.lock` rather than `.jobs.lock`, use a shared `jobs.tmp`, and replace the whole document. | Remove direct storage writes; invoke `cron.jobs.pause_job` or `cron.jobs.resume_job` once per selected ID and report any partial refusal truthfully. |
@@ -966,8 +966,8 @@ root, status stdout zero bytes, and the two blob OIDs one equal lowercase
 Command/shape/timeout failures return the corresponding `UNAVAILABLE` reason.
 Blob values are compared and discarded. `git_oid` identifies code observed by
 the executing imported module, not a later `HEAD`. Import may continue on
-failure, but no `GatewayRunner` start may publish readiness or start a cron
-provider until the mandatory capture below is `AVAILABLE`.
+failure. `AVAILABLE` and `UNAVAILABLE` are observations only and neither is a
+gateway-readiness, adapter, cron-provider, or scheduler-admission condition.
 
 `GatewayRunner.start` obtains exact
 `launch_profile=get_active_profile_name() or "default"` after the event loop
@@ -995,14 +995,18 @@ RunningBuildIdentityResultV2={
 It adds the live PID, Linux `/proc/<pid>/stat` field 22, and
 `/proc/<pid>/exe`, then passes the typed result to existing
 `write_runtime_status(running_build_identity=...)`. Every later status write
-preserves that member; restart replaces it. `UNAVAILABLE`, missing capture, or
-capture exception blocks readiness and cron-provider startup. This does not
-make ordinary module import require successful Git or `/proc` observation.
+preserves that member; restart replaces it. A missing loaded observation or an
+exception while adding process evidence is caught and published as typed
+`UNAVAILABLE` with `LOADED_SCHEDULER_UNAVAILABLE` or the corresponding exact
+process reason. It must not alter ordinary gateway readiness, adapter startup,
+cron-provider startup, or scheduler admission. This keeps packaged/non-Git,
+dirty development, non-Linux, and transient-Git-failure startup behavior
+unchanged while making the evidence failure visible.
 The existing runtime status file is an observation transport only: no
 scheduler, claim, repair, resume, or recovery path reads it, and a stale record
 is never accepted. No new file/store/READY/VCS authority is created.
 
-The mandatory production reader and result are:
+The strict deployment reader and result are:
 ```text
 gateway.status.read_live_running_build_identity(
   *, required_served_profile:str, expected_git_oid:str
@@ -1102,11 +1106,13 @@ If a source, preflight, deployment, clean-tree, writer, startup, or live check
 fails, perform no claim/canary/resume/product action. Before Hermes activation,
 the corrected MarketWatch writer disposition may safely remain deployed; an
 operator rollback to `Dmw_pre` is permitted only after the same read-only
-no-ACTIVE-claim check. After Hermes activation, stop its readiness/provider,
-retain the safer MarketWatch writers, and redeploy/restart only the exact clean
-`Dh_pre` or corrected `Mh` through the same checks; never mix an old
-MarketWatch writer tree with active new claim semantics. No automated rollback
-or local lifecycle record is introduced.
+no-ACTIVE-claim check. After ordinary Hermes startup, a failed or unavailable
+build-identity check leaves its readiness, adapters, providers, and scheduler
+behavior unchanged but withholds SYS-1030 deployment acceptance and every
+SYS-1029 handoff. The operator may retain the safer MarketWatch writers and
+redeploy/restart only the exact clean `Dh_pre` or corrected `Mh` through the
+same checks; never mix an old MarketWatch writer tree with active new claim
+semantics. No automated rollback or local lifecycle record is introduced.
 
 Current production state is an observation, not a desired-state manifest:
 only `9e059716170c` and `20c3fd791e82` are paused; `cci_precompute_runner`,
@@ -1281,10 +1287,14 @@ Required isolated proofs include:
   callers, and reader-only exclusions. Adding an unowned `open`, `copy`,
   `json.dump`, or replace edge to a live `jobs.json` fails with its
   repository-qualified path;
-- `tests/gateway/test_status.py::test_running_build_verification_is_mandatory_with_api_disabled`
-  disables API registration and proves `GatewayRunner.start` consumes the
-  loaded result exactly once before readiness/provider startup. Missing,
-  unavailable, exception, or bypass is RED and starts no cron provider;
+- `tests/gateway/test_status.py::test_running_build_observation_does_not_gate_ordinary_startup`
+  disables API registration and proves `GatewayRunner.start` consumes and
+  publishes exactly one typed observation before ordinary readiness/provider
+  startup. Non-Git packaged, dirty development, non-Linux, and transient Git
+  failure cases each publish `UNAVAILABLE`, preserve ordinary adapter/provider/
+  scheduler behavior, make the CLI exit 4, and produce zero SYS-1030 acceptance
+  or SYS-1029 handoff. A mutation that suppresses the observation, blocks
+  ordinary startup on it, or accepts it for deployment is RED;
 - `tests/gateway/test_status.py::test_running_build_rejects_old_loaded_code_after_clean_head_moves`
   imports from OID A then moves clean `HEAD` to B, dirties the loaded module at
   B, moves the module outside its checkout, changes/stages/adds untracked
@@ -1361,7 +1371,7 @@ must make each paired mutation fail:
 
 | Family | GREEN | Paired RED |
 |---|---|---|
-| F1 mandatory verifier | API disabled still reaches the CLI/live verifier; unavailable identity blocks readiness/provider and acceptance. | Delete/bypass capture or accept UNAVAILABLE. |
+| F1 strict deployment verifier | API disabled still gets one typed observation; unavailable evidence preserves ordinary startup, makes the CLI exit 4, and blocks only SYS-1030 acceptance/SYS-1029 handoff. | Delete/bypass publication, gate readiness/provider on UNAVAILABLE, or accept UNAVAILABLE for deployment. |
 | F2 loaded bytes | Stable ordinary tracked scheduler bytes equal `HEAD:<path>` and yield one immutable loaded identity. | A-loaded/B-HEAD, dirty/staged/untracked module, outside-checkout module, or HEAD-only comparison. |
 | F3 shutdown admission | CLOSED linearizes against registration/API/start; an admitted exact context is snapshotted and only it is interrupted/finalized. | Remove close lock/registration/context leaf, resample after kill, or mark N+1 from N's cut. |
 | F4 cleanup uncertainty | INCOMPLETE/UNKNOWN preserves pause and byte-exact ACTIVE claim across cold restart; second execution refuses. | Route canary through generic clear/finalizer or treat unknown as complete. |
