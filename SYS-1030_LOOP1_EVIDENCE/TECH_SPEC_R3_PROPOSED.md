@@ -246,10 +246,23 @@ ExecutionContextV1={
   mode:"RECURRING"|"CANARY", jobs_file_realpath:absolute string,
   job_id:nonempty string, claim_id:UUID4
 }
+ChronosExecutionEnvelopeV1={
+  schema:"cron-chronos-execution-envelope-v1",
+  selected_profile:nonempty string,
+  hermes_home_realpath:absolute string,
+  jobs_file_realpath:absolute string
+}
+ChronosFireTargetV1={
+  schema:"cron-chronos-fire-target-v1",
+  envelope:ChronosExecutionEnvelopeV1,
+  job_preimage:object,
+  scheduler:ChronosCronScheduler
+}
 ChronosClaimResultV1={
   status:"CLAIMED"|"GONE"|"DUPLICATE"|"CONFLICT"|"MALFORMED"|
          "LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
   job_postimage:object|null, execution_context:ExecutionContextV1|null,
+  execution_envelope:ChronosExecutionEnvelopeV1|null,
   error:string|null
 }
 ```
@@ -257,10 +270,14 @@ Only `CLAIMED` has nonnull `claim` and `job_postimage` and null `error`; every
 other claim status has both payloads null and a nonempty error. Only `APPLIED`
 has null disposition error; every other disposition has a nonempty error.
 `COMMIT_UNKNOWN` never licenses submit, retry, finalization, or execution.
-Only Chronos `CLAIMED` has a nonnull postimage and null error. Its context is
-nonnull for recurring work and null for the unchanged legacy one-shot route;
-every other Chronos status has both payloads null, with null error only for
-`GONE` and `DUPLICATE`. No HTTP branch infers a claim from an exception.
+Only Chronos `CLAIMED` has a nonnull postimage, a nonnull immutable execution
+envelope, and null error. Its execution context is nonnull for recurring work
+and null for the unchanged legacy one-shot route; every other Chronos status
+has null postimage, context, and envelope, with null error only for `GONE` and
+`DUPLICATE`. For a recurring claim, the context's `jobs_file_realpath` and the
+persisted claim's `owner_profile` must equal the envelope's paths/profile;
+mismatch is `MALFORMED` and cannot execute. No HTTP branch infers a claim or
+envelope from ambient process state or from an exception.
 ## 5. Chronos uses its existing wire
 No NAS change is required. Provision remains the documented current request
 containing `job_id`, `fire_at`, `agent_callback_url`, and `dedup_key`. Callback
@@ -271,9 +288,12 @@ remains authenticated by the current purpose-scoped NAS JWT and body:
 Both ingress handlers strict-parse exactly `job_id` and an aware `fire_at`, then
 call the sole shared read-only owner
 `cron.scheduler_provider.resolve_chronos_fire_target(job_id, fire_at)`, which
-returns one exact `(profile, jobs_file_realpath)` or a closed
-gone/conflict/malformed/store-failure classification over configured profile
-stores. The resolver first finds rows by exact job ID, then classifies the occurrence. A row
+returns one exact in-memory `ChronosFireTargetV1` or a closed
+gone/conflict/malformed/store-failure/provider-unavailable classification over
+configured profile stores. The resolver derives `hermes_home_realpath` from the selected profile,
+derives `jobs_file_realpath` as that exact home's `cron/jobs.json`, rejects any
+nonabsolute/noncanonical/symlink-mismatched relation, and first finds rows by
+exact job ID before classifying the occurrence. A row
 matches the occurrence only when either current
 `next_run_at == fire_at` or its tagged recurring claim has exact
 `scheduled_for == fire_at`.
@@ -283,8 +303,8 @@ matches the occurrence only when either current
   occurrence returns 409 and executes nothing. If no occurrence matches but
   multiple stores contain the job ID, the result is also 409; no arbitrary
   profile is selected.
-- One due/current match selects that store and synchronously invokes the atomic
-  recurring claim owner.
+- One due/current match selects that store and lets `claim_due` invoke exactly
+  the recurring or one-shot atomic owner for the matched schedule class.
 - An exact ACTIVE, NOT_SUBMITTED, or OPERATOR_SKIPPED duplicate returns 200
   without task creation. When one exact job-ID row exists and no exact claim
   remains, an authenticated callback whose `fire_at` instant is strictly
@@ -294,30 +314,87 @@ matches the occurrence only when either current
   409.
 - A refused/malformed/not-due claim returns 409 without task creation.
 - Lock/store failure returns 503 without task creation.
+- Selected-profile Chronos load, availability, binding, or secret-scope failure
+  returns 503 before claim or task creation.
 - Only a committed claim followed by successful task creation returns 202.
 Invalid authentication returns 401; malformed JSON, extra/missing keys, or an
 invalid field returns 400. Every 400/401 branch performs no store search or
 mutation.
 The claim's due check prevents a valid bearer callback from firing a future
 job early. `_find_cron_job_profile(job_id)` is not used for this route.
-`CronScheduler.claim_due(job_id, *, fire_at) -> ChronosClaimResultV1` dispatches
-by the selected row's
-existing schedule class: recurring uses §4 and one-shot uses unchanged
-`claim_job_for_fire` semantics with exact `fire_at` revalidation inside that
-owner's existing lock and returns that lock's exact postclaim snapshot. This
-adds no one-shot state or transition and introduces no unlocked `get_job`
-reread. `CronScheduler.run_claimed(result: ChronosClaimResultV1, *, adapters,
-loop) -> ManagedRunOutcomeV1` accepts only `CLAIMED`, invokes
-`_run_one_job_managed` on its exact postimage, and uses its optional context.
-`fire_due(job_id, *, fire_at, adapters, loop)` is exactly `claim_due` followed
-by `self.run_claimed` for synchronous callers. HTTP handlers call `claim_due`
-synchronously and create a task for that same `run_claimed`; no task
+`CronScheduler.claim_due(job_id, *, fire_at) -> ChronosClaimResultV1` requires
+its receiver's one-shot bound envelope, enters that exact home, secret, and
+cron-store context, and resets all three in `finally`. It retains the target's
+exact envelope and dispatches inside its selected home/store by the matching
+row's existing schedule class. Recurring uses §4 and validates
+that the returned `ExecutionContextV1`, claim owner profile, postimage ID, and
+jobs-file path equal the envelope before returning `CLAIMED`.
+
+The one-shot branch uses the internal exact-postimage owner:
+```text
+cron.jobs._claim_job_for_fire_postimage(
+  job_id, *, expected_fire_at:aware string|null,
+  claim_ttl_seconds:int=300
+) -> OneShotFireClaimResultV1
+OneShotFireClaimResultV1={
+  status:"CLAIMED"|"NOT_FOUND"|"DISABLED"|"PAUSED"|"DUPLICATE"|
+         "FIRE_AT_MISMATCH"|"LOCK_UNAVAILABLE"|"COMMIT_UNKNOWN",
+  job_postimage:object|null, error:string|null
+}
+```
+With nonnull `expected_fire_at`, it revalidates exact one-shot
+`next_run_at == expected_fire_at` under the selected store's strict lock before
+performing the existing fire-claim mutation and returns the committed/read-back
+postimage. Only `CLAIMED` has nonnull postimage and null error. Public
+`cron.jobs.claim_job_for_fire(job_id, *, claim_ttl_seconds=300) -> bool`
+retains its signature and behavior by delegating with
+`expected_fire_at=null` and projecting only `status == "CLAIMED"`; it exposes
+neither the postimage nor the envelope. This adds no one-shot state or
+transition and introduces no unlocked `get_job` reread.
+
+`CronScheduler._run_claimed_in_active_store(result, *, adapters, loop) ->
+ManagedRunOutcomeV1` accepts only `CLAIMED`, verifies that the already-active
+profile, Hermes home, and jobs-file realpath exactly equal the immutable
+envelope, then invokes `_run_one_job_managed` on the exact postimage; that
+managed owner performs the one matching finalizer described in §7. The helper
+does not enter or reset context and never rereads or re-arms.
+
+After the unique row is selected, the resolver installs
+`hermes_constants.set_hermes_home_override(envelope.hermes_home_realpath)`,
+`agent.secret_scope.set_secret_scope(build_profile_secret_scope(envelope.hermes_home_realpath))`,
+and `cron.jobs.use_cron_store(envelope.hermes_home_realpath)` in that order. In
+that scope it calls `plugins.cron_providers.load_cron_scheduler("chronos")`,
+requires an available `ChronosCronScheduler` whose client is not constructed,
+and calls its one-shot private
+`_bind_execution_envelope(envelope) -> ChronosCronScheduler`. Binding stores
+only the immutable envelope in that new in-memory provider instance; a second
+bind or a preconstructed client refuses. The resolver then resets store,
+secret, and home contexts in reverse order and returns that exact instance in
+the target. It never returns or reuses the handler's ambient provider.
+
+`CronScheduler.run_claimed(result: ChronosClaimResultV1, *, adapters,
+loop) -> ManagedRunOutcomeV1` validates the complete envelope and recurring
+context relation and requires its receiver's immutable bound envelope to equal
+the result envelope. It then installs the same existing home override, profile
+secret scope, and cron-store scope used by the resolver, calls the helper, and
+resets store, secret, and home tokens in reverse order in `finally`. A missing
+or mismatched path, profile, bound envelope, postimage, context, secret scope,
+or active-store identity refuses before execution or mutation. No ambient
+`HERMES_HOME`, cached provider client, default jobs constant, current dashboard
+profile, or caller-selected store participates.
+`fire_due(job_id, *, fire_at, adapters, loop)` resolves a target, then invokes
+`target.scheduler.claim_due` followed by `target.scheduler.run_claimed` for
+synchronous callers. HTTP handlers likewise invoke `claim_due` synchronously
+and create a task for `run_claimed` on that same target scheduler; no task
 double-claims.
 
 `ChronosCronScheduler.run_claimed` is the sole successor re-arm owner. It
-calls `super().run_claimed` and waits for exact-claim finalization. Only when
-`finalization_status` is `APPLIED` or `REMOVED` does it freshly read the same
-profile/store row. If that row still exists, is enabled, is not paused, is
+requires its one-shot bound envelope to equal the result, performs the same
+home, secret, and store context entry as the base method inside one
+`try/finally`, calls `_run_claimed_in_active_store`, and—before any context
+token resets—requires `finalization_status` to be `APPLIED` or `REMOVED` and
+freshly reads only the envelope-bound profile/store row. If that row still
+exists, is enabled, is not paused, is
 recurring, and has a valid successor `next_run_at`, it calls existing
 `_arm_one_shot(job)` exactly once and returns the unchanged typed managed
 outcome. An absent or removed one-shot, disabled, paused, or terminal row also
@@ -596,6 +673,23 @@ Required isolated proofs include:
   change at the immediate pre-save recheck;
 - Chronos exact `(job_id,fire_at)` has zero/one/multiple profile fixtures;
 - duplicate callback produces no second task;
+- `tests/cron/test_scheduler_provider.py::test_claimed_chronos_envelope_pins_profile_home_and_store`
+  creates profile A and B with the same job ID and distinct `jobs.json` bytes,
+  then exercises recurring and one-shot claims through both HTTP handlers and
+  the synchronous provider: the unique `(job_id,fire_at)` match in B returns a
+  nonnull B envelope; `run_claimed` executes, finalizes, rereads, and re-arms
+  only B while every A byte and call counter remains unchanged;
+- the same proof deletes or independently mutates each envelope profile/home/
+  jobs-file leaf and each recurring context/claim counterpart, expecting
+  refusal before run/finalize/rearm; it also changes ambient profile/home to A
+  after a valid B claim, preloads A's provider client and secrets, and proves
+  only B's fresh bound provider/client/secrets remain authoritative; reusing,
+  rebinding, or swapping the target scheduler refuses with zero execution and
+  zero re-arm;
+- `tests/cron/test_jobs.py::test_claim_job_for_fire_public_bool_and_internal_postimage`
+  proves the public signature/boolean behavior is unchanged while the internal
+  owner returns the exact committed one-shot postimage, and exact `fire_at`
+  mismatch writes zero bytes;
 - `tests/cron/test_scheduler_provider.py::test_chronos_run_claimed_rearms_exactly_once_after_finalization`
   uses a mocked NAS/`_arm_one_shot` boundary to prove synchronous and HTTP
   paths use the same owner, re-arm the exact successor once after exact
@@ -635,7 +729,7 @@ repository-required wrapper unchanged.
 | 01 | Retained: strict existing-lock fixed point over every writer. |
 | 02 | Removed correction-induced codec: exact captured JSON object and type-strict comparison need no digest. |
 | 03 | Retained: validate successor before atomic mutation. |
-| 04 | Reduced: use documented existing `{job_id,fire_at}` wire; no NAS repository/version invention. |
+| 04 | Closed: preserve documented `{job_id,fire_at}` while every claimed path carries and re-enters one immutable selected profile/home/store envelope; no NAS rewrite. |
 | 05 | Retained: claim before task creation and 202. |
 | 06 | Retained: `ACTIVE` blocks every later same-job occurrence. |
 | 07 | Superseded safely: claim commit precedes submit, so no post-submit CAS or start barrier exists. |
