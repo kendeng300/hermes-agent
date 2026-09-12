@@ -596,127 +596,562 @@ def derive_source_oracle(roots, oids):
             return (parent + "." if parent else "") + node.attr
         return ""
 
-    managed_dynamic_targets = {
-        "claim_job_for_fire", "fire_due", "get_fire_verifier",
-        "resolve_cron_scheduler", "run_one_job",
-    }
+    managed_dynamic_targets = set(relation_symbols)
 
-    def literal_fragments(node):
-        return "".join(
-            item.s for item in ast.walk(node) if isinstance(item, ast.Str)
-        )
+    STRING_LIMIT = 32
+    UNKNOWN = object()
 
-    def unresolved_managed_dynamic_call(node):
-        if not isinstance(node, ast.Call):
-            return False
-        called = dotted_name(node.func)
-        candidate = ""
-        if called.endswith("getattr") and len(node.args) >= 2:
-            if isinstance(node.args[1], ast.Str):
-                return False
-            candidate = literal_fragments(node.args[1])
-        elif called in {"globals", "locals"}:
-            candidate = literal_fragments(node)
-        elif called in {"__import__", "importlib.import_module"} and node.args:
-            if isinstance(node.args[0], ast.Str):
-                return False
-            candidate = literal_fragments(node.args[0])
-        return any(target in candidate for target in managed_dynamic_targets)
+    def tracked_target(name, module_names):
+        candidate = name
+        while candidate:
+            if candidate in module_names:
+                return candidate
+            candidate = candidate.rpartition(".")[0]
+        return None
 
-    for module, path in tracked_modules.items():
-        source = text("HERMES", path)
-        tree = parsed_tree(module, path)
-        if tree is None:
-            if managed_relation_pattern.search(source):
-                fail("SOURCE_UNSUPPORTED_RELEVANT_SYNTAX", path, "managed Python relation")
-            # Preserve ordinary import reachability even on the Python 3.8
-            # validation floor.  Such a module cannot become a managed call
-            # owner without triggering the refusal above.
-            for source_line in source.splitlines():
-                if re.match(r"^\s*(from|import)\s+", source_line):
-                    for target in resolve_import_targets(module, path, source_line):
-                        if target != module:
-                            all_import_graph[module].add(target)
-            continue
+    def relative_import(module, path, imported, level):
+        if not level:
+            return imported
+        package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
+        parts = package.split(".") if package else []
+        keep = max(0, len(parts) - (level - 1))
+        return ".".join(parts[:keep] + ([imported] if imported else []))
 
-        aliases = {}
-        local_symbols = {
-            item.name for item in tree.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    def merge_domains(domains):
+        domains = list(domains)
+        if not domains or any(domain is UNKNOWN for domain in domains):
+            return UNKNOWN
+        merged = set().union(*domains)
+        return frozenset(merged) if len(merged) <= STRING_LIMIT else UNKNOWN
+
+    def source_graph_from_map(source_map, module_paths):
+        """Return the full tracked import/call graph and every dynamic-site class.
+
+        The same routine consumes pinned source and all in-memory falsifiers.
+        It performs no regex/name prefilter.  String values are finite sets or
+        UNKNOWN and flow through local/tracked helper parameters and returns.
+        """
+        module_names = set(source_map)
+        trees = {}
+        aliases_by_module = {}
+        local_symbols_by_module = {}
+        summaries = {}
+        sites = []
+        import_graph = {module: set() for module in module_names}
+        call_graph = {module: set() for module in module_names}
+
+        def collect_assignments(statements):
+            assignments = collections.defaultdict(list)
+
+            class Collector(ast.NodeVisitor):
+                def visit_FunctionDef(self, node):
+                    return None
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_ClassDef(self, node):
+                    return None
+
+                def visit_Lambda(self, node):
+                    return None
+
+                def visit_Assign(self, node):
+                    for target in node.targets:
+                        if isinstance(target, ast.Name):
+                            assignments[target.id].append(node.value)
+                    self.visit(node.value)
+
+                def visit_AnnAssign(self, node):
+                    if isinstance(node.target, ast.Name) and node.value is not None:
+                        assignments[node.target.id].append(node.value)
+                    if node.value is not None:
+                        self.visit(node.value)
+
+                def visit_NamedExpr(self, node):
+                    if isinstance(node.target, ast.Name):
+                        assignments[node.target.id].append(node.value)
+                    self.visit(node.value)
+
+            collector = Collector()
+            for statement in statements:
+                collector.visit(statement)
+            return dict(assignments)
+
+        def add_summary(module, qualname, node, parent=None):
+            key = module + ("." + qualname if qualname else "")
+            body = node.body if hasattr(node, "body") else []
+            params = () if not qualname else tuple(
+                arg.arg for arg in node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+            )
+            returns = []
+
+            class ReturnCollector(ast.NodeVisitor):
+                def visit_FunctionDef(self, child):
+                    if child is not node:
+                        return None
+                    self.generic_visit(child)
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_Lambda(self, child):
+                    return None
+
+                def visit_Return(self, child):
+                    if child.value is not None:
+                        returns.append(child.value)
+
+            if qualname:
+                ReturnCollector().visit(node)
+            summaries[key] = {
+                "module": module,
+                "qualname": qualname,
+                "params": params,
+                "param_values": {},
+                "returns": returns,
+                "assignments": collect_assignments(body),
+                "parent": parent,
+            }
+            for child in body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    child_name = qualname + "." + child.name if qualname else child.name
+                    add_summary(module, child_name, child, key)
+
+        for module, source in source_map.items():
+            path = module_paths[module]
+            try:
+                tree = ast.parse(source, filename=path)
+            except SyntaxError:
+                trees[module] = None
+                continue
+            trees[module] = tree
+            aliases = {}
+            local_symbols = {
+                item.name for item in tree.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            }
+            aliases_by_module[module] = aliases
+            local_symbols_by_module[module] = local_symbols
+            add_summary(module, "", type("ModuleScope", (), {"body": tree.body})())
+            for item in tree.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    add_summary(module, item.name, item, module)
+            for item in ast.walk(tree):
+                if isinstance(item, ast.Import):
+                    for alias in item.names:
+                        aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+                        target = tracked_target(alias.name, module_names)
+                        if target is not None and target != module:
+                            import_graph[module].add(target)
+                elif isinstance(item, ast.ImportFrom):
+                    imported = relative_import(module, path, item.module or "", item.level)
+                    for alias in item.names:
+                        if alias.name != "*":
+                            aliases[alias.asname or alias.name] = (
+                                imported + "." + alias.name if imported else alias.name
+                            )
+                    for name in [imported] + [
+                        imported + "." + alias.name
+                        for alias in item.names if imported and alias.name != "*"
+                    ]:
+                        target = tracked_target(name, module_names)
+                        if target is not None and target != module:
+                            import_graph[module].add(target)
+
+        def qualify_callable(called, module):
+            if not called:
+                return ""
+            first, dot, suffix = called.partition(".")
+            aliases = aliases_by_module.get(module, {})
+            if first in aliases:
+                return aliases[first] + (("." + suffix) if dot else "")
+            if first in local_symbols_by_module.get(module, set()):
+                return module + "." + called
+            return called
+
+        # Source-derived fixed point of callable names that can invoke a ticket
+        # execution relation. The seed is the complete relation-symbol set,
+        # including _execute_job_now; wrappers are not hand-enumerated.
+        dynamic_wrapper_functions = {
+            (module, name)
+            for module, names in local_symbols_by_module.items()
+            for name in names if name in managed_dynamic_targets
         }
-        for item in ast.walk(tree):
-            if isinstance(item, ast.Import):
-                for alias in item.names:
-                    aliases[alias.asname or alias.name.split(".")[0]] = alias.name
-                    candidate = alias.name
-                    while candidate:
-                        if candidate in tracked_modules:
-                            if candidate != module:
-                                all_import_graph[module].add(candidate)
-                            break
-                        candidate = candidate.rpartition(".")[0]
-            elif isinstance(item, ast.ImportFrom):
-                imported = item.module or ""
-                if item.level:
-                    package = module if path.endswith("/__init__.py") else module.rpartition(".")[0]
-                    parts = package.split(".") if package else []
-                    keep = max(0, len(parts) - (item.level - 1))
-                    imported = ".".join(parts[:keep] + ([imported] if imported else []))
-                for alias in item.names:
-                    if alias.name == "*":
-                        continue
-                    aliases[alias.asname or alias.name] = (
-                        imported + "." + alias.name if imported else alias.name
+        function_calls = []
+        for module, tree in trees.items():
+            if tree is None:
+                continue
+            for function in ast.walk(tree):
+                if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                function_calls.append((
+                    module,
+                    function.name,
+                    {
+                        qualify_callable(dotted_name(call.func), module)
+                        for call in ast.walk(function) if isinstance(call, ast.Call)
+                    },
+                ))
+        for _ in range(len(function_calls) + 1):
+            additions = {
+                (module, name)
+                for module, name, calls in function_calls
+                if any(
+                    called.rpartition(".")[2] in managed_dynamic_targets
+                    or (
+                        tracked_target(called.rpartition(".")[0], module_names),
+                        called.rpartition(".")[2],
+                    ) in dynamic_wrapper_functions
+                    for called in calls
+                )
+            } - dynamic_wrapper_functions
+            if not additions:
+                break
+            dynamic_wrapper_functions.update(additions)
+        dynamic_wrapper_names = collections.defaultdict(set)
+        for module, name in dynamic_wrapper_functions:
+            dynamic_wrapper_names[module].add(name)
+        managed_authority_modules = set(dynamic_wrapper_names)
+        managed_seed_modules = {
+            module for module, names in local_symbols_by_module.items()
+            if names & managed_dynamic_targets
+        }
+
+        def eval_strings(node, scope, bindings=None, seen=None, depth=0):
+            if node is None or depth > 12:
+                return UNKNOWN
+            bindings = bindings or {}
+            seen = seen or set()
+            if isinstance(node, ast.Str):
+                return frozenset({node.s})
+            if isinstance(node, ast.Name):
+                if node.id in bindings:
+                    return bindings[node.id]
+                if node.id in scope["params"]:
+                    return scope["param_values"].get(node.id, UNKNOWN)
+                marker = (scope["module"], scope["qualname"], node.id)
+                if marker in seen:
+                    return UNKNOWN
+                expressions = scope["assignments"].get(node.id)
+                if not expressions and scope["parent"] in summaries:
+                    return eval_strings(node, summaries[scope["parent"]], bindings, seen, depth + 1)
+                if not expressions:
+                    return UNKNOWN
+                return merge_domains(
+                    eval_strings(expr, scope, bindings, seen | {marker}, depth + 1)
+                    for expr in expressions
+                )
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+                left = eval_strings(node.left, scope, bindings, seen, depth + 1)
+                right = eval_strings(node.right, scope, bindings, seen, depth + 1)
+                if left is UNKNOWN or right is UNKNOWN or len(left) * len(right) > STRING_LIMIT:
+                    return UNKNOWN
+                return frozenset(a + b for a in left for b in right)
+            if isinstance(node, ast.JoinedStr):
+                result = frozenset({""})
+                for part in node.values:
+                    domain = (
+                        frozenset({part.s}) if isinstance(part, ast.Str)
+                        else eval_strings(part.value, scope, bindings, seen, depth + 1)
+                        if isinstance(part, ast.FormattedValue) else UNKNOWN
                     )
-                for name in [imported] + [
-                    imported + "." + alias.name
-                    for alias in item.names if imported and alias.name != "*"
-                ]:
-                    candidate = name
-                    while candidate:
-                        if candidate in tracked_modules:
-                            if candidate != module:
-                                all_import_graph[module].add(candidate)
-                            break
-                        candidate = candidate.rpartition(".")[0]
-            elif isinstance(item, ast.Call):
-                if unresolved_managed_dynamic_call(item):
-                    unresolved_dynamic_modules.add(module)
+                    if domain is UNKNOWN or len(result) * len(domain) > STRING_LIMIT:
+                        return UNKNOWN
+                    result = frozenset(a + b for a in result for b in domain)
+                return result
+            if isinstance(node, ast.IfExp):
+                return merge_domains((
+                    eval_strings(node.body, scope, bindings, seen, depth + 1),
+                    eval_strings(node.orelse, scope, bindings, seen, depth + 1),
+                ))
+            if isinstance(node, ast.BoolOp):
+                return merge_domains(
+                    eval_strings(value, scope, bindings, seen, depth + 1)
+                    for value in node.values
+                )
+            if isinstance(node, ast.Call):
+                called = qualify_callable(dotted_name(node.func), scope["module"])
+                helper = summaries.get(called)
+                if helper is not None:
+                    local = {}
+                    for index, name in enumerate(helper["params"]):
+                        local[name] = (
+                            eval_strings(node.args[index], scope, bindings, seen, depth + 1)
+                            if index < len(node.args) else UNKNOWN
+                        )
+                    if not helper["returns"]:
+                        return UNKNOWN
+                    return merge_domains(
+                        eval_strings(expr, helper, local, seen, depth + 1)
+                        for expr in helper["returns"]
+                    )
+                if called == "str" and len(node.args) == 1:
+                    return eval_strings(node.args[0], scope, bindings, seen, depth + 1)
+            return UNKNOWN
+
+        def scoped_calls(module, tree):
+            result = []
+
+            class Visitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.qualnames = []
+                    self.scope = summaries[module]
+
+                def visit_FunctionDef(self, node):
+                    prior = self.scope
+                    self.qualnames.append(node.name)
+                    key = module + "." + ".".join(self.qualnames)
+                    self.scope = summaries.get(key, prior)
+                    self.generic_visit(node)
+                    self.qualnames.pop()
+                    self.scope = prior
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_Call(self, node):
+                    result.append((node, self.scope))
+                    self.generic_visit(node)
+
+            Visitor().visit(tree)
+            return result
+
+        # Derive helper-parameter string domains from every tracked caller.
+        # This makes legitimate call-neutral dispatchers (for example the
+        # dashboard's literal cron.jobs helper selector) finite while a missing
+        # or unknown caller remains UNKNOWN and therefore fail-closed when it
+        # can select managed authority.
+        all_scoped_calls = {
+            module: scoped_calls(module, tree)
+            for module, tree in trees.items() if tree is not None
+        }
+        dynamic_param_helpers = set()
+        for module, scoped in all_scoped_calls.items():
+            for call, owner_scope in scoped:
+                called = dotted_name(call.func)
+                receiver = dotted_name(call.args[0]) if called.endswith("getattr") and call.args else ""
+                receiver_root = receiver.partition(".")[0]
+                receiver_import = aliases_by_module.get(module, {}).get(receiver_root, receiver_root)
+                if called.endswith("getattr") and (
+                    receiver_import == "cron"
+                    or receiver_import.startswith(("cron.", "plugins.cron_providers"))
+                ):
+                    dynamic_param_helpers.add(
+                        owner_scope["module"]
+                        + (("." + owner_scope["qualname"]) if owner_scope["qualname"] else "")
+                    )
+        for _ in range(2):
+            observed = collections.defaultdict(lambda: collections.defaultdict(list))
+            for module, scoped in all_scoped_calls.items():
+                for call, caller_scope in scoped:
+                    helper_name = qualify_callable(dotted_name(call.func), module)
+                    helper = summaries.get(helper_name)
+                    if helper is None or helper_name not in dynamic_param_helpers:
+                        continue
+                    for index, param in enumerate(helper["params"]):
+                        domain = (
+                            eval_strings(call.args[index], caller_scope)
+                            if index < len(call.args) else UNKNOWN
+                        )
+                        observed[helper_name][param].append(domain)
+            changed = False
+            for helper_name, helper in summaries.items():
+                if helper_name not in dynamic_param_helpers:
+                    continue
+                next_values = {}
+                for param in helper["params"]:
+                    domains = observed[helper_name].get(param, [])
+                    next_values[param] = merge_domains(domains) if domains else UNKNOWN
+                if next_values != helper["param_values"]:
+                    helper["param_values"] = next_values
+                    changed = True
+            if not changed:
+                break
+
+        def receiver_module(node, module, scope, seen=None):
+            seen = seen or set()
+            name = dotted_name(node)
+            first, dot, suffix = name.partition(".")
+            aliases = aliases_by_module.get(module, {})
+            if first in aliases:
+                return aliases[first] + (("." + suffix) if dot else "")
+            if isinstance(node, ast.Name) and node.id not in seen:
+                expressions = scope["assignments"].get(node.id, [])
+                resolved = {
+                    receiver_module(expr, module, scope, seen | {node.id})
+                    for expr in expressions
+                }
+                resolved.discard("")
+                if len(resolved) == 1:
+                    return resolved.pop()
+            return name
+
+        def is_managed_module(name):
+            target = tracked_target(name, module_names)
+            return (
+                name == "cron"
+                or name.startswith(("cron.", "plugins.cron_providers"))
+                or target in managed_authority_modules
+            )
+
+        def is_managed_import_module(name):
+            target = tracked_target(name, module_names)
+            return (
+                name == "cron"
+                or name.startswith(("cron.", "plugins.cron_providers"))
+                or target in managed_seed_modules
+            )
+
+        def is_literal_string(node):
+            return isinstance(node, ast.Str)
+
+        def classify_target(module, scope, kind, expression, receiver=""):
+            domain = eval_strings(expression, scope)
+            literal = is_literal_string(expression)
+            managed_values = set()
+            receiver_target = tracked_target(receiver, module_names)
+            attribute_targets = set(managed_dynamic_targets)
+            if receiver_target is not None:
+                attribute_targets.update(dynamic_wrapper_names[receiver_target])
+            if domain is not UNKNOWN:
+                if kind == "IMPORT":
+                    managed_values = {
+                        value for value in domain if is_managed_import_module(value)
+                    }
+                elif kind == "ATTRIBUTE" and receiver_target is not None and is_managed_module(receiver_target):
+                    managed_values = set(domain) & attribute_targets
+                elif kind == "NAMESPACE":
+                    managed_values = set(domain) & managed_dynamic_targets
+                else:
+                    managed_values = set()
+            managed_namespace = (
+                is_managed_module(receiver) if kind == "ATTRIBUTE"
+                else False if kind == "NAMESPACE"
+                else False
+            )
+            if not literal and (
+                managed_values
+                or domain is UNKNOWN and (
+                    managed_namespace
+                    or any(token in ast.dump(expression).lower() for token in ("cron", "scheduler"))
+                )
+            ):
+                return "REFUSED", domain
+            if managed_values:
+                return "RESOLVED_MANAGED", domain
+            return "RESOLVED_DISJOINT", domain
+
+        def scope_sites(module, tree):
+            result = []
+
+            class Visitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.qualnames = []
+                    self.scope = summaries[module]
+
+                def visit_FunctionDef(self, node):
+                    prior = self.scope
+                    self.qualnames.append(node.name)
+                    key = module + "." + ".".join(self.qualnames)
+                    self.scope = summaries.get(key, prior)
+                    self.generic_visit(node)
+                    self.qualnames.pop()
+                    self.scope = prior
+
+                visit_AsyncFunctionDef = visit_FunctionDef
+
+                def visit_Call(self, node):
+                    called = receiver_module(node.func, module, self.scope)
+                    namespace_call = (
+                        isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "get"
+                        and isinstance(node.func.value, ast.Call)
+                        and dotted_name(node.func.value.func) in {"globals", "locals"}
+                    )
+                    if called.rpartition(".")[2] == "getattr" and len(node.args) >= 2:
+                        receiver = receiver_module(node.args[0], module, self.scope)
+                        status, domain = classify_target(
+                            module, self.scope, "ATTRIBUTE", node.args[1], receiver,
+                        )
+                        result.append((node, status, "GETATTR", domain, receiver))
+                    elif called in {
+                        "__import__", "builtins.__import__", "importlib.import_module",
+                    } and node.args:
+                        status, domain = classify_target(
+                            module, self.scope, "IMPORT", node.args[0], "",
+                        )
+                        result.append((node, status, "IMPORT", domain, ""))
+                    elif namespace_call and node.args:
+                        namespace = dotted_name(node.func.value.func).upper()
+                        status, domain = classify_target(
+                            module, self.scope, "NAMESPACE", node.args[0], module,
+                        )
+                        result.append((node, status, namespace + "_GET", domain, module))
+                    self.generic_visit(node)
+
+                def visit_Subscript(self, node):
+                    called = dotted_name(node.value.func) if isinstance(node.value, ast.Call) else ""
+                    if called in {"globals", "locals"}:
+                        expression = node.slice.value if isinstance(node.slice, ast.Index) else node.slice
+                        status, domain = classify_target(
+                            module, self.scope, "NAMESPACE", expression, module,
+                        )
+                        result.append((node, status, called.upper(), domain, module))
+                    self.generic_visit(node)
+
+            Visitor().visit(tree)
+            return result
+
+        for module, source in source_map.items():
+            path = module_paths[module]
+            tree = trees[module]
+            if tree is None:
+                if managed_relation_pattern.search(source):
+                    sites.append((module, 0, "REFUSED", "UNSUPPORTED_SYNTAX", None))
+                for source_line in source.splitlines():
+                    if re.match(r"^\s*(from|import)\s+", source_line):
+                        for target in resolve_import_targets(module, path, source_line):
+                            if target in module_names and target != module:
+                                import_graph[module].add(target)
+                continue
+            for item, status, kind, domain, receiver in scope_sites(module, tree):
+                site_kind = kind + ((":" + receiver) if receiver else "")
+                receiver_target = tracked_target(receiver, module_names) if receiver else None
+                if receiver_target and dynamic_wrapper_names.get(receiver_target):
+                    site_kind += ":" + ",".join(sorted(dynamic_wrapper_names[receiver_target]))
+                sites.append((module, item.lineno, status, site_kind, domain))
+                if kind == "IMPORT" and domain is not UNKNOWN:
+                    for name in domain:
+                        target = tracked_target(name, module_names)
+                        if target is not None and target != module:
+                            import_graph[module].add(target)
+                elif kind == "GETATTR" and status == "RESOLVED_MANAGED":
+                    target = tracked_target(receiver, module_names)
+                    if target is not None and target != module:
+                        call_graph[module].add(target)
+            local_symbols = local_symbols_by_module[module]
+            aliases = aliases_by_module[module]
+            for item in ast.walk(tree):
+                if not isinstance(item, ast.Call):
+                    continue
                 called = dotted_name(item.func)
                 if not called:
                     continue
-                first, dot, suffix = called.partition(".")
-                qualified = aliases.get(first)
-                if qualified is not None and dot:
-                    qualified += "." + suffix
-                elif qualified is None and first in local_symbols:
-                    qualified = module + "." + called
-                if qualified is None:
+                qualified = qualify_callable(called, module)
+                first = called.partition(".")[0]
+                if first not in aliases and first not in local_symbols:
                     continue
-                candidate = qualified
-                while candidate:
-                    if candidate in tracked_modules:
-                        if candidate != module:
-                            all_call_graph[module].add(candidate)
-                        break
-                    candidate = candidate.rpartition(".")[0]
+                target = tracked_target(qualified, module_names)
+                if target is not None and target != module:
+                    call_graph[module].add(target)
+        source_graph = {
+            module: import_graph[module] | call_graph[module] for module in module_names
+        }
+        return import_graph, call_graph, source_graph, sites
 
-    # The reverse relation is built only after the complete source pass. Calls
-    # and imports are both legitimate reachability edges; semantic filtering
-    # happens below, never while discovering them.
-    all_source_graph = {
-        module: all_import_graph[module] | all_call_graph[module]
-        for module in tracked_modules
-    }
-    hidden_bridge_tree = ast.parse(
-        "import cron.scheduler_provider as provider\n"
-        "def hidden_bridge():\n"
-        "    return getattr(provider, 'resolve_' + 'cron_scheduler')()\n"
+    source_map = {module: text("HERMES", path) for module, path in tracked_modules.items()}
+    all_import_graph, all_call_graph, all_source_graph, dynamic_sites = source_graph_from_map(
+        source_map, tracked_modules,
     )
-    if not any(
-        unresolved_managed_dynamic_call(node) for node in ast.walk(hidden_bridge_tree)
-    ):
-        fail("SOURCE_DYNAMIC_FALSIFIER_BLIND", "hidden_dynamic_bridge.py", "getattr target")
+    all_reverse_import_graph = {module: set() for module in tracked_modules}
     for module, targets in all_source_graph.items():
         for target in targets:
             if target != module:
@@ -803,23 +1238,301 @@ def derive_source_oracle(roots, oids):
     all_forward = walk(all_source_graph, entry_modules)
     all_reverse = walk(all_reverse_import_graph, authority_modules)
     source_connected = all_forward & all_reverse
-    probe_graph = {module: set(targets) for module, targets in all_source_graph.items()}
-    probe_graph["hidden_dynamic_bridge"] = {"cron.scheduler_provider"}
-    probe_graph["gateway.run"].add("hidden_dynamic_bridge")
-    probe_reverse = {module: set() for module in probe_graph}
-    for module, targets in probe_graph.items():
-        for target in targets:
-            probe_reverse.setdefault(target, set()).add(module)
-    if "hidden_dynamic_bridge" not in (
-        walk(probe_graph, entry_modules) & walk(probe_reverse, authority_modules)
-    ):
-        fail("SOURCE_FIXED_POINT_FALSIFIER_BLIND", "hidden_dynamic_bridge.py", "forward/reverse")
-    unresolved_connected = source_connected & unresolved_dynamic_modules
-    if unresolved_connected:
+    classified_dynamic = {"RESOLVED_MANAGED", "RESOLVED_DISJOINT", "REFUSED"}
+    unclassified = {
+        status for _module, _line, status, _kind, _domain in dynamic_sites
+        if status not in classified_dynamic
+    }
+    if unclassified:
+        fail("SOURCE_DYNAMIC_SITE_UNCLASSIFIED", "python", repr(sorted(unclassified)))
+    managed_forward = sorted({
+        (module, line, kind, tuple(sorted(domain)) if domain is not UNKNOWN else "UNKNOWN")
+        for module, line, status, kind, domain in dynamic_sites
+        if status == "RESOLVED_MANAGED" and module in all_forward
+    })
+    if managed_forward:
+        fail(
+            "SOURCE_DYNAMIC_MANAGED_DISPATCH", "python",
+            repr(managed_forward),
+        )
+    refused_import_forward = {
+        module for module, _line, status, kind, _domain in dynamic_sites
+        if status == "REFUSED" and kind.startswith("IMPORT")
+    } & all_forward
+    if refused_import_forward:
+        fail(
+            "SOURCE_UNRESOLVED_DYNAMIC_IMPORT", "python",
+            repr(sorted(refused_import_forward)),
+        )
+    refused_forward = {
+        module for module, _line, status, kind, _domain in dynamic_sites
+        if status == "REFUSED" and not kind.startswith("IMPORT")
+    } & all_forward
+    if refused_forward:
         fail(
             "SOURCE_UNRESOLVED_DYNAMIC_TARGET", "python",
-            repr(sorted(unresolved_connected)),
+            repr(sorted(refused_forward)),
         )
+    # These pinned, source-valid dynamic loaders/dispatchers are explicit
+    # negative controls. They may remain dynamic only because their may-target
+    # domains are proven disjoint from the ticket execution authority.
+    for negative_module in (
+        "hermes_cli.console_engine", "hermes_cli.memory_oauth",
+        "hermes_cli.web_server", "plugins.memory", "providers", "tools.registry",
+    ):
+        bad = {
+            status for module, _line, status, _kind, _domain in dynamic_sites
+            if module == negative_module and status != "RESOLVED_DISJOINT"
+        }
+        if bad:
+            fail(
+                "SOURCE_DYNAMIC_NEGATIVE_FALSE_POSITIVE", negative_module,
+                repr(sorted(bad)),
+            )
+
+    # Source-shaped falsifiers use the exact same complete source-map pipeline
+    # as the pinned tree.  Each bridge is attached to a real gateway entrypoint;
+    # there is no hand-added graph edge or detector-only AST shortcut.
+    dynamic_falsifiers = {
+        "m_direct_literal": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    return getattr(provider, 'resolve_cron_scheduler')\n",
+            "RESOLVED_MANAGED",
+        ),
+        "m_execute_now_literal": (
+            "import tools.cronjob_tools as cron_tools\n"
+            "def probe():\n    return getattr(cron_tools, '_execute_job_now')\n",
+            "RESOLVED_MANAGED",
+        ),
+        "m_direct_concat": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    return getattr(provider, 'resolve_' + 'cron_scheduler')\n",
+            "REFUSED",
+        ),
+        "m_local_assignment": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    target_name = 'resolve_' + 'cron_scheduler'\n"
+            "    return getattr(provider, target_name)\n",
+            "REFUSED",
+        ),
+        "m_alias_assignment": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    first = 'resolve_'\n    second = first\n"
+            "    return getattr(provider, second + 'cron_scheduler')\n",
+            "REFUSED",
+        ),
+        "m_receiver_alias": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    receiver = provider\n"
+            "    target = 'resolve_' + 'cron_scheduler'\n"
+            "    return getattr(receiver, target)\n",
+            "REFUSED",
+        ),
+        "m_callable_alias": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    choose = getattr\n"
+            "    target = 'resolve_' + 'cron_scheduler'\n"
+            "    return choose(provider, target)\n",
+            "REFUSED",
+        ),
+        "m_chained_assignment": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    left = target = 'resolve_' + 'cron_scheduler'\n"
+            "    return getattr(provider, target)\n",
+            "REFUSED",
+        ),
+        "m_annotated_assignment": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    target: str = 'resolve_' + 'cron_scheduler'\n"
+            "    return getattr(provider, target)\n",
+            "REFUSED",
+        ),
+        "m_named_expression": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    return getattr(provider, (target := 'resolve_' + 'cron_scheduler'))\n",
+            "REFUSED",
+        ),
+        "m_fstring": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe():\n    suffix = 'cron_scheduler'\n"
+            "    return getattr(provider, f'resolve_{suffix}')\n",
+            "REFUSED",
+        ),
+        "m_conditional": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe(flag):\n    target = 'resolve_cron_scheduler' if flag else 'close'\n"
+            "    return getattr(provider, target)\n",
+            "REFUSED",
+        ),
+        "m_branch_assignments": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe(flag):\n    if flag:\n        target = 'resolve_cron_scheduler'\n"
+            "    else:\n        target = 'close'\n    return getattr(provider, target)\n",
+            "REFUSED",
+        ),
+        "m_local_helper": (
+            "import cron.scheduler_provider as provider\n"
+            "def build(prefix):\n    return prefix + 'cron_scheduler'\n"
+            "def probe():\n    return getattr(provider, build('resolve_'))\n",
+            "REFUSED",
+        ),
+        "m_globals": (
+            "from cron.scheduler import run_one_job\n"
+            "def probe():\n    target = 'run_' + 'one_job'\n    return globals()[target]\n",
+            "REFUSED",
+        ),
+        "m_globals_get": (
+            "from cron.scheduler import run_one_job\n"
+            "def probe():\n    target = 'run_' + 'one_job'\n"
+            "    return globals().get(target)\n",
+            "REFUSED",
+        ),
+        "m_locals": (
+            "from cron.scheduler import run_one_job\n"
+            "def probe():\n    target = 'run_' + 'one_job'\n"
+            "    run_one_job = None\n    return locals()[target]\n",
+            "REFUSED",
+        ),
+        "m_locals_get": (
+            "from cron.scheduler import run_one_job\n"
+            "def probe():\n    target = 'run_' + 'one_job'\n"
+            "    run_one_job = None\n    return locals().get(target)\n",
+            "REFUSED",
+        ),
+        "m_importlib": (
+            "import importlib\n"
+            "def probe():\n    target = 'cron.' + 'scheduler_provider'\n"
+            "    return importlib.import_module(target)\n",
+            "REFUSED",
+        ),
+        "m_importlib_alias": (
+            "import importlib as loader\n"
+            "def probe():\n    target = 'cron.' + 'scheduler_provider'\n"
+            "    return loader.import_module(target)\n",
+            "REFUSED",
+        ),
+        "m_importlib_callable_alias": (
+            "from importlib import import_module as load_module\n"
+            "def probe():\n    target = 'cron.' + 'scheduler_provider'\n"
+            "    return load_module(target)\n",
+            "REFUSED",
+        ),
+        "m_literal_managed_import": (
+            "import importlib\n"
+            "def probe():\n    return importlib.import_module('cron.scheduler_provider')\n",
+            "RESOLVED_MANAGED",
+        ),
+        "m_dunder_import": (
+            "def probe():\n    target = 'cron.' + 'scheduler_provider'\n"
+            "    return __import__(target)\n",
+            "REFUSED",
+        ),
+        "m_builtins_import": (
+            "import builtins\n"
+            "def probe():\n    target = 'cron.' + 'scheduler_provider'\n"
+            "    return builtins.__import__(target)\n",
+            "REFUSED",
+        ),
+        "m_helper_invokes": (
+            "import cron.scheduler_provider as provider\n"
+            "def invoke(target):\n    return getattr(provider, target)\n"
+            "def probe():\n    return invoke('resolve_' + 'cron_scheduler')\n",
+            "REFUSED",
+        ),
+        "m_helper_returns_callable": (
+            "import cron.scheduler_provider as provider\n"
+            "def choose():\n    return getattr(provider, 'resolve_' + 'cron_scheduler')\n"
+            "def probe():\n    return choose()\n",
+            "REFUSED",
+        ),
+        "m_unknown_managed_receiver": (
+            "import cron.scheduler_provider as provider\n"
+            "def probe(target_name):\n    return getattr(provider, target_name)\n",
+            "REFUSED",
+        ),
+        "m_unknown_managed_import": (
+            "import importlib\n"
+            "def probe(cron_module):\n    return importlib.import_module(cron_module)\n",
+            "REFUSED",
+        ),
+        "m_disjoint_constructed": (
+            "class Plain:\n    pass\n"
+            "def probe():\n    field = 'cl' + 'ose'\n    return getattr(Plain(), field, None)\n",
+            "RESOLVED_DISJOINT",
+        ),
+        "m_disjoint_literal_import": (
+            "def probe():\n    return __import__('re')\n",
+            "RESOLVED_DISJOINT",
+        ),
+        "m_disjoint_tracked_import": (
+            "import importlib\n"
+            "def probe():\n    return importlib.import_module('plain_module')\n",
+            "RESOLVED_DISJOINT",
+        ),
+        "m_static_managed_call": (
+            "from cron.scheduler import run_one_job\n"
+            "def probe():\n    return run_one_job()\n",
+            "NONE",
+        ),
+    }
+    helper_source = "def build(prefix):\n    return prefix + 'cron_scheduler'\n"
+    tracked_helper_source = (
+        "import cron.scheduler_provider as provider\n"
+        "from m_tracked_helper_lib import build\n"
+        "def probe():\n    return getattr(provider, build('resolve_'))\n"
+    )
+    dynamic_falsifiers["m_tracked_helper"] = (tracked_helper_source, "REFUSED")
+    for mutant, (mutant_source, expected_status) in sorted(dynamic_falsifiers.items()):
+        # This is a complete, in-memory source map for the same analyzer: a
+        # real entry module, the mutant wrapper, and the managed authority it
+        # may select.  Keeping the fixture graph minimal avoids reparsing the
+        # unchanged 907-module pinned tree for each spelling while preserving
+        # the production parser, value flow, edge derivation, and graph walks.
+        overlay = {
+            "gateway.run": "import " + mutant + "\n" + mutant + ".probe()\n",
+            "cron.scheduler_provider": "def resolve_cron_scheduler():\n    return None\n",
+            "cron.scheduler": "def run_one_job():\n    return None\n",
+            "tools.cronjob_tools": "def _execute_job_now():\n    return None\n",
+            "plain_module": "def ordinary():\n    return None\n",
+        }
+        overlay_paths = {
+            "gateway.run": "gateway/run.py",
+            "cron.scheduler_provider": "cron/scheduler_provider.py",
+            "cron.scheduler": "cron/scheduler.py",
+            "tools.cronjob_tools": "tools/cronjob_tools.py",
+            "plain_module": "plain_module.py",
+        }
+        overlay[mutant] = mutant_source
+        overlay_paths[mutant] = mutant + ".py"
+        if mutant == "m_tracked_helper":
+            overlay["m_tracked_helper_lib"] = helper_source
+            overlay_paths["m_tracked_helper_lib"] = "m_tracked_helper_lib.py"
+        _imports, _calls, overlay_graph, overlay_sites = source_graph_from_map(
+            overlay, overlay_paths,
+        )
+        if mutant not in walk(overlay_graph, {"gateway.run"}):
+            fail("SOURCE_FIXED_POINT_FALSIFIER_BLIND", mutant + ".py", "not forward reachable")
+        statuses = {
+            status for module, _line, status, _kind, _domain in overlay_sites
+            if module == mutant
+        }
+        if expected_status == "NONE" and statuses:
+            fail(
+                "SOURCE_DYNAMIC_NEGATIVE_FALSE_POSITIVE", mutant + ".py",
+                repr(sorted(statuses)),
+            )
+        if expected_status != "NONE" and expected_status not in statuses:
+            fail(
+                "SOURCE_DYNAMIC_FALSIFIER_BLIND", mutant + ".py",
+                expected_status + " not in " + repr(sorted(statuses)),
+            )
+        if expected_status == "RESOLVED_DISJOINT" and "REFUSED" in statuses:
+            fail("SOURCE_DYNAMIC_NEGATIVE_FALSE_POSITIVE", mutant + ".py", repr(sorted(statuses)))
+        rejected = bool(statuses & {"RESOLVED_MANAGED", "REFUSED"})
+        if expected_status in {"RESOLVED_MANAGED", "REFUSED"} and not rejected:
+            fail("SOURCE_DYNAMIC_FALSIFIER_SURVIVED", mutant + ".py", repr(sorted(statuses)))
+        if expected_status in {"NONE", "RESOLVED_DISJOINT"} and rejected:
+            fail("SOURCE_DYNAMIC_NEGATIVE_FALSE_POSITIVE", mutant + ".py", repr(sorted(statuses)))
     module_names = (
         entry_modules | relation_modules | authority_modules | support_modules
         | reexport_modules | provider_family | source_connected

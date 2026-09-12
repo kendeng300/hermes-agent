@@ -132,8 +132,16 @@ on a managed relation refuses; it is never silently filtered. The module
 authority is the complete intersection of forward source-derived-entrypoint
 reachability and reverse managed-sink reachability, with no later regex/name
 intersection. A source-connected `getattr`, `globals`, `importlib`, dynamic
-import, or constructed managed target that cannot be resolved statically is a
-hard refusal. Forward entrypoint reachability and reverse sink reachability
+import, or constructed managed target is evaluated by one bounded may-value
+fixed point over finite strings or `UNKNOWN`, import/callable aliases,
+ordinary/annotated/chained assignments, concatenation, finite f-strings and
+conditionals, and local/tracked helper parameters and returns. Every reached
+dynamic site is exactly `RESOLVED_MANAGED`, `RESOLVED_DISJOINT`, or `REFUSED`.
+A resolved dynamic managed dispatch, or an unresolved target on a known
+managed receiver/namespace/import candidate, is a hard refusal; proven
+disjoint source-valid loaders remain legal. Forward entrypoint reachability is
+checked for refusals before reverse sink intersection. Forward entrypoint
+reachability and reverse sink reachability
 must reach that same source-owned projection. MarketWatch writer discovery
 parses every tracked
 production Python candidate, including aliases, function-local bindings, and
@@ -141,8 +149,10 @@ direct destination expressions, plus both shell extractor callers. It checks
 keyed fan-in/fan-out cardinality and identity conservation and binds every
 finite-matrix cell—including its invalid complement—to an exact
 reviewer-owned status/reason/nullability/exit image. Its self-falsifiers add an
-independently detected source-shaped writer, exercise alias/local/direct
-writer forms, replace route/module members without changing cardinality,
+independently detected source-shaped writer; exercise alias/local/direct
+writer forms and a full in-memory source-map matrix for literal, constructed,
+aliased, helper-returned, namespace, and dynamic-import targets; replace
+route/module members without changing cardinality,
 omit a source-derived module, fabricate an early provider, and alter legal and
 invalid matrix images. A PASS is
 preapplication evidence only; it is not implementation or runtime acceptance.
