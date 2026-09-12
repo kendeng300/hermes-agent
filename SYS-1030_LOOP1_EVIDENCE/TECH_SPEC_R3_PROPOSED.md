@@ -94,8 +94,12 @@ argument and directly contradict the finite direct-call rule below.
 
 ## 3. Closed types and one authority per effect
 
-These are closed internal types. They may be dataclasses, enums, or typed
-records, but consumers must not substitute free strings or callbacks.
+These are closed internal record contracts. In this finite candidate they are
+validated data mappings/tuples constructed inside the listed whole functions;
+the implementation adds no module-level import, assignment, constant, class,
+base, or decorator. Consumers must not substitute free strings or callbacks.
+That representation choice makes the residual structural AST rule
+implementable while the behavioral tests enforce the closed products.
 
 ### 3.1 Job-store operation
 
@@ -115,10 +119,33 @@ commits, read-backs, and returns a typed result. Each listed writer calls it
 directly exactly once. The public raw `save_jobs` function is deleted;
 `_save_jobs_unlocked` remains private and has no external caller.
 
+Deletion is a source-derived migration, not a grep-after-the-fact assumption.
+The pinned reverse set is recorded exactly in `save_jobs_migration` in the
+manifest: 13 production owners in `cron/jobs.py` plus
+`agent/curator_backup.py::_restore_cron_skill_links`; the module imports and all
+affected nodes in `tests/cron/test_jobs.py` and
+`tests/cron/test_ticker_stall_60703.py`; and the affected nodes in
+`tests/agent/test_curator_backup.py`, `tests/cron/test_cron_provider_pin.py`,
+`tests/cron/test_file_permissions.py`, `tests/hermes_cli/test_cron.py`,
+`tests/test_timezone.py`, and `tests/tools/test_cronjob_tools.py`. Production
+callers move to closed operations. Tests seed their worker-owned temporary store
+directly or use a closed public operation; a test helper never recreates a raw
+whole-store API. Candidate preflight re-derives the baseline reverse set and
+requires zero remaining semantic import, attribute, name, or reflection
+reference to public `save_jobs` in those paths and all 25 production paths.
+
 Every lookup by job ID requires exactly one row with a nonempty exact ID.
 Duplicate IDs are `MALFORMED`: load/claim/finalize/skip/import performs zero
 mutation and repair never silently selects or deletes one. Unknown, malformed,
 or legacy claim objects block execution rather than being overwritten.
+
+`_jobs_lock` is fail-closed. Unsupported or unavailable OS locking, acquisition
+timeout, lock/open error, and ownership uncertainty return typed
+`LOCK_UNAVAILABLE` before the first store read or write; code never falls back
+to the process-local `RLock`. A held-lock/two-process witness proves the loser
+performs zero read, mutation, submit, or business effect. Reentrancy inside one
+closed operation is unnecessary: public owners call the commit owner once and
+the commit owner alone acquires the cross-process lock.
 
 Job finalizers fresh-load and compare
 `(canonical_store, job_id, occurrence_kind, claim_id)`. A missing, foreign, or
@@ -135,6 +162,14 @@ directly switches on this type and calls the fixed owner for that route.
 `_run_one_job_managed` exactly once. `run_one_job` is a Boolean compatibility
 projection that calls `_run_one_job_managed` exactly once. No wrapper invokes
 itself, another compatibility wrapper, or a generic dispatcher.
+
+For a Chronos descriptor, `admit_and_start_managed_execution` calls
+`ChronosCronScheduler.run_claimed` directly. That owner chooses exactly one of
+`run_registered_execution` or `run_registered_http_execution`, waits for its
+post-finalization outcome, and only then directly invokes `_arm_one_shot` when
+eligible. `ChronosCronScheduler.fire_due` calls the admission owner, not
+`run_claimed`; therefore the graph has no `run_claimed -> admit -> run_claimed`
+cycle, and HTTP cannot bypass the sole re-arm owner.
 
 The execution pipeline produces a pre-finalization `RunProductV1`. The exact
 finalizer consumes that product and produces `FinalizationProductV1`; only then
@@ -178,11 +213,111 @@ ambiguous run is an operational fact, not a guessed failure or success.
 
 An operator may change an `ACTIVE` claim to `OPERATOR_SKIPPED` only by knowingly
 accepting an unknown business outcome. The claim carries stable machine and boot
-identity plus PID and process start identity. Automatic/local death proof is
-valid only when machine and boot equal the current node and the exact PID/start
-identity is absent or mismatched, with resolved script-supervisor containment.
-A foreign or unavailable machine/boot identity refuses. There is no PID scan and
-no inference that absence in local `/proc` proves a remote owner dead.
+identity plus PID and process start identity. A same-machine, different-boot
+claim proves every old-boot process gone. A same-machine, current-boot claim may
+be skipped only after the durable supervisor and every descendant identity are
+resolved and cleanup is `COMPLETE`; a dead/reused parent with a live descendant,
+or an unknown supervisor, refuses. A foreign or unavailable machine/boot
+identity refuses. There is no PID scan and no inference that absence in local
+`/proc` proves a remote owner dead.
+
+### 3.4 Closed record schemas and legal products
+
+The following aliases are exact: `JobId` and `Reason` are nonempty UTF-8
+strings; `ClaimId` is canonical UUID4 text; `UtcInstant` is an aware UTC RFC3339
+instant; `CanonicalStore` is an absolute, symlink-resolved jobs-file path;
+`Pid` is a positive integer; and `StartIdentity` is the platform process-start
+identity, not wall-clock time. `null` is legal only where stated. Unknown fields
+in any control record refuse rather than being ignored.
+
+`JobsOperationV1` has these data-only variants and no others:
+
+| tag | required payload |
+|---|---|
+| `CREATE` | validated candidate job |
+| `UPDATE` | `job_id`, validated field patch |
+| `PAUSE`, `RESUME`, `TRIGGER`, `REMOVE` | `job_id` and operation-specific reason/time |
+| `RUN_RESULT` | exact claim key plus `RunProductV1` |
+| `HEARTBEAT` | exact claim key plus owner identity and observed time |
+| `ADVANCE` | exact recurring claim key plus computed successor instant |
+| `DISPATCH_STATUS` | exact claim key plus one legal scheduled status product |
+| `REWRITE_SKILL_REFS` | validated old/new immutable reference pair |
+| `REPAIR` | validated repair plan and exact observed malformed revision |
+| `SELECT_AND_CLAIM_DUE` | selection instant, owner identity, route |
+| `CLAIM_FIRE` | binding, occurrence kind, `scheduled_for`, owner identity |
+| `CLAIM_CANARY` | canonical store, `job_id`, owner identity |
+| `NOT_SUBMITTED` | exact recurring claim key and never-called proof |
+| `ROLLBACK_ONESHOT` | exact one-shot claim key, preimage, never-called proof |
+| `FINALIZE_RECURRING`, `FINALIZE_ONESHOT`, `FINALIZE_CANARY` | exact claim key and pre-finalization product |
+| `OPERATOR_SKIP` | exact claim key, explicit acceptance, death/containment proof |
+| `QUARANTINE` | exact claim key, cleanup diagnostic and immutable pre-kill snapshot |
+| `ARCHIVE_REPLACE` | canonical store, validated wrapper bytes, expected current revision |
+
+Each public owner can construct only its named private variant branch. No caller
+passes a mutator, callback, function, callable factory, operation-name string,
+or caller-selected capability tag. The commit result is exactly
+`JobsCommitResultV1(status, store, operation, revision_before, revision_after,
+value, reason)` where status is `UNCHANGED | COMMITTED | REFUSED_NO_WRITE |
+COMMIT_UNKNOWN | LOCK_UNAVAILABLE`. `revision_after` is present only for
+`UNCHANGED`/`COMMITTED`; `value` is present only for those variants; and a known
+refusal has no postimage. `COMMIT_UNKNOWN` never asserts either preimage or
+postimage.
+
+The scheduled claim union is closed:
+
+- `ActiveClaimV1(status=ACTIVE, mode, claim_id, job_id, scheduled_for,
+  machine_id, boot_id, owner_pid, owner_start, api_state, worker_state,
+  cleanup, base_snapshot)`. `mode` is `RECURRING | ONESHOT | CANARY`;
+  `api_state` is `NOT_ENTERED | ENTERED_ACK_UNKNOWN | ACCEPTED`;
+  `worker_state` is `NOT_STARTED | STARTED`; `cleanup` is null until STARTED and
+  then `PENDING | COMPLETE | INCOMPLETE | UNKNOWN`; `base_snapshot` is exact
+  serialized B only for CANARY and is null otherwise. `ACCEPTED` requires API
+  entry, and STARTED requires `api_state=ACCEPTED`.
+- `NotSubmittedClaimV1(status=NOT_SUBMITTED, mode=RECURRING, claim_id, job_id,
+  scheduled_for, api_state=NOT_ENTERED, worker_state=NOT_STARTED, cleanup=null,
+  reason)`. Owner/process/base fields are absent. It alone is retryable.
+- `OperatorSkippedClaimV1(status=OPERATOR_SKIPPED, mode, claim_id, job_id,
+  scheduled_for, accepted_unknown_outcome=true, skip_reason, skip_at,
+  death_proof)`. `death_proof` is one closed same-node/new-boot or
+  same-node/current-boot-with-descendants-COMPLETE product. It is terminal and
+  never retryable.
+
+`ReservationV1(reservation_id, lifecycle_id, route, host, role,
+shutdown_requested)` exists under `_running_lock` before store open.
+`ExecutionContextV1` adds canonical store, job, occurrence kind, claim ID,
+phase, owner PID/start, and immutable claim readback. Phase is `RESERVED |
+CLAIMED | API_ENTERED | ACCEPTED | WORKER_STARTED | FINALIZING | REARMING |
+RELEASING`; transitions are monotone. A context key is exactly
+`(lifecycle_id,reservation_id,canonical_store,job_id,occurrence_kind,claim_id)`.
+
+`ManagedStartV1` is exactly one of `SYNC(route,binding,job,resources)`,
+`POOL(route,binding,job,pool_resource)`, or
+`HTTP_TASK(route,binding,job,task_group_resource)`. Resource fields are opaque
+already-owned handles, never executable callables. `AdmissionResultV1` is:
+
+- `STARTED(context_key, api_entered=true, accepted=true)`;
+- `PRE_API_REFUSED(reason, api_entered=false, disposition)` where disposition
+  is exactly recurring `NOT_SUBMITTED`, one-shot `ROLLED_BACK_PREIMAGE`, canary
+  `RETAIN_ACTIVE_C2` after durable C2, or `NO_CLAIM`; or
+- `SUBMIT_UNKNOWN(context_key, api_entered=true,
+  disposition=RETAIN_ACTIVE)`.
+
+No other field/nullability/status combination is legal. In particular,
+`PRE_API_REFUSED + ROLLED_BACK_PREIMAGE` is impossible after C2, and
+`SUBMIT_UNKNOWN + NOT_SUBMITTED` is impossible for every route.
+
+`RunProductV1(status, output, primary_error, delivery_input)` has status
+`SUCCEEDED | FAILED | PRE_RUN_FAILED | INTERRUPTED`; success alone has null
+`primary_error`. `DeliveryProductV1(status, error)` is `NOT_REQUESTED`,
+`DELIVERED`, or `FAILED` with an error only in the last case.
+`FinalizationProductV1(status, claim_key, revision, error)` is `COMMITTED |
+REFUSED_FOREIGN_CLAIM | COMMIT_UNKNOWN`, with revision only for COMMITTED.
+`ManagedRunOutcomeV1(run_product, delivery_product, finalization_product,
+cleanup_product, exit_code)` is created only after finalization and is never an
+input to it. Exit is 0 only for fully finalized success, 1 for finalized
+business/pre-run failure, 2 for known refusal before execution, and 3 for
+cleanup/finalization/commit uncertainty. Tests enumerate the invalid complement
+and reject every unlisted cross-product.
 
 ## 4. Admission, claim, execution, and shutdown linearization
 
@@ -239,6 +374,33 @@ The semantic route set is exactly these ten cells:
 9. `CANARY`
 10. `MANUAL_COMPAT`
 
+The manifest fixes the complete relation, not independent name sets. In the
+table, `GW`, `DASH`, `EP`, `ER`, and `CLI` mean `GATEWAY/GATEWAY`,
+`STANDALONE_DASHBOARD/STANDALONE_DASHBOARD`,
+`ELECTRON_PRIMARY/ELECTRON_PRIMARY`, `ELECTRON_PROFILE/ELECTRON_PROFILE`, and
+`CLI_CHAT/CLI_TICK` host/role pairs:
+
+| route | occurrence | exact host/role pairs | claim owner | submit owner | finalizer | re-arm |
+|---|---|---|---|---|---|---|
+| `BUILTIN_RECURRING` | recurring | GW,DASH,EP,ER,CLI | `claim_recurring_occurrence` | `_submit_with_guard` | `finalize_recurring_occurrence` | N/A |
+| `BUILTIN_ONESHOT` | one-shot | GW,DASH,EP,ER,CLI | `_prepare_due_one_shots_locked` | `_submit_with_guard` | `finalize_one_shot_occurrence` | N/A |
+| `CHRONOS_SYNC_RECURRING` | recurring | GW,DASH | `claim_job_for_fire` | `ChronosCronScheduler.run_claimed` | `finalize_recurring_occurrence` | N/A |
+| `CHRONOS_SYNC_ONESHOT` | one-shot | GW,DASH | `claim_job_for_fire` | `ChronosCronScheduler.run_claimed` | `finalize_one_shot_occurrence` | `_arm_one_shot` |
+| `CHRONOS_GATEWAY_HTTP_RECURRING` | recurring | GW | `claim_job_for_fire` | `ChronosCronScheduler.run_claimed` | `finalize_recurring_occurrence` | N/A |
+| `CHRONOS_GATEWAY_HTTP_ONESHOT` | one-shot | GW | `claim_job_for_fire` | `ChronosCronScheduler.run_claimed` | `finalize_one_shot_occurrence` | `_arm_one_shot` |
+| `CHRONOS_DASHBOARD_HTTP_RECURRING` | recurring | DASH | `claim_job_for_fire` | `ChronosCronScheduler.run_claimed` | `finalize_recurring_occurrence` | N/A |
+| `CHRONOS_DASHBOARD_HTTP_ONESHOT` | one-shot | DASH | `claim_job_for_fire` | `ChronosCronScheduler.run_claimed` | `finalize_one_shot_occurrence` | `_arm_one_shot` |
+| `CANARY` | paused canary | `CLI_CHAT/CANARY` | `claim_paused_job_canary` | `admit_and_start_managed_execution` | `finalize_paused_job_canary` | N/A |
+| `MANUAL_COMPAT` | manual | exact pairs below | `trigger_job` | `admit_and_start_managed_execution` | N/A | N/A |
+
+The manual pairs are exactly `GATEWAY/GATEWAY`,
+`GATEWAY_API_CHAT/GATEWAY`, `CLI_CHAT/CLI_CHAT`,
+`CLI_CHAT/CLI_MANUAL`, `TUI_STDIO/TUI_STDIO`, `TUI_WS/TUI_WS`,
+`ACP_STDIO/ACP_STDIO`, `STANDALONE_DASHBOARD/STANDALONE_DASHBOARD`,
+`ELECTRON_PRIMARY/ELECTRON_PRIMARY`, and
+`ELECTRON_PROFILE/ELECTRON_PROFILE`. A same-count host, role, owner, occurrence,
+stage, or witness substitution is a preflight refusal.
+
 Route is independent from ingress host. Direct `ChronosCronScheduler.fire_due`
 is the preserved synchronous provider ABI, not an invented resident host.
 `cron/scheduler.py::__main__ -> tick` is a `CLI_TICK` alias. `MANUAL_COMPAT` in
@@ -268,11 +430,51 @@ For every recurring route the suite includes an in-grace occurrence and a stale
 multi-slot catch-up, proving one claim/one effect, exact `scheduled_for`, one
 future schedule advance, ACTIVE restart blocking, and safe NOT_SUBMITTED retry.
 
+The expected cut product is literal. “Restart” means a cold process reading the
+durable postimage; it never trusts an in-memory result:
+
+| durable cut | recurring | one-shot | canary | manual | restart/effect rule |
+|---|---|---|---|---|---|
+| before claim commit | preimage | preimage | B/no C2 | no scheduled claim | selection may run once |
+| claim commit, before registration | ACTIVE | ACTIVE | ACTIVE C2+B | N/A | blocks automatic effect |
+| registered, before API entry | NOT_SUBMITTED only with proved never-call | exact preimage rollback only with proved never-call | ACTIVE C2+B | no effect | recurring NOT_SUBMITTED alone may retry |
+| API entered, ack unknown | ACTIVE | ACTIVE | ACTIVE C2+B | unknown | no replay, exit 3 |
+| accepted, before worker | ACTIVE | ACTIVE | ACTIVE C2+B | accepted | no replay |
+| worker start, before effect | ACTIVE/PENDING | ACTIVE/PENDING | ACTIVE C2+B/PENDING | PENDING | no replay |
+| cleanup COMPLETE, before result/finalizer | ACTIVE | ACTIVE | ACTIVE C2+B | pending result | exact worker may finalize |
+| cleanup INCOMPLETE or UNKNOWN | ACTIVE+quarantine | ACTIVE+quarantine | ACTIVE C2+B+diagnostic | quarantined | no replay, exit 3 |
+| result durable, before finalizer | ACTIVE | ACTIVE | ACTIVE C2+B | result | exact finalizer once |
+| before/unknown finalizer commit | ACTIVE or COMMIT_UNKNOWN | same | same | result | no guessed terminal state |
+| finalizer verified | terminal occurrence, future schedule retained | exact terminal/removal product | B plus four allowed leaves | result | no second finalizer |
+| before/unknown Chronos re-arm | terminal but re-arm pending | same | N/A | N/A | no effect replay; reconcile may arm only verified terminal one-shot |
+| re-arm verified, before release | exact successor armed | exact successor armed | N/A | N/A | release only exact context |
+| release verified | no context | no context | no context | no context | cold restart observes only store/provider truth |
+
+For the “registered, before API” row the recurring and one-shot disposition is
+legal only when no API/starter/task call occurred. Once a canary C2 exists it is
+never rolled back in that row. Shutdown before/after every row uses the same
+postimage, result, finalizer/re-arm count, and command exit; it does not create a
+separate shortcut. Equivalence across route rows is allowed only when claim,
+store, submit, finalizer, and re-arm owners are all identical.
+
 `ChronosCronScheduler.run_claimed` is the sole post-finalization one-shot re-arm
 owner for synchronous and HTTP routes. Reconcile and other paths do not re-arm
 an ACTIVE or cleanup-uncertain occurrence.
 
 ## 6. Pause-preserving canary conservation
+
+The public syntax is exactly `hermes cron canary JOB_ID` and
+`hermes cron skip-active-claim JOB_ID --claim-id UUID4 --reason TEXT`. The
+canary command emits exactly one JSON object with keys
+`status,job_id,claim_id,run_status,finalization_status,cleanup_status,error`.
+Success or an ordinary run failure writes that object to stdout, leaves stderr
+empty, and exits 0 or 1 respectively. Parser/validation/preclaim refusal writes
+the object to stderr, leaves stdout empty, and exits 2. Cleanup or commit
+uncertainty writes it to stderr, leaves stdout empty, keeps ACTIVE, and exits 3.
+The skip command additionally requires the exact current claim ID; success
+prints the terminal `OPERATOR_SKIPPED` record and exits 0, known refusal exits 2,
+and uncertain cleanup exits 3. No command has an implicit job, latest-claim,
+force, retry, or yes-default form.
 
 The public canary accepts one exact job reference only when its fresh locked row
 is paused and disabled. Let `P` be that full row, including unknown extensions,
@@ -295,9 +497,10 @@ extension-object key order, and extension-list order are part of conservation.
 
 `INCOMPLETE`, `UNKNOWN`, or commit uncertainty keeps C2 ACTIVE, preserves B,
 writes only the bounded cleanup diagnostic, exits 3, and blocks a second canary,
-resume, and trigger. Pre-API refusal may restore the exact B only when no API was
-entered. Tests inject every store commit cut and attempt a second canary after an
-operator-skipped C1.
+resume, and trigger. Once C2 is durably committed, even `PRE_API_REFUSED` keeps
+that exact ACTIVE C2 and embedded B; the general preclaim rollback rule does not
+apply. Restoring B is legal only at a cut before C2 exists. Tests inject every
+store commit cut and attempt a second canary after an operator-skipped C1.
 
 ## 7. Authentication, target binding, and first store access
 
@@ -314,6 +517,16 @@ Both Chronos HTTP adapters pass raw `Authorization` and exact JSON body
 5. fresh-opens only eligible candidates and accepts exactly one row whose ID and
    stored scheduled occurrence equal `fire_at`;
 6. rechecks the immutable binding before promotion and submit.
+
+Its only success product is
+`AuthenticatedTargetV1(profile,canonical_home,canonical_jobs_file,provider,
+route,job_id,fire_at,auth_subject,auth_purpose,auth_audience,auth_expiry,
+config_revision,reservation_id)`. Every field is nonnull and source-derived;
+the stored job is not copied into the product. Refusal is
+`AuthenticatedTargetRefusalV1(reason,reservation_released=true)` with no target
+fields. A success becomes invalid if any auth/config/profile/home/store/provider
+field or revision differs at the promotion barrier. The reservation is released
+exactly once on every refusal.
 
 Zero or multiple matches, any verification failure, CLOSED admission, or a
 config/auth tuple change refuses with zero mutation and no task or `202`.
@@ -341,6 +554,30 @@ separate Python child lifecycle; existing Electron handles are stop/wait
 witnesses only. TUI, ACP, CLI, and manual calls synchronously enter the central
 managed path using an installed lifecycle or one outer command-scoped lifecycle
 closed and drained in `finally`.
+
+The concrete shutdown ownership is exact:
+
+| host / role | lifecycle close/snapshot/drain owner | pre-kill/stop witness |
+|---|---|---|
+| GATEWAY / GATEWAY | `GatewayRunner.stop._stop_impl` | `_kill_tool_subprocesses` |
+| GATEWAY_API_CHAT / GATEWAY | same GATEWAY lifecycle | same immutable pre-kill snapshot |
+| STANDALONE_DASHBOARD / STANDALONE_DASHBOARD | `hermes_cli.web_server::_lifespan` | lifespan outer `finally` |
+| ELECTRON_PRIMARY / ELECTRON_PRIMARY | child `web_server::_lifespan` | existing `teardownPrimaryBackendAndWait` handle proves stop/wait |
+| ELECTRON_PROFILE / ELECTRON_PROFILE | child `web_server::_lifespan` | existing `teardownPoolBackendAndWait` handle proves stop/wait |
+| TUI_STDIO / TUI_STDIO | `cron.scheduler::command_scoped_lifecycle` | synchronous outer `finally` |
+| TUI_WS / TUI_WS | installed host lifecycle or `command_scoped_lifecycle` | synchronous outer `finally` |
+| ACP_STDIO / ACP_STDIO | `command_scoped_lifecycle` | synchronous outer `finally` |
+| CLI_CHAT / CLI_CHAT, CLI_MANUAL, CLI_TICK, CANARY | installed or command-scoped lifecycle | command outer `finally` |
+
+The Electron functions are read-only witnesses outside the 25-path edit set;
+they cannot be claimed as changed launch authority. For GATEWAY, close and the
+first snapshot occur in `_stop_impl`; immediately before
+`process_registry.kill_all`, `_kill_tool_subprocesses` consumes one immutable
+still-active snapshot and never resamples after kill. For each other row, the
+named outer owner closes first, snapshots RESERVED and registered contexts,
+then stops/awaits and drains or quarantines. If central implementation cannot
+provide this without editing a witness path, Loop 1 must reset the literal
+production scope rather than silently widen it.
 
 `tests/cron/test_scheduler_shutdown.py::test_nine_hosts_eleven_roles_close_snapshot_drain`
 must walk all nine hosts and 11 roles and prove: close is first teardown action;
@@ -392,6 +629,12 @@ traversal, symlinks, duplicate normalized paths, invalid profile names, duplicat
 JSON object keys, nonfinite JSON, duplicate job IDs, and malformed jobs wrappers.
 Jobs members are exactly root `cron/jobs.json` and
 `profiles/<valid>/cron/jobs.json`.
+
+Export remains the read-only baseline `hermes_cli.backup::run_backup` and is an
+AST-unchanged attestation. `TestRoundTrip.test_backup_then_import` proves its
+archive, including default and named-profile jobs stores plus non-jobs members,
+is accepted by the new whole-archive importer without an export-side writer or
+format fork.
 
 A zero-jobs archive still restores all valid non-jobs content. After the one
 read-only preflight and before `hermes_root.mkdir` or any destination creation,
@@ -445,20 +688,38 @@ mutation axiom, the launcher proves a clean deployed checkout/OID before the
 child imports. Failure leaves cron admission CLOSED but does not make ordinary
 messaging/readiness fail.
 
-Every protected claim-path module records its actual loader/spec origin and
-loaded identity at import. After provider resolution the activation aggregate
-includes entrypoint, jobs, scheduler, scheduler_provider, provider loader, exact
-selected provider, applicable HTTP/manual owner, and config/profile/home/auth/
-secrets/verifier/NAS dependencies.
+Read-only dependency modules outside the 25 paths are not changed to self-record.
+One central `gateway.status::observe_loaded_cron_runtime` inspects already-loaded
+module and callable objects only after provider resolution and before OPEN. The
+exact base set for every route is `cron.jobs`, `cron.scheduler`,
+`cron.scheduler_provider`, `hermes_cli.config`, `hermes_cli.profiles`, and
+`hermes_cli.auth`. Chronos routes add `plugins.cron_providers`,
+`plugins.cron_providers.chronos`, and
+`plugins.cron_providers.chronos._nas_client`; GATEWAY HTTP adds
+`gateway.platforms.api_server`; dashboard/Electron HTTP adds
+`hermes_cli.web_server`; CANARY adds `hermes_cli.cron` and `hermes_cli.main`;
+MANUAL adds `tools.cronjob_tools` plus the source-real entry module for its exact
+host. `FINITE_SCOPE_V1.json::routes[].loaded_modules` and
+`entrypoint_modules_by_host` are the literal route/role membership relation;
+omission or same-count substitution refuses.
 
-Disk HEAD/blob is only deployed identity. For each changed protected callable,
-controlled verification compares its actual live `__code__` and declared direct
-global callable bindings to the corresponding code object compiled from
-`Dh:path` by the canonical product interpreter, and binds module origin,
-checkout, and selected provider class. `inspect.getsource`, current-disk reads
-after import, or same-size/hash counts are not loaded-byte proof. Stale-loaded
-with current disk, mixed root/OID/blob, missing module, dirty checkout, or
-selected-provider mismatch leaves cron CLOSED.
+Disk HEAD/blob is only deployed identity. `LoadedObjectProofV1` is exactly
+`(role,profile,pid,process_start,module_name,module_origin,loader_name,
+checkout_root,deployed_oid,path,git_blob_sha256,object_kind,qualname,
+code_projection_sha256,binding_projection_sha256,status,reason)`. For modules,
+the code projection includes executed module code, imports, assignments, class
+bases/decorators/bodies, defaults and closures. For each changed protected
+callable it includes the live `__code__` graph (`co_code`, constants, names,
+vars, flags, free/cell vars, defaults, keyword defaults and closure cell
+values) and declared direct global callable bindings. The observer compares
+that projection with objects compiled from `Dh:path` by the canonical product
+Python 3.11 without executing them. Status is exactly `VERIFIED` or `REFUSED`;
+all other fields are required on VERIFIED and `reason` is required on REFUSED.
+`inspect.getsource`, re-reading current disk as a substitute for a live object,
+same-size/count evidence, or a post-hoc process verifier is invalid. Stale-loaded
+with restored disk, mixed root/OID/blob, missing object, dirty checkout, wrong
+entrypoint set, or selected-provider mismatch leaves cron CLOSED before first
+store open or claim.
 
 The complete Git chain is:
 
@@ -468,6 +729,32 @@ The complete Git chain is:
   `R[role, profile, pid, start] == Dh`.
 - MarketWatch: `Cmw == Rmw`; approved merge `Mmw` contains it; deployed clean
   `Dmw == Mmw`.
+
+The only canonical authorities are Hermes URL
+`https://github.com/kendeng300/hermes-agent.git` at freshly fetched
+`refs/remotes/origin/main`, and MarketWatch URL
+`https://github.com/kendeng300/marketwatch.git` at freshly fetched
+`refs/remotes/origin/master`. A similarly named remote, stale local ref, tag,
+local branch, or wrong default branch refuses.
+
+The sole handoff owner is
+`gateway.status::accept_controlled_deployment(*, hermes_root,
+marketwatch_root, approved_artifacts, intended_roles, launch) ->
+ControlledAcceptanceV1`. It performs exactly: CLOSE, DRAIN, owner-prove every
+old role STOPPED, fresh-fetch and verify MarketWatch URL/ref/ancestry and
+`Cmw/Rmw/Mmw/Dmw`, fresh-fetch and verify Hermes URL/ref/ancestry and
+`Ch/Rh/Mh/Dh`, launch each child with the immutable expectation before claim
+imports, receive each child's pre-store loaded-object verification, aggregate
+the exact intended `STOPPED | VERIFIED` role set, then OPEN. It never mutates a
+checkout while an old role is live and never verifies a child after admission.
+
+`ControlledAcceptanceV1(status, Ch, Rh, Mh, Dh, Cmw, Rmw, Mmw, Dmw,
+role_receipts, reason)` is `ACCEPTED` only when every identity is present and
+the full order completed; it exits 0. A known prelaunch/preclaim failure is
+`REFUSED`, exits 2, leaves CLOSED, and performs zero store open/claim. An
+uncertain launch/stop/receipt is `AMBIGUOUS`, exits 3, leaves CLOSED, and is
+never reported as STOPPED or VERIFIED. This object, not a READY file, is the
+terminal deployment handoff.
 
 Deploy and verify MarketWatch before Hermes. Strict acceptance enumerates every
 intended resident role and requires owner-proved `STOPPED` or live `VERIFIED` at
@@ -483,18 +770,41 @@ the latest branch and rerun the finite preflight plus required tests.
 
 `FINITE_SCOPE_V1.json` contains:
 
-- the two pinned source OIDs and literal 25 production paths;
-- every protected changed/added/deleted/unchanged-attested function;
-- exact direct authority edges and counts;
-- the ten semantic routes, host/role axis, ordered stages, and exact test nodes.
+- the two pinned commit OIDs, canonical URLs/refs, and literal 25 production
+  paths;
+- every protected changed/added/deleted/unchanged-attested whole function,
+  baseline-exact signature/dynamic sites, an independent authority inventory,
+  and exact caller-to-callee counts;
+- the ten exact route×occurrence×host/role×claim×submit×finalizer×re-arm and
+  loaded-module relations, shutdown owners, closed result schemas, complete
+  `save_jobs` reverse migration, and exact test nodes;
+- five current subject artifacts, two Git-history evidence files, and three
+  retired artifacts that must remain absent.
 
 `validate_finite_scope_v1.py` is read-only and uses Git-object commands for
 production bytes. In manifest phase it checks schema, exact scope, source
 existence, canonical AST hashes, routes/hosts/roles, and test-node syntax. In
 candidate phase it additionally refuses production paths outside 25, unlisted
-changed functions, wrong dispositions, changed attestations, missing or
-substituted direct authority calls, dynamic or escaped authority callable use,
-and string-built authority names.
+changed functions, wrong dispositions, changed attestations or baseline-exact
+signatures/defaults/decorators, any residual module/import/assignment/class
+change after declared whole functions are removed, missing or substituted
+direct authority calls, and new/changed reflection, namespace lookup, dynamic
+import, callable-result, lambda-callee, subscript-callee, escaped callable, or
+string-constructed authority selection.
+
+Candidate OIDs must be Git commit objects. The invoked checker and manifest must
+be byte-equal to their blobs in the candidate commit. Candidate mode requires
+exactly five external `--approved-artifact-sha256 PATH=HASH` arguments; those
+bind the proposal, pointer, manifest, checker, and current DMAIC bytes without a
+self-referential candidate hash. It requires all five current artifacts and two
+history files present, all three retired artifacts absent, and every required
+test file plus exact Python qualname present in candidate Git objects. It
+re-derives the pinned semantic reverse set of public `save_jobs` and requires
+complete migration with zero candidate reference. The coordinator also supplies
+`--hermes-fetched-ref-oid` and `--marketwatch-fetched-ref-oid`; each must be a
+commit object equal to the configured exact canonical ref after the
+coordinator's fresh fetch. Fresh-fetch timing and the full OID handoff belong to
+that named coordinator, not a local state file.
 
 A literal Name/Attribute call resolved from a static import is direct. Authority
 callables may not be assigned, returned, placed in a container, passed to a
@@ -504,8 +814,9 @@ baseline exception requires one exact `BaselineSiteV1`, one targeted test, and
 spec review; adding general analyzer logic is not the remedy.
 
 The checker result is exactly
-`{"status":"PASS|REFUSED","errors":[{"code":...,"detail":...}]}` and errors are
-empty iff PASS. Counts and digests are observations, not semantic proof. The
+`{"status":"PASS|REFUSED","errors":[{"code":...,"path":...,
+"qualname":...,"detail":...}]}` and errors are empty iff PASS. Counts and
+digests are observations, not semantic proof. The
 parameterized behavioral tests prove runtime meanings; the checker only proves
 finite scope and syntax-level authority structure.
 
@@ -515,14 +826,32 @@ Hermes must contain and pass these literal nodes:
 
 - `tests/cron/test_sys1030_scope_preflight.py::test_exact_25_path_and_changed_function_contract`
 - `tests/cron/test_sys1030_scope_preflight.py::test_direct_authority_calls_and_baseline_attestations`
+- `tests/cron/test_sys1030_scope_preflight.py::test_module_class_signature_partition_rejects_undeclared_change`
+- `tests/cron/test_sys1030_scope_preflight.py::test_constructed_authority_and_dynamic_site_complement`
+- `tests/cron/test_sys1030_scope_preflight.py::test_subject_artifacts_and_real_test_nodes_are_candidate_bound`
+- `tests/cron/test_sys1030_scope_preflight.py::test_canonical_remotes_and_refs_are_exact`
+- `tests/cron/test_sys1030_scope_preflight.py::test_authority_inventory_and_edges_are_exact`
 - `tests/cron/test_sys1030_route_matrix.py::test_ten_routes_every_cut_claim_finalize_rearm_release`
+- `tests/cron/test_sys1030_route_matrix.py::test_exact_route_relation_rejects_same_count_substitution`
+- `tests/cron/test_sys1030_route_matrix.py::test_closed_result_schemas_reject_unlisted_cross_products`
+- `tests/cron/test_sys1030_route_matrix.py::test_total_cut_restart_matrix_has_literal_postimages`
+- `tests/cron/test_sys1030_route_matrix.py::test_closed_result_schemas_reject_unlisted_cross_products`
+- `tests/cron/test_sys1030_route_matrix.py::test_total_cut_restart_matrix_has_literal_postimages`
 - `tests/cron/test_jobs.py::test_scheduled_claim_total_union_and_restart`
 - `tests/cron/test_jobs.py::test_canary_B_C2_four_leaf_conservation`
+- `tests/cron/test_jobs.py::test_cross_process_lock_unavailable_refuses_before_read`
+- `tests/cron/test_jobs.py::test_canary_cli_results_and_post_c2_cuts`
+- `tests/cron/test_jobs.py::test_parent_dead_child_live_skip_refuses`
+- `tests/cron/test_jobs.py::test_no_public_raw_jobs_writer`
 - `tests/cron/test_scheduler_shutdown.py::test_nine_hosts_eleven_roles_close_snapshot_drain`
+- `tests/cron/test_scheduler_shutdown.py::test_all_host_shutdown_owners_close_snapshot_before_kill`
 - `tests/cron/test_scheduler_provider.py::test_auth_profile_binding_before_first_store_open`
 - `tests/cron/test_scheduler_provider.py::test_loaded_claim_modules_are_actual_imported_bytes`
+- `tests/cron/test_scheduler_provider.py::test_exact_loaded_module_sets_and_live_code_objects`
 - `tests/gateway/test_status.py::test_git_candidate_merge_deploy_live_role_chain`
+- `tests/gateway/test_status.py::test_acceptance_coordinator_order_and_typed_handoff`
 - `tests/hermes_cli/test_backup.py::test_whole_archive_jobs_last_and_truthful_partial`
+- `tests/hermes_cli/test_backup.py::TestRoundTrip.test_backup_then_import`
 - `tests/cron/test_scheduler.py::test_prerun_failure_constructs_nothing_and_dominates`
 - `tests/cron/test_scheduler.py::test_existing_script_supervisor_ast_is_unchanged`
 
