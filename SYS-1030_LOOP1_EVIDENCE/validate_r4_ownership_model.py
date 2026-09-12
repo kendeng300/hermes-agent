@@ -551,6 +551,7 @@ def derive_source_oracle(roots, oids):
     # be parsed soundly.
     all_import_graph = {module: set() for module in tracked_modules}
     all_call_graph = {module: set() for module in tracked_modules}
+    unresolved_dynamic_modules = set()
     all_reverse_import_graph = {module: set() for module in tracked_modules}
     path_modules = {path: module for module, path in tracked_modules.items()}
 
@@ -594,6 +595,33 @@ def derive_source_oracle(roots, oids):
             parent = dotted_name(node.value)
             return (parent + "." if parent else "") + node.attr
         return ""
+
+    managed_dynamic_targets = {
+        "claim_job_for_fire", "fire_due", "get_fire_verifier",
+        "resolve_cron_scheduler", "run_one_job",
+    }
+
+    def literal_fragments(node):
+        return "".join(
+            item.s for item in ast.walk(node) if isinstance(item, ast.Str)
+        )
+
+    def unresolved_managed_dynamic_call(node):
+        if not isinstance(node, ast.Call):
+            return False
+        called = dotted_name(node.func)
+        candidate = ""
+        if called.endswith("getattr") and len(node.args) >= 2:
+            if isinstance(node.args[1], ast.Str):
+                return False
+            candidate = literal_fragments(node.args[1])
+        elif called in {"globals", "locals"}:
+            candidate = literal_fragments(node)
+        elif called in {"__import__", "importlib.import_module"} and node.args:
+            if isinstance(node.args[0], ast.Str):
+                return False
+            candidate = literal_fragments(node.args[0])
+        return any(target in candidate for target in managed_dynamic_targets)
 
     for module, path in tracked_modules.items():
         source = text("HERMES", path)
@@ -652,6 +680,8 @@ def derive_source_oracle(roots, oids):
                             break
                         candidate = candidate.rpartition(".")[0]
             elif isinstance(item, ast.Call):
+                if unresolved_managed_dynamic_call(item):
+                    unresolved_dynamic_modules.add(module)
                 called = dotted_name(item.func)
                 if not called:
                     continue
@@ -678,6 +708,15 @@ def derive_source_oracle(roots, oids):
         module: all_import_graph[module] | all_call_graph[module]
         for module in tracked_modules
     }
+    hidden_bridge_tree = ast.parse(
+        "import cron.scheduler_provider as provider\n"
+        "def hidden_bridge():\n"
+        "    return getattr(provider, 'resolve_' + 'cron_scheduler')()\n"
+    )
+    if not any(
+        unresolved_managed_dynamic_call(node) for node in ast.walk(hidden_bridge_tree)
+    ):
+        fail("SOURCE_DYNAMIC_FALSIFIER_BLIND", "hidden_dynamic_bridge.py", "getattr target")
     for module, targets in all_source_graph.items():
         for target in targets:
             if target != module:
@@ -764,9 +803,26 @@ def derive_source_oracle(roots, oids):
     all_forward = walk(all_source_graph, entry_modules)
     all_reverse = walk(all_reverse_import_graph, authority_modules)
     source_connected = all_forward & all_reverse
+    probe_graph = {module: set(targets) for module, targets in all_source_graph.items()}
+    probe_graph["hidden_dynamic_bridge"] = {"cron.scheduler_provider"}
+    probe_graph["gateway.run"].add("hidden_dynamic_bridge")
+    probe_reverse = {module: set() for module in probe_graph}
+    for module, targets in probe_graph.items():
+        for target in targets:
+            probe_reverse.setdefault(target, set()).add(module)
+    if "hidden_dynamic_bridge" not in (
+        walk(probe_graph, entry_modules) & walk(probe_reverse, authority_modules)
+    ):
+        fail("SOURCE_FIXED_POINT_FALSIFIER_BLIND", "hidden_dynamic_bridge.py", "forward/reverse")
+    unresolved_connected = source_connected & unresolved_dynamic_modules
+    if unresolved_connected:
+        fail(
+            "SOURCE_UNRESOLVED_DYNAMIC_TARGET", "python",
+            repr(sorted(unresolved_connected)),
+        )
     module_names = (
         entry_modules | relation_modules | authority_modules | support_modules
-        | reexport_modules | provider_family | (source_connected & relevant_modules)
+        | reexport_modules | provider_family | source_connected
         | {"hermes_cli.cron_deployment"}
     )
 
@@ -1001,6 +1057,13 @@ def derive_source_oracle(roots, oids):
     providers = {binding + ":" + kind for binding in bindings for kind in resolution_kinds}
     return {
         "_authority_modules": authority_modules,
+        "_module_paths": {
+            module: (
+                tracked_modules[module] if module in tracked_modules
+                else "CREATE:hermes_cli/cron_deployment.py"
+            )
+            for module in module_names
+        },
         "_python_graph_counts": {
             "modules": len(tracked_modules),
             "import_edges": sum(len(value) for value in all_import_graph.values()),
@@ -1320,8 +1383,10 @@ def validate_typed_membership_sets(type_map, source_oracle):
         fail("ROUTE_TYPED_MEMBERSHIP_MISMATCH", "RouteMemberTupleV1", "literal slots")
 
     module_tuple = type_map["ModuleMemberTupleV1"]
+    module_slot_width = len(str(len(module_members) - 1))
     expected_module_fields = [
-        "member_" + str(index).zfill(2) for index in range(len(module_members))
+        "member_" + str(index).zfill(module_slot_width)
+        for index in range(len(module_members))
     ]
     if [field["name"] for field in module_tuple["fields"]] != expected_module_fields or any(
         field["type"] != "ModuleNameV1" or field["presence"] != "REQUIRED"
@@ -1366,8 +1431,9 @@ def validate_typed_membership_sets(type_map, source_oracle):
         ordered = sorted(members)
         if len(ordered) != len(set(ordered)) or not set(ordered) <= set(universe):
             fail("MEMBERSHIP_LITERAL_INVALID", prefix, repr(ordered))
+        slot_width = len(str(width - 1))
         slots = {
-            prefix + str(index).zfill(2 if width >= 10 else 1): (
+            prefix + str(index).zfill(slot_width): (
                 ordered[index] if index < len(ordered) else None
             )
             for index in range(width)
@@ -1752,7 +1818,11 @@ def validate_manifests(model, locator_map, conditions, source_oracle):
             if member["condition"] != "ALWAYS" and member["condition"] not in conditions:
                 fail("CONDITION_REFERENCE_UNDEFINED", mid + "." + key, member["condition"])
             sorted_unique(member["locators"], mid + "." + key + ".locators")
-            if not member["locators"] or any(lid not in locator_map for lid in member["locators"]):
+            if mid == "modules":
+                expected_path = source_oracle["_module_paths"].get(key)
+                if member["locators"] or member["attributes"].get("source_path") != expected_path:
+                    fail("MODULE_SOURCE_PATH_MISMATCH", mid + "." + key, repr(expected_path))
+            elif not member["locators"] or any(lid not in locator_map for lid in member["locators"]):
                 fail("SOURCE_REFERENCE_UNDEFINED", mid + "." + key, "locators")
             if not isinstance(member["attributes"], dict):
                 fail("MANIFEST_ATTRIBUTES_INVALID", mid + "." + key, "attributes")
@@ -2072,12 +2142,12 @@ def validate_source_fixed_point(manifests, source_cache, source_oracle):
         fail("SOURCE_FIXED_POINT_MISMATCH", "host_route", "forward/reverse disagreement")
 
     module_paths = {
-        item["key"]: tuple(source_cache[lid]["path"] for lid in item["locators"])
+        item["key"]: item["attributes"].get("source_path")
         for item in manifests["modules"]["members"]
     }
-    if set(module_paths) != source_oracle["modules"]:
+    if module_paths != source_oracle["_module_paths"]:
         fail("SOURCE_FIXED_POINT_MISMATCH", "modules", "module set")
-    if any(not paths for paths in module_paths.values()):
+    if any(not path for path in module_paths.values()):
         fail("SOURCE_FIXED_POINT_MISMATCH", "modules", "unproved member")
     return {
         "host_route_edges": len(forward_pairs),

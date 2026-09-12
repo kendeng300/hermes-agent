@@ -128,9 +128,14 @@ parses source-relevant entry, authority, caller, import, writer, and wrapper
 relationships without intersecting them with a model member list. Before that
 selection it builds the complete tracked production-Python import/call graph
 and the relevant tracked TypeScript/shell call/write graph. Unsupported syntax
-on a managed relation refuses; it is never silently filtered. Forward
-entrypoint reachability and reverse sink reachability must reach the same
-source-owned projection. MarketWatch writer discovery parses every tracked
+on a managed relation refuses; it is never silently filtered. The module
+authority is the complete intersection of forward source-derived-entrypoint
+reachability and reverse managed-sink reachability, with no later regex/name
+intersection. A source-connected `getattr`, `globals`, `importlib`, dynamic
+import, or constructed managed target that cannot be resolved statically is a
+hard refusal. Forward entrypoint reachability and reverse sink reachability
+must reach that same source-owned projection. MarketWatch writer discovery
+parses every tracked
 production Python candidate, including aliases, function-local bindings, and
 direct destination expressions, plus both shell extractor callers. It checks
 keyed fan-in/fan-out cardinality and identity conservation and binds every
