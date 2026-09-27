@@ -18,9 +18,10 @@ _PROTECTED_BLOCKS = (
     "TRUTH MANDATE", "SELF-POLICING BAN", "CODE TRACEABILITY MANDATE",
     "HONEST BLOCKER REPORT IS VALID COMPLETION", "BYPASS ESCALATION PROHIBITION",
 )
-_APPROVED_REQ_MANIFEST_SHA256 = "7963ac5a1f6bbc99c5d3fcb064ca50cc5062b729fe7135b3ea515cee69660f55"
-_APPROVED_CANONICAL_CORE_SHA256 = "9175c49e20f242f42ca1d043486c5edae742628b0ed551ecf882e662e0fe1d24"
-_APPROVED_CANONICAL_CORE_PATH = Path.home() / ".hermes" / "SOUL.md"
+# Reviewed identity reconciliation: docs/sys2977-policy-reconciliation.md.
+_APPROVED_REQ_MANIFEST_SHA256 = "71c71b61aa36002e0c9d3bbdeff75860f7de275ebe2e075ca506aa2800bc5eaa"
+_APPROVED_CANONICAL_CORE_SHA256 = "94075360d64c1bde30039428c3295c8721330043f03edf07bbb2d6cd55bd515e"
+_APPROVED_REQ_COUNT = 150
 
 
 def _normalized_text(data: bytes, *, label: str) -> str:
@@ -81,8 +82,7 @@ def render_profile(
     core_path: Path | str | None = None,
     adapter_path: Path | str | None = None,
 ) -> RenderedPromptProfile:
-    canonical_path = core_path if core_path is not None else _APPROVED_CANONICAL_CORE_PATH
-    canonical = load_policy_core(canonical_path) if core is None else _normalized_text(
+    canonical = load_policy_core(core_path) if core is None else _normalized_text(
         core.encode("utf-8"), label="canonical policy core"
     )
     adapter, metadata = _adapter_text(spec, adapter_path)
@@ -95,9 +95,10 @@ def render_profile(
     # caller may override the profile-aware source path for validation/tests,
     # but may not bypass the production contract by doing so.
     req_keys = [tuple(row) for row in reqs]
-    if len(req_keys) != 152 or len(set(req_keys)) != 152:
+    if len(req_keys) != _APPROVED_REQ_COUNT or len(set(req_keys)) != _APPROVED_REQ_COUNT:
         raise PromptProfileError(
-            f"POLICY_INTEGRITY_FAILURE: expected 152 unique REQ tuples, got {len(req_keys)}"
+            f"POLICY_INTEGRITY_FAILURE: expected {_APPROVED_REQ_COUNT} unique REQ tuples, "
+            f"got {len(req_keys)}"
         )
     missing = [block for block in _PROTECTED_BLOCKS if block not in canonical]
     if missing:

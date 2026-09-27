@@ -66,6 +66,7 @@ fi
 # ── Run in hermetic env ──────────────────────────────────────────────────────
 # env -i: start with empty environment, opt-in only what we need.
 # No credential var can leak — you'd have to explicitly add it here.
+# Preserve configured temporary directories for isolated test runs.
 echo "▶ running per-file parallel test suite via run_tests_parallel.py"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; clean env)"
 
@@ -74,6 +75,9 @@ cd "$REPO_ROOT"
 exec env -i \
   PATH="$PATH" \
   HOME="$HOME" \
+  ${TMPDIR:+TMPDIR="$TMPDIR"} \
+  ${TEMP:+TEMP="$TEMP"} \
+  ${TMP:+TMP="$TMP"} \
   TZ=UTC \
   LANG=C.UTF-8 \
   LC_ALL=C.UTF-8 \
