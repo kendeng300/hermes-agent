@@ -16,7 +16,7 @@ def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> str:
 
     reqs = [
         [f"test-{index}", "constraint", "universal", f"gate-{index}"]
-        for index in range(152)
+        for index in range(renderer._APPROVED_REQ_COUNT)
     ]
     core = "\n".join(
         [*renderer._PROTECTED_BLOCKS]
@@ -28,7 +28,7 @@ def _install_parent_supported_core(tmp_path: Path, monkeypatch) -> str:
     ) + "\n"
     core_path = tmp_path / "SOUL.md"
     core_path.write_text(core, encoding="utf-8")
-    monkeypatch.setattr(renderer, "_APPROVED_CANONICAL_CORE_PATH", core_path)
+    monkeypatch.setattr(renderer, "default_core_path", lambda: core_path)
     monkeypatch.setattr(
         renderer,
         "_APPROVED_CANONICAL_CORE_SHA256",
