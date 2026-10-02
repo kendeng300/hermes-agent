@@ -291,6 +291,121 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+@pytest.mark.parametrize("entrypoint", ["live", "registry"])
+@pytest.mark.parametrize("platform,async_supported", [("cron", True), ("api_server", False)])
+def test_cron_delegation_returns_parallel_results_before_parent_exit(
+    monkeypatch, tmp_path, request, entrypoint, platform, async_supported
+):
+    """A cron parent must own its results before its session/DB is closed.
+
+    Exercise the real aggregation and daemon pool: the first workers rendezvous
+    concurrently, one remains pending, and another reports a genuine failure.
+    The tool must return all results together rather than an unroutable handle.
+    """
+    import json
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import MagicMock
+
+    import gateway.session_context as session_context
+    import tools.delegate_tool as dt
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+    from tools.registry import registry
+
+    parent = MagicMock()
+    parent.platform = platform
+    parent._delegate_depth = 0
+    parent.session_id = "cron_test_parent"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = threading.Lock()
+    parent._memory_manager = None
+    parent._session_db = SessionDB(tmp_path / "state.db")
+    request.addfinalizer(parent._session_db.close)
+    parent._session_db.create_session(parent.session_id, source=platform)
+
+    def build_child(**kwargs):
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        child.session_id = f"child_{kwargs['task_index']}"
+        child._session_db = parent._session_db
+        child._session_db.create_session(
+            child.session_id, source="subagent", parent_session_id=parent.session_id,
+        )
+        return child
+
+    release = threading.Event()
+    started = threading.Barrier(3)
+    slow_started = threading.Event()
+    all_finished = threading.Event()
+    finished = []
+
+    def run_child(task_index, goal, child, **kwargs):
+        if task_index < 3:
+            started.wait(timeout=5)
+        if task_index == 0:
+            slow_started.set()
+            assert release.wait(timeout=5)
+        failed = task_index == 1
+        child._session_db.append_message(
+            child.session_id, "assistant",
+            "source unavailable" if failed else f"independent opinion: {goal}",
+        )
+        finished.append(task_index)
+        if len(finished) == 3:
+            all_finished.set()
+        return {
+            "task_index": task_index,
+            "status": "error" if failed else "completed",
+            "summary": None if failed else f"independent opinion: {goal}",
+            "error": "source unavailable" if failed else None,
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "test-model",
+        }
+
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    monkeypatch.setattr(dt, "_get_max_concurrent_children", lambda: 3)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: {
+        "model": "test-model", "provider": None, "base_url": None,
+        "api_key": None, "api_mode": None, "command": None, "args": None,
+    })
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: async_supported)
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda **kw: "")
+
+    tasks = [{"goal": f"seat {index}"} for index in range(3)]
+
+    def dispatch():
+        if entrypoint == "live":
+            return AIAgent._dispatch_delegate_task(parent, {"tasks": tasks})
+        return registry.dispatch("delegate_task", {"tasks": tasks}, parent_agent=parent)
+
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        pending = caller.submit(dispatch)
+        try:
+            assert slow_started.wait(timeout=5)
+            assert not pending.done(), "cron returned while an analyst was still running"
+        finally:
+            release.set()
+            assert all_finished.wait(timeout=5)
+        result = json.loads(pending.result(timeout=5))
+
+    assert sorted(finished) == list(range(len(tasks)))
+    assert [entry["task_index"] for entry in result["results"]] == list(range(len(tasks)))
+    assert result["results"][0]["summary"] == "independent opinion: seat 0"
+    assert result["results"][1]["status"] == "error"
+    assert result["results"][1]["summary"] is None
+    assert result["results"][1]["error"] == "source unavailable"
+    assert "delegation_id" not in result
+    assert process_registry.completion_queue.empty()
+    assert ad.active_count() == 0
+    for index in range(len(tasks)):
+        assert len(parent._session_db.get_messages(f"child_{index}")) == 1
+    parent._session_db.append_message(parent.session_id, "tool", json.dumps(result))
+    assert len(parent._session_db.get_messages(parent.session_id)) == 1
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 

@@ -2973,16 +2973,25 @@ def delegate_task(
             _async_ok = async_delivery_supported()
         except Exception:
             _async_ok = True
-        if not _async_ok:
+        # Cron parents are ephemeral: they have no completion-event consumer,
+        # and the scheduler closes their shared session DB after the turn.
+        # Keep the existing parallel fan-out, but return its results within
+        # this tool call before the parent can finish and close that DB.
+        _cron_parent = getattr(parent_agent, "platform", None) == "cron"
+        if not _async_ok or _cron_parent:
+            _sync_reason = (
+                "ephemeral cron session"
+                if _cron_parent else "stateless HTTP API"
+            )
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
-                "(stateless HTTP API); running the batch synchronously instead."
+                "(%s); running the batch synchronously instead.", _sync_reason,
             )
             _sync_result = _execute_and_aggregate()
             if isinstance(_sync_result, dict):
                 _sync_result["note"] = (
-                    "background=true is not available on this endpoint (stateless "
-                    "HTTP API — no channel to deliver a detached subagent result "
+                    f"background=true is not available on this endpoint ({_sync_reason} "
+                    "— no channel to deliver a detached subagent result "
                     "after the turn ends), so the subagent(s) ran SYNCHRONOUSLY and "
                     "the result is included above."
                 )
