@@ -35,7 +35,7 @@ def script_env(tmp_path, monkeypatch):
     return sched, job, script
 
 
-@pytest.mark.parametrize("failure", [None, "timeout", "cleanup"])
+@pytest.mark.parametrize("failure", [None, "nonzero", "timeout", "cleanup"])
 def test_script_does_not_change_parent_cwd_even_on_failure(script_env, monkeypatch, failure):
     sched, job, script = script_env
     parent_cwd = os.getcwd()
@@ -48,7 +48,8 @@ def test_script_does_not_change_parent_cwd_even_on_failure(script_env, monkeypat
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
         if failure == "cleanup":
             raise sched.CronScriptCleanupError("synthetic cleanup uncertainty")
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+        return subprocess.CompletedProcess(argv, 7 if failure == "nonzero" else 0,
+                                           stdout="ok", stderr="")
 
     monkeypatch.setattr(sched, "_run_script_process", run_process)
     pause = MagicMock(return_value="cleanup unverified; job paused")
@@ -64,6 +65,8 @@ def test_script_does_not_change_parent_cwd_even_on_failure(script_env, monkeypat
         assert "cleanup unverified" in error
     elif failure == "timeout":
         assert "timed out" in error
+    elif failure == "nonzero":
+        assert "exited with code 7" in error
     else:
         assert response == "ok"
 
@@ -142,9 +145,11 @@ def test_script_runs_during_agent_override_without_leaking_cwd(script_env, monke
     due = [agent_job]
     monkeypatch.setattr(sched, "get_due_jobs", lambda: list(due))
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as seq, \
-         concurrent.futures.ThreadPoolExecutor(max_workers=2) as parallel:
+         concurrent.futures.ThreadPoolExecutor(max_workers=2) as parallel, \
+         concurrent.futures.ThreadPoolExecutor(max_workers=1) as scripts:
         monkeypatch.setattr(sched, "_get_sequential_pool", lambda: seq)
         monkeypatch.setattr(sched, "_get_parallel_pool", lambda workers: parallel)
+        monkeypatch.setattr(sched, "_get_script_pool", lambda: scripts)
         try:
             assert sched.tick(verbose=False, sync=False) == 1
             assert agent_started.wait(5), "mock agent did not start"
@@ -170,6 +175,7 @@ def test_script_runs_during_agent_override_without_leaking_cwd(script_env, monke
     assert second_agent_started.is_set()
     assert os.getcwd() == parent_cwd
     assert os.environ.get("TERMINAL_CWD") == baseline
+    assert sched._terminal_cwd_baseline is None
     assert sched._running_job_ids == set()
 
 
@@ -207,3 +213,61 @@ def test_saturated_agent_pool_does_not_block_script(script_env, monkeypatch):
     finally:
         release_agent.set()
         sched._shutdown_parallel_pool()
+
+
+def test_script_pool_serializes_and_drains_accepted_work(monkeypatch):
+    import cron.scheduler as sched
+
+    monkeypatch.setattr(sched, "_parallel_pool", None)
+    monkeypatch.setattr(sched, "_sequential_pool", None)
+    monkeypatch.setattr(sched, "_script_pool", None)
+    started = threading.Event()
+    release = threading.Event()
+    shutdown_started = threading.Event()
+    shutdown_done = threading.Event()
+    completed = []
+    pool = sched._get_script_pool()
+    assert sched._get_script_pool() is pool
+
+    def first():
+        started.set()
+        assert release.wait(5)
+        completed.append("first")
+
+    def shutdown():
+        shutdown_started.set()
+        sched._shutdown_parallel_pool()
+        shutdown_done.set()
+
+    first_future = pool.submit(first)
+    second_future = pool.submit(lambda: completed.append("second"))
+    thread = threading.Thread(target=shutdown)
+    try:
+        assert started.wait(3)
+        assert not second_future.done()
+        thread.start()
+        assert shutdown_started.wait(3)
+        assert not shutdown_done.is_set()
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(5)
+        else:
+            sched._shutdown_parallel_pool()
+    first_future.result(timeout=1)
+    second_future.result(timeout=1)
+    assert shutdown_done.is_set()
+    assert completed == ["first", "second"]
+    assert sched._script_pool is None
+
+
+def test_agent_prerun_script_keeps_its_agent_environment(script_env, monkeypatch):
+    sched, job, script = script_env
+    monkeypatch.setenv("TERMINAL_CWD", "active-agent-project")
+    monkeypatch.setattr(sched, "_terminal_cwd_baseline", {"TERMINAL_CWD": "baseline"})
+    job["no_agent"] = False
+    success, output = sched._run_scheduled_job_script(job, str(script))
+    assert success
+    assert json.loads(output) == {
+        "cwd": str(script.parent), "terminal_cwd": "active-agent-project",
+    }

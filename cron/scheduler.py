@@ -428,20 +428,25 @@ def _consume_interrupted_flag(job_id: str) -> bool:
         return False
 
 
-# Sequential (env-mutating) cron jobs — workdir jobs that touch
+# Sequential (env-mutating) cron agents — workdir jobs that touch
 # process-global runtime state — must run one at a time, but must NOT block the
 # ticker thread.  A persistent single-thread executor preserves ordering across
 # ticks while keeping dispatch fire-and-forget, the same as the parallel pool.
 _sequential_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+# Reserve one worker for pure scripts so agent reviews cannot starve polling.
+# The configured parallel-agent cap remains unchanged; this adds one script
+# slot, and scripts still queue behind other scripts.
+_script_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
 
 class _ReadWriteLock:
     """Writer-preferring readers-writer lock.
 
     Guards the process-global ``os.environ["TERMINAL_CWD"]`` override that a
-    workdir cron job applies for the whole of its agent run.  Workdir jobs are
-    writers: they mutate the shared env and need exclusive access.  Workdir-less
-    jobs are readers: they only observe ``TERMINAL_CWD`` (indirectly, via the
+    workdir cron job applies for the whole of its agent run. Workdir agents are
+    writers: they mutate the shared env and need exclusive access. Workdir-less
+    agents are readers: they only observe ``TERMINAL_CWD`` (indirectly, via the
     terminal / file / code-exec tools), so any number of them may run
     concurrently with each other, but none may run alongside a writer — that is
     exactly what stops a workdir-less job from picking up another job's workdir
@@ -487,8 +492,13 @@ class _ReadWriteLock:
 
 
 # Serializes the per-job TERMINAL_CWD override against every other concurrently
-# running cron job.  See _ReadWriteLock and run_job for the usage contract.
+# running cron agent. See _ReadWriteLock and run_job for the usage contract.
 _terminal_cwd_lock = _ReadWriteLock()
+
+# Pure scripts must not inherit an agent's temporary TERMINAL_CWD override.
+# This short lock only protects capture/copy/restore, never an agent's run.
+_terminal_cwd_env_lock = threading.Lock()
+_terminal_cwd_baseline: Optional[dict[str, str]] = None
 
 
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
@@ -522,9 +532,20 @@ def _get_sequential_pool() -> concurrent.futures.ThreadPoolExecutor:
     return _sequential_pool
 
 
+def _get_script_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the reserved, bounded pure-script lane."""
+    global _script_pool
+    if _script_pool is None:
+        _script_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="cron-script",
+        )
+    return _script_pool
+
+
 def _shutdown_parallel_pool() -> None:
     """Shut down the persistent pools on process exit."""
-    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool
+    global _parallel_pool, _parallel_pool_max_workers, _sequential_pool, _script_pool
     if _parallel_pool is not None:
         _parallel_pool.shutdown(wait=True, cancel_futures=False)
         _parallel_pool = None
@@ -532,6 +553,9 @@ def _shutdown_parallel_pool() -> None:
     if _sequential_pool is not None:
         _sequential_pool.shutdown(wait=True, cancel_futures=False)
         _sequential_pool = None
+    if _script_pool is not None:
+        _script_pool.shutdown(wait=True, cancel_futures=False)
+        _script_pool = None
 
 
 atexit.register(_shutdown_parallel_pool)
@@ -2348,7 +2372,7 @@ def _run_script_process(
         raise
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, *, no_agent: bool = False) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -2374,6 +2398,8 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        no_agent: Exclude another agent's temporary TERMINAL_CWD override
+            from the child's environment. Agent pre-run scripts retain it.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -2433,11 +2459,16 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         from tools.environments.local import _sanitize_subprocess_env
 
+        with _terminal_cwd_env_lock:
+            script_env = os.environ.copy()
+            if no_agent and _terminal_cwd_baseline is not None:
+                script_env.pop("TERMINAL_CWD", None)
+                script_env.update(_terminal_cwd_baseline)
         result = _run_script_process(
             argv,
             timeout=script_timeout,
             cwd=str(path.parent),
-            env=_sanitize_subprocess_env(os.environ.copy()),
+            env=_sanitize_subprocess_env(script_env),
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -2604,6 +2635,8 @@ def _run_scheduled_job_script(job: dict, script_path: str) -> tuple[bool, str]:
         if quarantine_reason is not None:
             return False, quarantine_reason
     try:
+        if job.get("no_agent"):
+            return _run_job_script(script_path, no_agent=True)
         return _run_job_script(script_path)
     except CronScriptCleanupError as cleanup_error:
         if job_id is None:
@@ -3006,6 +3039,7 @@ def run_job(
     Returns:
         Tuple of (success, full_output_doc, final_response, error_message)
     """
+    global _terminal_cwd_baseline
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
@@ -3034,26 +3068,10 @@ def run_job(
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
 
-        # Apply workdir if configured — lets scripts use predictable relative
-        # paths. For no_agent jobs this is just the subprocess cwd (not an
-        # agent TERMINAL_CWD bridge).
-        _job_workdir = (job.get("workdir") or "").strip() or None
-        _prior_cwd = None
-        if _job_workdir and Path(_job_workdir).is_dir():
-            _prior_cwd = os.getcwd()
-            try:
-                os.chdir(_job_workdir)
-            except OSError:
-                _prior_cwd = None
-
-        try:
-            ok, output = _run_scheduled_job_script(job, script_path)
-        finally:
-            if _prior_cwd is not None:
-                try:
-                    os.chdir(_prior_cwd)
-                except OSError:
-                    pass
+        # _run_job_script explicitly sets the child cwd to the script's
+        # directory. Changing the parent cwd is unnecessary and unsafe when
+        # this script runs alongside an agent or another scheduler caller.
+        ok, output = _run_scheduled_job_script(job, script_path)
 
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -3261,8 +3279,9 @@ def run_job(
     #
     # os.environ["TERMINAL_CWD"] is process-global, so this override is
     # serialized by _terminal_cwd_lock (acquired just below): a workdir job
-    # holds it as a writer for its whole run, excluding every other job, while
-    # workdir-less jobs hold it as readers and stay parallel with each other.
+    # holds it as a writer for its whole run, excluding every other agent, while
+    # workdir-less agents hold it as readers and stay parallel with each other.
+    # Pure scripts use an independent child cwd and baseline environment.
     # The sequential pool only keeps workdir jobs from overlapping EACH OTHER;
     # the lock is what additionally keeps a concurrently-firing workdir-less
     # parallel-pool job from observing this override and running its shell /
@@ -3279,11 +3298,7 @@ def run_job(
         )
         _job_workdir = None
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    _prior_terminal_cwd = None
 
     _holds_cwd_write = _job_workdir is not None
     if _holds_cwd_write:
@@ -3298,7 +3313,13 @@ def run_job(
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     try:
         if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
+            with _terminal_cwd_env_lock:
+                _prior_terminal_cwd = os.environ.get("TERMINAL_CWD")
+                _terminal_cwd_baseline = (
+                    {} if _prior_terminal_cwd is None
+                    else {"TERMINAL_CWD": _prior_terminal_cwd}
+                )
+                os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -3849,10 +3870,12 @@ def run_job(
         # only ever mutate it when the job has a workdir; see the setup block
         # at the top of run_job for the serialization guarantee.
         if _job_workdir:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
+            with _terminal_cwd_env_lock:
+                if _prior_terminal_cwd is None:
+                    os.environ.pop("TERMINAL_CWD", None)
+                else:
+                    os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
+                _terminal_cwd_baseline = None
         # Release the cwd lock now that the env is restored, so a waiting
         # workdir job (or queued reader) can proceed without seeing the override.
         if _holds_cwd_write:
@@ -4203,8 +4226,9 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         for job in due_jobs:
             advance_next_run(job["id"])
 
-        # Resolve max parallel workers: env var > config.yaml > unbounded.
-        # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
+        # Resolve parallel-agent workers: env var > config.yaml > unbounded.
+        # HERMES_CRON_MAX_PARALLEL=1 serializes that lane; scripts retain their
+        # separate single worker, as workdir agents retain theirs.
         _max_workers: Optional[int] = None
         try:
             _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
@@ -4237,14 +4261,17 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             body."""
             return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
 
-        # Partition due jobs: those with a per-job workdir mutate
+        # Pure scripts use their own bounded lane so neither agent pool can
+        # starve them. Agent jobs with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
         # they queue on the single-thread sequential pool to run one at a time.
         # That alone only keeps workdir jobs from overlapping EACH OTHER;
         # run_job's _terminal_cwd_lock is what additionally stops a concurrently
         # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        script_jobs = [j for j in due_jobs if j.get("no_agent")]
+        agent_jobs = [j for j in due_jobs if not j.get("no_agent")]
+        sequential_jobs = [j for j in agent_jobs if (j.get("workdir") or "").strip()]
+        parallel_jobs = [j for j in agent_jobs if not (j.get("workdir") or "").strip()]
 
         _results: list = []
         _all_futures: list = []
@@ -4314,7 +4341,17 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     return None
                 raise
 
-        # Sequential pass for env-mutating (workdir) jobs.
+        if script_jobs:
+            script_pool = _get_script_pool()
+            for job in script_jobs:
+                fut = _submit_with_guard(job, script_pool)
+                if fut is None:
+                    continue
+                _all_futures.append(fut)
+                if not sync:
+                    _results.append(True)
+
+        # Sequential pass for env-mutating (workdir) agent jobs.
         # Queued to a persistent single-thread pool so they run one at a time
         # WITHOUT blocking the ticker thread — a long workdir job no
         # longer starves the rest of the schedule (same fix as the parallel
