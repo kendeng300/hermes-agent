@@ -3299,6 +3299,7 @@ def run_job(
         _job_workdir = None
 
     _prior_terminal_cwd = None
+    _captured_terminal_cwd = False
 
     _holds_cwd_write = _job_workdir is not None
     if _holds_cwd_write:
@@ -3315,6 +3316,7 @@ def run_job(
         if _job_workdir:
             with _terminal_cwd_env_lock:
                 _prior_terminal_cwd = os.environ.get("TERMINAL_CWD")
+                _captured_terminal_cwd = True
                 _terminal_cwd_baseline = (
                     {} if _prior_terminal_cwd is None
                     else {"TERMINAL_CWD": _prior_terminal_cwd}
@@ -3866,10 +3868,9 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir; see the setup block
-        # at the top of run_job for the serialization guarantee.
-        if _job_workdir:
+        # Restore only a captured snapshot: entering the short lock can be
+        # interrupted before this invocation has read or changed the env.
+        if _captured_terminal_cwd:
             with _terminal_cwd_env_lock:
                 if _prior_terminal_cwd is None:
                     os.environ.pop("TERMINAL_CWD", None)
