@@ -271,3 +271,75 @@ def test_agent_prerun_script_keeps_its_agent_environment(script_env, monkeypatch
     assert json.loads(output) == {
         "cwd": str(script.parent), "terminal_cwd": "active-agent-project",
     }
+
+
+@pytest.mark.parametrize("baseline", [None, "baseline-project", "_UNSET_"])
+@pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
+def test_interrupted_snapshot_preserves_environment_and_releases_writer(
+    script_env, monkeypatch, baseline, interruption,
+):
+    sched, script_job, _ = script_env
+    if baseline is None:
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+    else:
+        monkeypatch.setenv("TERMINAL_CWD", baseline)
+    writer_lock = sched._ReadWriteLock()
+    monkeypatch.setattr(sched, "_terminal_cwd_lock", writer_lock)
+    monkeypatch.setattr(sched, "_terminal_cwd_baseline", None)
+
+    class InterruptFirstEntry:
+        entries = 0
+
+        def __enter__(self):
+            self.entries += 1
+            if self.entries == 1:
+                raise interruption("before environment snapshot")
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(sched, "_terminal_cwd_env_lock", InterruptFirstEntry())
+    agent = MagicMock()
+    agent.run_conversation.return_value = {"final_response": "done", "messages": []}
+    agent.get_activity_summary.return_value = {"seconds_since_activity": 0.0}
+    constructor = MagicMock(return_value=agent)
+    monkeypatch.setitem(sys.modules, "run_agent", SimpleNamespace(AIAgent=constructor))
+    monkeypatch.setattr("hermes_state.SessionDB", MagicMock())
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", lambda **kw: {
+        "provider": "test", "api_key": "synthetic", "base_url": "http://test.invalid",
+        "api_mode": "chat_completions",
+    })
+    monkeypatch.setattr("hermes_cli.env_loader.load_hermes_dotenv", lambda **kw: None)
+    monkeypatch.setattr("hermes_cli.env_loader.reset_secret_source_cache", lambda: None)
+    monkeypatch.setattr(sched, "load_config", lambda: {})
+    monkeypatch.setattr(sched, "_build_job_prompt", lambda *a, **kw: "review")
+    monkeypatch.setattr(sched, "_resolve_origin", lambda job: None)
+    monkeypatch.setattr(sched, "_resolve_delivery_target", lambda job: None)
+    monkeypatch.setattr(sched, "_resolve_cron_enabled_toolsets", lambda *a: None)
+    monkeypatch.setattr(sched, "_teardown_cron_agent", lambda *a: None)
+    monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+    job = {"id": "interrupted-agent", "prompt": "review", "workdir": script_job["workdir"]}
+
+    with pytest.raises(interruption, match="before environment snapshot"):
+        sched.run_job(job)
+    constructor.assert_not_called()
+    assert os.environ.get("TERMINAL_CWD") == baseline
+    assert sched._terminal_cwd_baseline is None
+
+    acquired = threading.Event()
+
+    def probe_writer():
+        writer_lock.acquire_write()
+        acquired.set()
+        writer_lock.release_write()
+
+    probe = threading.Thread(target=probe_writer, daemon=True)
+    probe.start()
+    probe.join(timeout=3)
+    assert acquired.is_set(), "interruption leaked the agent writer lock"
+    success, _, response, error = sched.run_job(dict(job, id="following-agent"))
+    assert success, error
+    assert response == "done"
+    assert os.environ.get("TERMINAL_CWD") == baseline
+    assert sched._terminal_cwd_baseline is None
