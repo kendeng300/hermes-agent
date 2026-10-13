@@ -800,3 +800,92 @@ def test_refusal_before_admission_does_not_manufacture_a_completed_run(runtime_c
     stored = jobs.get_job(c["job"]["id"])
     assert c["agents"] == [] and stored["repeat"]["completed"] == 0
     assert "dispatch_claim" not in stored and stored["fire_claim"] == before["fire_claim"]
+
+
+@pytest.mark.parametrize("entry", ["run_job", "run_one_job"])
+def test_accepted_queued_run_expired_before_supervisor_overwrites_old_ok_and_retries(runtime_case, monkeypatch, entry):
+    c = runtime_case
+    monkeypatch.setattr(jobs, "_hermes_now", scheduler._hermes_now)
+    jobs.update_job(c["job"]["id"], {"last_status": "ok"})
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    old = scheduler._prepare_job_runtime(c["job"], dispatched=False)
+    assert jobs.get_job(c["job"]["id"])["dispatch_claim"]["status"] == "claimed"
+    c["clock"][0] = 1601
+    # This is actual accepted-worker entry, not a direct reuse of an already
+    # bound expired capability. Activation changes claimed -> dispatched.
+    with scheduler._job_runtime_scope(old):
+        result = getattr(scheduler, entry)(c["job"])
+        assert (result[0] if entry == "run_job" else result) is False
+    stored = jobs.get_job(c["job"]["id"])
+    assert c["agents"] == [] and stored["last_status"] == "error"
+    assert stored["enabled"] is True and stored["repeat"]["completed"] == 1
+    assert "dispatch_claim" not in stored and stored.get("fire_claim") is None
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    new = scheduler._prepare_job_runtime(jobs.get_job(c["job"]["id"]))
+    assert new["run_id"] != old["run_id"]
+    assert new["dispatch_at"] == scheduler._hermes_now().isoformat()
+
+
+@pytest.mark.parametrize("entry", ["run_job", "run_one_job"])
+@pytest.mark.parametrize("fault", ["construct", "submit"])
+@pytest.mark.parametrize("successor", [False, True])
+def test_accepted_supervisor_setup_refusal_finalizes_only_owned_run(runtime_case, monkeypatch, entry, fault, successor):
+    from tools import daemon_pool
+    c = runtime_case
+    old, replacement, shutdowns = {}, {}, []
+    monkeypatch.setattr(jobs, "_hermes_now", scheduler._hermes_now)
+    jobs.update_job(c["job"]["id"], {"last_status": "ok"})
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+
+    def refuse():
+        stored = jobs.get_job(c["job"]["id"])
+        old.update(stored["dispatch_claim"]["runtime"])
+        if successor:
+            replacement.update(at=scheduler._hermes_now().isoformat(), status="dispatched",
+                               runtime={**old, "run_id": "e" * 32})
+            jobs.update_job(c["job"]["id"], {"dispatch_claim": replacement,
+                "fire_claim": {"at": scheduler._hermes_now().isoformat(), "by": "new-owner"}})
+        raise RuntimeError("synthetic scoped supervisor setup refused")
+
+    class Pool:
+        def __init__(self, **kwargs):
+            if fault == "construct":
+                refuse()
+
+        def submit(self, *args, **kwargs):
+            refuse()
+
+        def shutdown(self, **kwargs):
+            shutdowns.append(kwargs)
+
+    monkeypatch.setattr(daemon_pool, "DaemonThreadPoolExecutor", Pool)
+    result = getattr(scheduler, entry)(c["job"])
+    assert (result[0] if entry == "run_job" else result) is False
+    stored = jobs.get_job(c["job"]["id"])
+    assert old and c["agents"] == []
+    assert len(shutdowns) == (1 if fault == "submit" else 0)
+    if successor:
+        assert stored["dispatch_claim"] == replacement and stored["fire_claim"]["by"] == "new-owner"
+        assert stored["last_status"] == "ok" and stored["repeat"]["completed"] == 0
+    else:
+        assert stored["last_status"] == "error" and stored["repeat"]["completed"] == 1
+        assert stored["enabled"] is True and "dispatch_claim" not in stored and stored.get("fire_claim") is None
+        assert jobs.claim_job_for_fire(c["job"]["id"])
+        new = scheduler._prepare_job_runtime(jobs.get_job(c["job"]["id"]))
+        assert new["run_id"] != old["run_id"]
+
+
+@pytest.mark.parametrize("entry", ["run_job", "run_one_job"])
+@pytest.mark.parametrize("bound", [False, True])
+def test_reused_expired_dispatched_capability_is_refused_without_finalizing_its_owner(runtime_case, entry, bound):
+    c = runtime_case
+    jobs.update_job(c["job"]["id"], {"last_status": "ok"})
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    old = scheduler._prepare_job_runtime(c["job"])
+    before = jobs.get_job(c["job"]["id"])
+    c["clock"][0] = 1601
+    with scheduler._job_runtime_scope(old if bound else None):
+        result = getattr(scheduler, entry)(c["job"])
+        assert (result[0] if entry == "run_job" else result) is False
+    assert c["agents"] == []
+    assert jobs.get_job(c["job"]["id"]) == before
