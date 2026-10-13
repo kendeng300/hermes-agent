@@ -3200,6 +3200,29 @@ def _runtime_owns_claim(job):
     return claim.get("status") == "dispatched" and claim.get("runtime") == dict(runtime)
 
 
+def _finalize_failed_runtime(job, runtime, error, *, drain_record=None):
+    """Close one admitted, actually drained failure; never a refusal or successor.
+
+    Immediate failure, cleanup-grace completion and delayed drain share this
+    exact claim comparison. An unrelated/hard-cleanup guard remains authoritative.
+    """
+    from cron import jobs as store
+    with store._jobs_lock(), _running_lock:
+        if _cleanup_unverified_jobs.get(job["id"]) is not drain_record:
+            return
+        current = store.get_job(job["id"]) or {}
+        claim = current.get("dispatch_claim") or {}
+        if (claim.get("status") == "dispatched"
+                and claim.get("runtime") == dict(runtime)):
+            store.mark_job_run(job["id"], False, str(error))
+        if drain_record is not None:
+            # This exact record owns the process-local marker even if an
+            # operator replaced the durable claim. Do not mutate that successor.
+            _record_running_marker(job["id"], False)
+            _running_job_ids.discard(job["id"])
+            _cleanup_unverified_jobs.pop(job["id"], None)
+
+
 def _run_scoped_runtime(job, operation, agents):
     """Fence the entire supplied job operation; quarantine only unproven drain."""
     _runtime_remaining()
@@ -3261,21 +3284,11 @@ def _run_scoped_runtime(job, operation, agents):
                         # The future callback runs after its execution context
                         # unwinds. Preserve the original store and finalize only
                         # this exact failed claim before admitting manual retry.
-                        with store._jobs_lock(), _running_lock:
-                            if _cleanup_unverified_jobs.get(job["id"]) is not record:
-                                return
-                            current = store.get_job(job["id"]) or {}
-                            claim = current.get("dispatch_claim") or {}
-                            if claim.get("runtime") == dict(runtime):
-                                store.mark_job_run(job["id"], False, failure)
-                            # A successor's claim is never marked or cleared.
-                            # This record still owns the process-local marker.
-                            if _cleanup_unverified_jobs.get(job["id"]) is record:
-                                _record_running_marker(job["id"], False)
-                                _running_job_ids.discard(job["id"])
-                                _cleanup_unverified_jobs.pop(job["id"], None)
+                        _finalize_failed_runtime(job, runtime, failure, drain_record=record)
 
                     future.add_done_callback(lambda done: drain_context.run(drained, done))
+                else:
+                    _finalize_failed_runtime(job, runtime, exc)
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -3312,7 +3325,13 @@ def run_job(job: dict, *, defer_agent_teardown: Optional[list] = None,
                         while deferred:
                             _teardown_cron_agent(deferred.pop(), job["id"])
 
-            return _run_scoped_runtime(job, execute, agents)
+            result = _run_scoped_runtime(job, execute, agents)
+            if result[0] is False:
+                # Direct scoped callers have no run_one_job completion owner.
+                # The actual worker and teardown have returned before closing
+                # this failed tuple; unscoped execution keeps its old contract.
+                _finalize_failed_runtime(job, runtime, result[3] or "Job execution failed")
+            return result
     except Exception as exc:
         error = str(exc)
         return False, f"# Cron job FAILED\n\n{error}\n", "", error
