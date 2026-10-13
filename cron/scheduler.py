@@ -25,7 +25,6 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from types import MappingProxyType
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -3165,7 +3164,8 @@ def _prepare_job_runtime(job, *, dispatched=True):
             claim.update(at=start.isoformat(), status="dispatched" if dispatched else "claimed", runtime=runtime)
             if store.update_job(job["id"], {"dispatch_claim": claim}) is None:
                 raise ValueError("Job disappeared before runtime claim commit")
-    return MappingProxyType(dict(runtime))
+    from tools.delegate_tool import freeze_job_runtime
+    return freeze_job_runtime(runtime)
 
 
 def _activate_job_runtime(job, runtime):
@@ -3254,15 +3254,28 @@ def _run_scoped_runtime(job, operation, agents):
                         _running_job_ids.add(job["id"])
                         _record_running_marker(job["id"], True)
 
+                    failure = str(exc)
+                    drain_context = contextvars.copy_context()
+
                     def drained(_):
-                        # Never clear a marker belonging to a later resumed run.
-                        with _running_lock:
+                        # The future callback runs after its execution context
+                        # unwinds. Preserve the original store and finalize only
+                        # this exact failed claim before admitting manual retry.
+                        with store._jobs_lock(), _running_lock:
+                            if _cleanup_unverified_jobs.get(job["id"]) is not record:
+                                return
+                            current = store.get_job(job["id"]) or {}
+                            claim = current.get("dispatch_claim") or {}
+                            if claim.get("runtime") == dict(runtime):
+                                store.mark_job_run(job["id"], False, failure)
+                            # A successor's claim is never marked or cleared.
+                            # This record still owns the process-local marker.
                             if _cleanup_unverified_jobs.get(job["id"]) is record:
                                 _record_running_marker(job["id"], False)
                                 _running_job_ids.discard(job["id"])
                                 _cleanup_unverified_jobs.pop(job["id"], None)
 
-                    future.add_done_callback(drained)
+                    future.add_done_callback(lambda done: drain_context.run(drained, done))
         raise
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
@@ -3515,6 +3528,7 @@ def _run_job(
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
+    _cron_future = None
 
     # Mark this as a cron session so the approval system can apply cron_mode.
     # This env var is process-wide and persists for the lifetime of the
@@ -4174,6 +4188,11 @@ def _run_job(
         return False, output, "", error_msg
 
     finally:
+        # Inactivity timeout is a wrapper result, not proof that the model or
+        # its recorded tools stopped. Scoped callers retain cwd/resources until
+        # actual drain; the outer deadline supervisor may already report FAILED.
+        from tools.delegate_tool import drain_job_agent
+        drain_job_agent(agent, _cron_future)
         # Restore only a captured snapshot: entering the short lock can be
         # interrupted before this invocation has read or changed the env.
         if _captured_terminal_cwd:

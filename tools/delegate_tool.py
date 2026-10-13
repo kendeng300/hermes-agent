@@ -122,14 +122,77 @@ _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 _JOB_RUNTIME = contextvars.ContextVar("delegation_job_runtime", default=None)
 
 
+def _runtime_read_only(*args, **kwargs):
+    raise TypeError("Job runtime capability is immutable")
+
+
+class _RuntimeDict(dict):
+    """JSON-compatible immutable copy of nested scheduler capability data."""
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _runtime_read_only
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+class _RuntimeList(list):
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _runtime_read_only
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def freeze_job_runtime(runtime):
+    """Isolate all nested aliases while preserving JSON values and equality."""
+    def freeze(value):
+        if isinstance(value, dict):
+            return _RuntimeDict((key, freeze(item)) for key, item in value.items())
+        if isinstance(value, list):
+            return _RuntimeList(freeze(item) for item in value)
+        return value
+
+    return MappingProxyType(freeze(dict(runtime))) if runtime is not None else None
+
+
 @contextmanager
 def job_runtime_scope(runtime):
     """Internal scheduler capability; never populated from model arguments."""
-    token = _JOB_RUNTIME.set(MappingProxyType(dict(runtime)) if runtime is not None else None)
+    token = _JOB_RUNTIME.set(freeze_job_runtime(runtime))
     try:
         yield
     finally:
         _JOB_RUNTIME.reset(token)
+
+
+def drain_job_agent(agent, future):
+    """Scoped resource release waits for actual work, not its timeout wrapper.
+
+    The scheduler's outer deadline still returns failure while this worker
+    drains. Thread-ID tracking covers recorded tools only; it is not proof
+    about an executor task that has not yet registered its thread.
+    """
+    if _JOB_RUNTIME.get() is None:
+        return
+    if future is not None:
+        while not future.done():
+            try:
+                future.result()
+            except BaseException:
+                # An actual completed exception is drained too; never mistake
+                # an interrupted waiter for completion of the worker itself.
+                pass
+    lock = getattr(agent, "_tool_worker_threads_lock", None)
+    if lock is not None:
+        while True:
+            with lock:
+                active = set(agent._tool_worker_threads)
+            if not active:
+                break
+            for worker in threading.enumerate():
+                if worker.ident in active and worker is not threading.current_thread():
+                    worker.join(timeout=0.05)
+            # Preserve ownership even if a recorded worker is between Python
+            # thread teardown and removal from the agent's tracking set.
+            threading.Event().wait(0.01)
 
 
 def job_runtime_remaining():
@@ -1857,6 +1920,7 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    _child_future = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2466,6 +2530,7 @@ def _run_single_child(
         }
 
     finally:
+        drain_job_agent(child, _child_future)
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
