@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
+import os
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -472,3 +473,220 @@ def test_invalid_scoped_policy_fails_before_agent_without_global_fallback(runtim
     success, _, final, error = scheduler.run_job(c["job"])
     assert not success and not final and error
     assert c["agents"] == []
+
+
+def test_nested_completion_capability_is_immutable_isolated_and_json_serializable(runtime_case, monkeypatch):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    frozen = scheduler._prepare_job_runtime(c["job"])
+    expected = jobs.get_job(c["job"]["id"])["dispatch_claim"]["runtime"]
+    with pytest.raises(TypeError):
+        frozen["completion_verifier"]["callable"] = "different:verify"
+    with pytest.raises(TypeError):
+        frozen["completion_verifier"]["python_path"].append("/different")
+    assert json.loads(json.dumps(dict(frozen))) == expected
+    supplied = deepcopy(expected)
+    with delegate.job_runtime_scope(supplied):
+        supplied["completion_verifier"]["python_path"].append("/caller-mutation")
+        scoped = delegate._JOB_RUNTIME.get()
+        assert json.loads(json.dumps(dict(scoped))) == expected
+        with pytest.raises(TypeError):
+            scoped["completion_verifier"]["python_path"][0] = "/changed"
+
+
+@pytest.mark.parametrize("replace_claim", [False, True])
+def test_idle_actual_model_drain_holds_cwd_and_finalizes_only_old_claim(runtime_case, monkeypatch, replace_claim):
+    c = runtime_case
+    entered, interrupted, release, model_done, wrapper_done = (threading.Event() for _ in range(5))
+    closed = []
+    workdir = c["home"] / "scoped-cwd"
+    workdir.mkdir()
+    c["job"]["workdir"] = str(workdir)
+    monkeypatch.setattr(jobs, "_hermes_now", scheduler._hermes_now)
+    monkeypatch.setattr(scheduler, "_terminal_cwd_lock", scheduler._ReadWriteLock())
+    monkeypatch.setattr(scheduler, "_teardown_cron_agent", lambda *a: closed.append(True))
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a: "synthetic-output")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    original, real_wait = scheduler._run_job, scheduler.concurrent.futures.wait
+
+    def actual(agent, prompt):
+        agent.get_activity_summary = lambda: {"seconds_since_activity": 1000}
+        agent.interrupt = lambda *a: interrupted.set()
+        entered.set()
+        try:
+            assert release.wait(timeout=5)
+            return {"final_response": "late actual model"}
+        finally:
+            model_done.set()
+
+    def wrapper(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            wrapper_done.set()
+
+    def poll(futures, timeout=None, **kwargs):
+        assert entered.wait(timeout=3)
+        if not threading.current_thread().name.startswith("cron-scoped-runtime"):
+            assert interrupted.wait(timeout=3)
+            c["clock"][0] = 1601
+        return real_wait(futures, timeout=0.01, **kwargs)
+
+    c["callback"] = actual
+    monkeypatch.setattr(scheduler, "_run_job", wrapper)
+    monkeypatch.setattr(scheduler.concurrent.futures, "wait", poll)
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    replacement = None
+    try:
+        assert scheduler.run_one_job(c["job"]) is False
+        old = jobs.get_job(c["job"]["id"])["dispatch_claim"]["runtime"]
+        assert not model_done.is_set() and not wrapper_done.is_set()
+        assert closed == [] and os.environ.get("TERMINAL_CWD") == str(workdir)
+        assert scheduler._terminal_cwd_lock._writer_active
+        record = scheduler._cleanup_unverified_jobs[c["job"]["id"]]
+        if replace_claim:
+            replacement = {"at": scheduler._hermes_now().isoformat(), "status": "dispatched",
+                           "runtime": {**deepcopy(old), "run_id": "c" * 32}}
+            jobs.update_job(c["job"]["id"], {"dispatch_claim": replacement,
+                "fire_claim": {"at": scheduler._hermes_now().isoformat(), "by": "new-owner"}})
+        release.set()
+        assert wrapper_done.wait(timeout=3)
+        record["worker"].result(timeout=3)
+        # The callback has to finalize the old claim before releasing its guard.
+        for _ in range(100):
+            if c["job"]["id"] not in scheduler.get_running_job_ids():
+                break
+            threading.Event().wait(0.01)
+        stored = jobs.get_job(c["job"]["id"])
+        assert not scheduler._terminal_cwd_lock._writer_active and closed
+        if replacement is not None:
+            assert stored["dispatch_claim"] == replacement
+            assert stored["fire_claim"]["by"] == "new-owner"
+        else:
+            assert stored["last_status"] == "error" and stored["enabled"] is True
+            assert "dispatch_claim" not in stored and stored.get("fire_claim") is None
+            assert jobs.claim_job_for_fire(c["job"]["id"])
+            next_runtime = scheduler._prepare_job_runtime(jobs.get_job(c["job"]["id"]))
+            assert next_runtime["run_id"] != old["run_id"]
+            assert next_runtime["dispatch_at"] == scheduler._hermes_now().isoformat()
+    finally:
+        release.set()
+        assert model_done.wait(timeout=3)
+        assert wrapper_done.wait(timeout=3)
+        with scheduler._running_lock:
+            scheduler._cleanup_unverified_jobs.pop(c["job"]["id"], None)
+            scheduler._running_job_ids.discard(c["job"]["id"])
+
+
+@pytest.mark.parametrize("scoped", [False, True])
+def test_real_child_timeout_keeps_resources_until_actual_drain_only_when_scoped(runtime_case, monkeypatch, scoped):
+    c = runtime_case
+    entered, interrupted, release, returned = (threading.Event() for _ in range(4))
+    closed, leases, results = [], [], []
+    child = SimpleNamespace(_subagent_id=None, _delegate_depth=1, _delegate_role="leaf",
+        _credential_pool=SimpleNamespace(acquire_lease=lambda: "lease", current=lambda: None,
+                                        release_lease=lambda value: leases.append(value)),
+        interrupt=lambda: interrupted.set(), close=lambda: closed.append(True),
+        get_activity_summary=lambda: {"api_call_count": 1})
+    parent = SimpleNamespace(_active_children=[child], _active_children_lock=threading.Lock())
+
+    def actual(**kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"final_response": "late child", "completed": False, "api_calls": 1}
+
+    child.run_conversation = actual
+    monkeypatch.setattr(delegate, "_get_child_timeout", lambda: 0.01)
+    runtime = scheduler._prepare_job_runtime(c["job"]) if scoped else None
+
+    def invoke():
+        try:
+            with delegate.job_runtime_scope(runtime):
+                results.append(delegate._run_single_child(0, "synthetic child", child, parent))
+        finally:
+            returned.set()
+
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=3) and interrupted.wait(timeout=3)
+        if scoped:
+            assert not returned.wait(timeout=0.05)
+            assert closed == [] and leases == [] and child in parent._active_children
+        else:
+            assert returned.wait(timeout=3)
+            assert closed == [True] and leases == ["lease"]
+    finally:
+        release.set()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+    assert results[0]["status"] == "timeout"
+    assert closed == [True] and leases == ["lease"] and parent._active_children == []
+
+
+@pytest.mark.parametrize("kind", ["parent", "child"])
+@pytest.mark.parametrize("scoped", [False, True])
+def test_recorded_tool_worker_drain_precedes_conversation_resource_release(runtime_case, monkeypatch, kind, scoped):
+    c = runtime_case
+    entered, release, returned = (threading.Event() for _ in range(3))
+    closed, tool_threads, results = [], [], []
+
+    def conversation(agent):
+        agent._tool_worker_threads = set()
+        agent._tool_worker_threads_lock = threading.Lock()
+
+        def actual_tool():
+            tid = threading.get_ident()
+            with agent._tool_worker_threads_lock:
+                agent._tool_worker_threads.add(tid)
+            entered.set()
+            try:
+                assert release.wait(timeout=5)
+            finally:
+                with agent._tool_worker_threads_lock:
+                    agent._tool_worker_threads.discard(tid)
+
+        worker = threading.Thread(target=actual_tool, daemon=True)
+        tool_threads.append(worker)
+        worker.start()
+        assert entered.wait(timeout=3)
+        return {"final_response": "conversation returned while tool active", "completed": True, "api_calls": 1}
+
+    if kind == "parent":
+        c["callback"] = lambda agent, prompt: conversation(agent)
+        monkeypatch.setattr(scheduler, "_teardown_cron_agent", lambda *a: closed.append(True))
+        invoke = lambda: scheduler.run_job(c["job"] if scoped else c["ordinary"])
+    else:
+        child = SimpleNamespace(_subagent_id=None, _delegate_depth=1, _delegate_role="leaf",
+                                close=lambda: closed.append(True), interrupt=lambda: None)
+        parent = SimpleNamespace(_active_children=[child], _active_children_lock=threading.Lock())
+        child.run_conversation = lambda **kwargs: conversation(child)
+        runtime = scheduler._prepare_job_runtime(c["job"]) if scoped else None
+
+        def invoke():
+            with delegate.job_runtime_scope(runtime):
+                return delegate._run_single_child(0, "synthetic tool worker", child, parent)
+
+    def runner():
+        try:
+            results.append(invoke())
+        finally:
+            returned.set()
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=3)
+        if scoped:
+            assert not returned.wait(timeout=0.05)
+            assert closed == []
+        else:
+            assert returned.wait(timeout=3) and closed == [True]
+    finally:
+        release.set()
+        for worker in tool_threads:
+            worker.join(timeout=3)
+            assert not worker.is_alive()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+    assert len(results) == 1 and closed == [True]
