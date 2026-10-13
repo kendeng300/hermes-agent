@@ -950,7 +950,7 @@ class TestRunJobScript:
         import inspect
         from cron import scheduler as sched_mod
 
-        assert inspect.getsource(sched_mod.run_job).count(
+        assert inspect.getsource(sched_mod._run_job).count(
             "_run_scheduled_job_script(job, script_path)"
         ) == 2
         assert inspect.getsource(sched_mod._build_job_prompt).count(

@@ -80,6 +80,161 @@ def runtime_case(tmp_path, monkeypatch):
         yield state
 
 
+def _completion_hook(case, monkeypatch, result=True):
+    calls = []
+    case["policy"]["completion_verifier"] = {
+        "callable": "synthetic_review_completion:verify",
+        "python_path": [str(case["home"])],
+    }
+
+    def process(argv, *, timeout, cwd, env, input_text=None):
+        request = json.loads(input_text)
+        assert 0 < timeout <= 600
+        assert env["PYTHONPATH"] == str(case["home"])
+        assert env["HERMES_HOME"] == str(case["home"])
+        assert argv[1] == "-c"
+        if request["probe"]:
+            exists = request["hook"] == "synthetic_review_completion:verify"
+            return SimpleNamespace(returncode=0, stdout=json.dumps(exists), stderr="")
+        kwargs = request["kwargs"]
+        calls.append((kwargs["job_id"], kwargs["run_id"], kwargs["runtime"]))
+        return SimpleNamespace(returncode=0, stdout=json.dumps(result), stderr="")
+
+    monkeypatch.setattr(scheduler, "_run_script_process", process)
+    return calls
+
+
+@pytest.mark.parametrize("response", ["[SILENT]", "BLOCKED: missing final reviews", "Interim only"])
+def test_scoped_completion_requires_verified_outcome_not_parent_prose(runtime_case, monkeypatch, response):
+    c = runtime_case
+    calls = _completion_hook(c, monkeypatch, False)
+    c["callback"] = lambda agent, prompt: {"final_response": response}
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a: "synthetic-output")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    scheduler.run_one_job(c["job"])
+    stored = jobs.get_job(c["job"]["id"])
+    assert stored["last_status"] == "error"
+    assert "completion" in stored["last_error"].lower()
+    assert len(calls) == 1 and calls[0][0] == c["job"]["id"]
+    assert calls[0][1] == calls[0][2]["run_id"]
+
+
+def test_verified_completion_allows_silent_duplicate_suppression_once(runtime_case, monkeypatch):
+    c = runtime_case
+    calls = _completion_hook(c, monkeypatch)
+    c["callback"] = lambda agent, prompt: {"final_response": "[SILENT]"}
+    delivered = []
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a: "synthetic-output")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: delivered.append(a))
+    scheduler.run_one_job(c["job"])
+    assert jobs.get_job(c["job"]["id"])["last_status"] == "ok"
+    assert len(calls) == 1 and delivered == []
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_scoped_delivery_failure_cannot_leave_success(runtime_case, monkeypatch, raises):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a: "synthetic-output")
+
+    def delivery(*args, **kwargs):
+        if raises:
+            raise RuntimeError("synthetic delivery failure")
+        return "synthetic delivery failure"
+
+    monkeypatch.setattr(scheduler, "_deliver_result", delivery)
+    scheduler.run_one_job(c["job"])
+    stored = jobs.get_job(c["job"]["id"])
+    assert stored["last_status"] == "error"
+    assert "delivery" in stored["last_error"].lower()
+
+
+def test_configured_review_iteration_fallback_is_failed_not_completed(runtime_case, monkeypatch):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    c["callback"] = lambda agent, prompt: {"completed": False,
+        "turn_exit_reason": "max_iterations_reached(40)", "final_response": "interim summary"}
+    success, _, _, error = scheduler.run_job(c["job"])
+    assert not success and "interim" in error
+
+
+@pytest.mark.parametrize("hook", ["bad-name", "missing_synthetic_module:verify", "synthetic_review_completion:missing"])
+def test_invalid_completion_hook_records_admission_failure_before_agent(runtime_case, monkeypatch, hook):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    c["policy"]["completion_verifier"]["callable"] = hook
+    assert scheduler.run_one_job(c["job"]) is False
+    stored = jobs.get_job(c["job"]["id"])
+    assert stored["last_status"] == "error"
+    assert c["agents"] == []
+
+
+def test_pool_rejection_preserves_recoverable_claim_and_records_failure(runtime_case, monkeypatch):
+    c = runtime_case
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [c["job"]])
+    monkeypatch.setattr(jobs, "_hermes_now", scheduler._hermes_now)
+    monkeypatch.setattr(scheduler, "_get_lock_paths", lambda: (c["home"], c["home"] / "tick.lock"))
+    monkeypatch.setattr(scheduler, "_interpreter_shutting_down", lambda error=None: error is not None)
+    pool = SimpleNamespace(submit=MagicMock(side_effect=RuntimeError("cannot schedule new futures after interpreter shutdown")))
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda *a: pool)
+    try:
+        scheduler.tick(verbose=False, sync=True)
+        stored = jobs.get_job(c["job"]["id"])
+        assert stored["dispatch_claim"]["status"] == "claimed"
+        assert stored["last_status"] == "error"
+        assert c["job"]["id"] not in scheduler.get_running_job_ids()
+    finally:
+        with scheduler._running_lock:
+            scheduler._running_job_ids.discard(c["job"]["id"])
+
+
+@pytest.mark.parametrize("phase", ["agent", "save", "delivery"])
+def test_deadline_quarantines_unsettled_work_until_actual_drain(runtime_case, monkeypatch, phase):
+    c = runtime_case
+    entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+    real_wait = scheduler.concurrent.futures.wait
+    original = scheduler._run_one_job
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"final_response": "late response"} if phase == "agent" else None
+
+    def tracked(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            drained.set()
+
+    def poll(futures, timeout=None, **kwargs):
+        assert entered.wait(timeout=3)
+        c["clock"][0] = 1601
+        return real_wait(futures, timeout=0.01, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_run_one_job", tracked)
+    monkeypatch.setattr(scheduler, "save_job_output", blocked if phase == "save" else lambda *a: "synthetic-output")
+    monkeypatch.setattr(scheduler, "_deliver_result", blocked if phase == "delivery" else lambda *a, **k: None)
+    monkeypatch.setattr(scheduler, "_notify_provider_jobs_changed", lambda: None)
+    if phase == "agent":
+        c["callback"] = blocked
+    monkeypatch.setattr(scheduler.concurrent.futures, "wait", poll)
+    try:
+        assert scheduler.run_one_job(c["job"]) is False
+        stored = jobs.get_job(c["job"]["id"])
+        assert stored["last_status"] == "error" and stored["enabled"] is False
+        assert scheduler._cleanup_quarantine_reason(stored)
+        # An explicit resume must not admit another worker while this one lives.
+        jobs.update_job(c["job"]["id"], {"enabled": True, "state": "scheduled",
+            "paused_at": None, "paused_reason": None})
+        assert scheduler._cleanup_quarantine_reason(jobs.get_job(c["job"]["id"]))
+    finally:
+        release.set()
+        assert drained.wait(timeout=3)
+        with scheduler._running_lock:
+            scheduler._cleanup_unverified_jobs.pop(c["job"]["id"], None)
+            scheduler._running_job_ids.discard(c["job"]["id"])
+
+
 def test_scoped_schema_and_execution_cap_with_legacy_default_unchanged(runtime_case):
     c = runtime_case
     seen = []
