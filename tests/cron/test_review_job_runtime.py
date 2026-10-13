@@ -2,6 +2,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import contextvars
 import json
 import os
 import threading
@@ -673,7 +674,9 @@ def test_recorded_tool_worker_drain_precedes_conversation_resource_release(runti
         finally:
             returned.set()
 
-    thread = threading.Thread(target=runner, daemon=True)
+    # Match the scheduler's context-propagating admission: the synthetic store
+    # is a ContextVar too, so a bare test thread would read a different store.
+    thread = threading.Thread(target=contextvars.copy_context().run, args=(runner,), daemon=True)
     thread.start()
     try:
         assert entered.wait(timeout=3)
