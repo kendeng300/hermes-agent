@@ -889,3 +889,28 @@ def test_reused_expired_dispatched_capability_is_refused_without_finalizing_its_
         assert (result[0] if entry == "run_job" else result) is False
     assert c["agents"] == []
     assert jobs.get_job(c["job"]["id"]) == before
+
+
+def test_admitted_outer_exception_cannot_overwrite_a_successor_completed_after_finalization(runtime_case, monkeypatch):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    monkeypatch.setattr(jobs, "_hermes_now", scheduler._hermes_now)
+    original = scheduler._finalize_failed_runtime
+    successor = {}
+
+    def finalized(*args, **kwargs):
+        original(*args, **kwargs)
+        assert jobs.claim_job_for_fire(c["job"]["id"])
+        successor.update(scheduler._prepare_job_runtime(jobs.get_job(c["job"]["id"])))
+        jobs.mark_job_run(c["job"]["id"], True)
+
+    def missing_probe(*args, **kwargs):
+        raise ModuleNotFoundError("synthetic failed probe")
+
+    monkeypatch.setattr(scheduler, "_finalize_failed_runtime", finalized)
+    monkeypatch.setattr(scheduler, "_run_script_process", missing_probe)
+    assert scheduler.run_one_job(c["job"]) is False
+    stored = jobs.get_job(c["job"]["id"])
+    assert successor and stored["repeat"]["completed"] == 2
+    assert stored["last_status"] == "ok" and stored["last_error"] is None
+    assert "dispatch_claim" not in stored
