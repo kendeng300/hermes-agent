@@ -693,3 +693,110 @@ def test_recorded_tool_worker_drain_precedes_conversation_resource_release(runti
         thread.join(timeout=3)
         assert not thread.is_alive()
     assert len(results) == 1 and closed == [True]
+
+
+@pytest.mark.parametrize("entry", ["run_job", "run_one_job"])
+@pytest.mark.parametrize("failure", ["probe_error", "grace_drain", "returned_failure"])
+def test_admitted_finished_failure_allows_actual_manual_retry_with_new_identity(runtime_case, monkeypatch, entry, failure):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    old, entered, release, grace = {}, threading.Event(), threading.Event(), []
+    monkeypatch.setattr(jobs, "_hermes_now", scheduler._hermes_now)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a: "synthetic-output")
+    monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: None)
+    c["callback"] = lambda *a: {"failed": True, "completed": False, "error": "synthetic model failure"}
+
+    def process(*args, **kwargs):
+        old.update(json.loads(kwargs["input_text"])["kwargs"]["runtime"])
+        entered.set()
+        if failure == "grace_drain":
+            assert release.wait(timeout=5)
+        if failure != "returned_failure":
+            raise ModuleNotFoundError("synthetic configured hook unavailable")
+        return SimpleNamespace(returncode=0, stdout="true", stderr="")
+
+    monkeypatch.setattr(scheduler, "_run_script_process", process)
+    if failure == "grace_drain":
+        real_wait = scheduler.concurrent.futures.wait
+
+        def poll(futures, timeout=None, **kwargs):
+            assert entered.wait(timeout=3)
+            future = next(iter(futures))
+            original_result = future.result
+
+            def result(timeout=None):
+                if timeout == 0.1:
+                    grace.append(True)
+                    release.set()
+                return original_result(timeout=timeout)
+
+            monkeypatch.setattr(future, "result", result)
+            c["clock"][0] = 1601
+            return real_wait(futures, timeout=0.001, **kwargs)
+
+        monkeypatch.setattr(scheduler.concurrent.futures, "wait", poll)
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    try:
+        result = getattr(scheduler, entry)(c["job"])
+        if entry == "run_job":
+            assert result[0] is False
+        stored = jobs.get_job(c["job"]["id"])
+        assert old and stored["last_status"] == "error"
+        assert stored["enabled"] is True and stored["repeat"]["completed"] == 1
+        assert "dispatch_claim" not in stored and stored.get("fire_claim") is None
+        assert scheduler._cleanup_quarantine_reason(stored) is None
+        if failure == "grace_drain":
+            assert grace == [True], "must exercise actual completion during the cleanup grace"
+        assert jobs.claim_job_for_fire(c["job"]["id"])
+        new = scheduler._prepare_job_runtime(jobs.get_job(c["job"]["id"]))
+        assert new["run_id"] != old["run_id"]
+        assert new["dispatch_at"] == scheduler._hermes_now().isoformat()
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("entry", ["run_job", "run_one_job"])
+@pytest.mark.parametrize("authority", ["successor", "hard_cleanup"])
+def test_finished_failure_does_not_finalize_successor_or_clear_hard_quarantine(runtime_case, monkeypatch, entry, authority):
+    c = runtime_case
+    _completion_hook(c, monkeypatch)
+    preserved = {}
+    monkeypatch.setattr(scheduler, "_notify_provider_jobs_changed", lambda: None)
+
+    def process(*args, **kwargs):
+        runtime = json.loads(kwargs["input_text"])["kwargs"]["runtime"]
+        if authority == "successor":
+            claim = {"at": scheduler._hermes_now().isoformat(), "status": "dispatched",
+                     "runtime": {**runtime, "run_id": "d" * 32}}
+            fire = {"at": scheduler._hermes_now().isoformat(), "by": "new-owner"}
+            jobs.update_job(c["job"]["id"], {"dispatch_claim": claim, "fire_claim": fire})
+            preserved.update(dispatch_claim=claim, fire_claim=fire)
+            raise ModuleNotFoundError("old invocation failed after successor took ownership")
+        preserved["runtime"] = runtime
+        raise scheduler.CronScriptCleanupError("synthetic hard process cleanup unverified")
+
+    monkeypatch.setattr(scheduler, "_run_script_process", process)
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    getattr(scheduler, entry)(c["job"])
+    stored = jobs.get_job(c["job"]["id"])
+    assert c["agents"] == [] and stored["repeat"]["completed"] == 0
+    if authority == "successor":
+        assert stored["dispatch_claim"] == preserved["dispatch_claim"]
+        assert stored["fire_claim"] == preserved["fire_claim"]
+    else:
+        assert stored["enabled"] is False and stored["state"] == "paused"
+        assert stored["paused_reason"].startswith(jobs.SCRIPT_CLEANUP_PAUSE_PREFIX)
+        assert stored["dispatch_claim"]["runtime"] == preserved["runtime"]
+        assert scheduler._cleanup_quarantine_reason(stored)
+
+
+@pytest.mark.parametrize("entry", ["run_job", "run_one_job"])
+def test_refusal_before_admission_does_not_manufacture_a_completed_run(runtime_case, entry):
+    c = runtime_case
+    c["policy"]["max_concurrent_children"] = 0
+    assert jobs.claim_job_for_fire(c["job"]["id"])
+    before = jobs.get_job(c["job"]["id"])
+    getattr(scheduler, entry)(c["job"])
+    stored = jobs.get_job(c["job"]["id"])
+    assert c["agents"] == [] and stored["repeat"]["completed"] == 0
+    assert "dispatch_claim" not in stored and stored["fire_claim"] == before["fire_claim"]
