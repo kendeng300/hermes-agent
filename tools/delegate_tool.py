@@ -17,6 +17,9 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextvars
+from contextlib import contextmanager
+from types import MappingProxyType
 import json
 import logging
 
@@ -116,6 +119,93 @@ def _get_subagent_approval_callback():
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_JOB_RUNTIME = contextvars.ContextVar("delegation_job_runtime", default=None)
+
+
+def _runtime_read_only(*args, **kwargs):
+    raise TypeError("Job runtime capability is immutable")
+
+
+class _RuntimeDict(dict):
+    """JSON-compatible immutable copy of nested scheduler capability data."""
+    __setitem__ = __delitem__ = clear = pop = popitem = setdefault = update = __ior__ = _runtime_read_only
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+class _RuntimeList(list):
+    __setitem__ = __delitem__ = append = clear = extend = insert = pop = remove = reverse = sort = __iadd__ = __imul__ = _runtime_read_only
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def freeze_job_runtime(runtime):
+    """Isolate all nested aliases while preserving JSON values and equality."""
+    def freeze(value):
+        if isinstance(value, dict):
+            return _RuntimeDict((key, freeze(item)) for key, item in value.items())
+        if isinstance(value, list):
+            return _RuntimeList(freeze(item) for item in value)
+        return value
+
+    return MappingProxyType(freeze(dict(runtime))) if runtime is not None else None
+
+
+@contextmanager
+def job_runtime_scope(runtime):
+    """Internal scheduler capability; never populated from model arguments."""
+    token = _JOB_RUNTIME.set(freeze_job_runtime(runtime))
+    try:
+        yield
+    finally:
+        _JOB_RUNTIME.reset(token)
+
+
+def drain_job_agent(agent, future):
+    """Scoped resource release waits for actual work, not its timeout wrapper.
+
+    The scheduler's outer deadline still returns failure while this worker
+    drains. Thread-ID tracking covers recorded tools only; it is not proof
+    about an executor task that has not yet registered its thread.
+    """
+    if _JOB_RUNTIME.get() is None:
+        return
+    if future is not None:
+        while not future.done():
+            try:
+                future.result()
+            except BaseException:
+                # An actual completed exception is drained too; never mistake
+                # an interrupted waiter for completion of the worker itself.
+                pass
+    lock = getattr(agent, "_tool_worker_threads_lock", None)
+    if lock is not None:
+        while True:
+            with lock:
+                active = set(agent._tool_worker_threads)
+            if not active:
+                break
+            for worker in threading.enumerate():
+                if worker.ident in active and worker is not threading.current_thread():
+                    worker.join(timeout=0.05)
+            # Preserve ownership even if a recorded worker is between Python
+            # thread teardown and removal from the agent's tracking set.
+            threading.Event().wait(0.01)
+
+
+def job_runtime_remaining():
+    runtime = _JOB_RUNTIME.get()
+    if runtime is None:
+        return None
+    now = time.monotonic()
+    remaining = runtime["deadline_monotonic"] - now
+    if now < runtime["dispatch_monotonic"] or remaining <= 0:
+        raise TimeoutError("Job elapsed deadline reached; completion is not established")
+    return remaining
+
+
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
 # per process. _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild (via _build_top_level_description / _build_tasks_param_description),
@@ -360,6 +450,9 @@ def _get_max_concurrent_children() -> int:
     Uses the same ``_load_config()`` path that the rest of ``delegate_task``
     uses, keeping config priority consistent (config.yaml > env > default).
     """
+    runtime = _JOB_RUNTIME.get()
+    if runtime is not None:
+        return runtime["max_concurrent_children"]
     cfg = _load_config()
     val = cfg.get("max_concurrent_children")
     if val is not None:
@@ -479,6 +572,8 @@ def _get_max_spawn_depth() -> int:
     Like max_concurrent_children, there is no upper ceiling — but each
     extra level multiplies API cost, so raise it deliberately.
     """
+    if _JOB_RUNTIME.get() is not None and _JOB_RUNTIME.get()["leaf_only"]:
+        return 1
     cfg = _load_config()
     val = cfg.get("max_spawn_depth")
     if val is None:
@@ -1825,6 +1920,7 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    _child_future = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2010,6 +2106,9 @@ def _run_single_child(
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
         child_timeout = _get_child_timeout()
+        remaining = job_runtime_remaining()
+        if remaining is not None:
+            child_timeout = min(child_timeout, remaining) if child_timeout is not None else remaining
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2046,9 +2145,13 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        if _JOB_RUNTIME.get() is not None:
+            _child_future = _timeout_executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        else:
+            _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
+            job_runtime_remaining()
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2427,6 +2530,7 @@ def _run_single_child(
         }
 
     finally:
+        drain_job_agent(child, _child_future)
         # Stop the heartbeat thread so it doesn't keep touching parent activity
         # after the child has finished (or failed).  Guard the join: .start()
         # now lives inside the try block, so if it raised (OS thread
@@ -2528,6 +2632,10 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+    try:
+        job_runtime_remaining()
+    except TimeoutError as exc:
+        return tool_error(str(exc))
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -2665,7 +2773,9 @@ def delegate_task(
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
+            job_runtime_remaining()
+            effective_role = ("leaf" if _JOB_RUNTIME.get() is not None and _JOB_RUNTIME.get()["leaf_only"]
+                              else _normalize_role(t.get("role") or top_role))
             # Per-task reasoning_required beats top-level (PROMPT-813)
             _task_reasoning = is_truthy_value(
                 t.get("reasoning_required"), default=False
@@ -2731,8 +2841,13 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    worker = _run_single_child
+                    worker_args = []
+                    if _JOB_RUNTIME.get() is not None:
+                        worker = contextvars.copy_context().run
+                        worker_args = [_run_single_child]
                     future = executor.submit(
-                        _run_single_child,
+                        worker, *worker_args,
                         task_index=i,
                         goal=t["goal"],
                         child=child,
