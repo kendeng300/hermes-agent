@@ -17,6 +17,9 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import contextvars
+from contextlib import contextmanager
+from types import MappingProxyType
 import json
 import logging
 
@@ -116,6 +119,30 @@ def _get_subagent_approval_callback():
 # — the model has no toolsets argument. Subagents inherit the parent's toolsets.
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
+_JOB_RUNTIME = contextvars.ContextVar("delegation_job_runtime", default=None)
+
+
+@contextmanager
+def job_runtime_scope(runtime):
+    """Internal scheduler capability; never populated from model arguments."""
+    token = _JOB_RUNTIME.set(MappingProxyType(dict(runtime)) if runtime is not None else None)
+    try:
+        yield
+    finally:
+        _JOB_RUNTIME.reset(token)
+
+
+def job_runtime_remaining():
+    runtime = _JOB_RUNTIME.get()
+    if runtime is None:
+        return None
+    now = time.monotonic()
+    remaining = runtime["deadline_monotonic"] - now
+    if now < runtime["dispatch_monotonic"] or remaining <= 0:
+        raise TimeoutError("Job elapsed deadline reached; completion is not established")
+    return remaining
+
+
 # One-shot guard: the high-concurrency cost advisory is emitted at most once
 # per process. _get_max_concurrent_children() runs on every get_definitions()
 # schema rebuild (via _build_top_level_description / _build_tasks_param_description),
@@ -360,6 +387,9 @@ def _get_max_concurrent_children() -> int:
     Uses the same ``_load_config()`` path that the rest of ``delegate_task``
     uses, keeping config priority consistent (config.yaml > env > default).
     """
+    runtime = _JOB_RUNTIME.get()
+    if runtime is not None:
+        return runtime["max_concurrent_children"]
     cfg = _load_config()
     val = cfg.get("max_concurrent_children")
     if val is not None:
@@ -479,6 +509,8 @@ def _get_max_spawn_depth() -> int:
     Like max_concurrent_children, there is no upper ceiling — but each
     extra level multiplies API cost, so raise it deliberately.
     """
+    if _JOB_RUNTIME.get() is not None and _JOB_RUNTIME.get()["leaf_only"]:
+        return 1
     cfg = _load_config()
     val = cfg.get("max_spawn_depth")
     if val is None:
@@ -2010,6 +2042,9 @@ def _run_single_child(
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
         child_timeout = _get_child_timeout()
+        remaining = job_runtime_remaining()
+        if remaining is not None:
+            child_timeout = min(child_timeout, remaining) if child_timeout is not None else remaining
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2046,9 +2081,13 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        if _JOB_RUNTIME.get() is not None:
+            _child_future = _timeout_executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        else:
+            _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
+            job_runtime_remaining()
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
             try:
@@ -2528,6 +2567,10 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+    try:
+        job_runtime_remaining()
+    except TimeoutError as exc:
+        return tool_error(str(exc))
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -2665,7 +2708,9 @@ def delegate_task(
         for i, t in enumerate(task_list):
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
-            effective_role = _normalize_role(t.get("role") or top_role)
+            job_runtime_remaining()
+            effective_role = ("leaf" if _JOB_RUNTIME.get() is not None and _JOB_RUNTIME.get()["leaf_only"]
+                              else _normalize_role(t.get("role") or top_role))
             # Per-task reasoning_required beats top-level (PROMPT-813)
             _task_reasoning = is_truthy_value(
                 t.get("reasoning_required"), default=False
@@ -2731,8 +2776,13 @@ def delegate_task(
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    worker = _run_single_child
+                    worker_args = []
+                    if _JOB_RUNTIME.get() is not None:
+                        worker = contextvars.copy_context().run
+                        worker_args = [_run_single_child]
                     future = executor.submit(
-                        _run_single_child,
+                        worker, *worker_args,
                         task_index=i,
                         goal=t["goal"],
                         child=child,

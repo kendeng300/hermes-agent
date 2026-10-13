@@ -226,6 +226,64 @@ def test_delivery_and_success_mark_cannot_escape_deadline_after_model_return(run
     assert all("APPROVED report" not in content for content in delivered)
 
 
+def test_delivery_readback_finishing_late_is_not_a_success(runtime_case, monkeypatch):
+    c = runtime_case
+    marked = []
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda job_id: True)
+    monkeypatch.setattr(scheduler, "run_job", lambda *a, **k: (True, "document", "report", None))
+    monkeypatch.setattr(scheduler, "save_job_output", lambda *a: "synthetic-output")
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **k: marked.append((a, k)))
+
+    def delivered(*args, **kwargs):
+        c["clock"][0] += 601
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+    scheduler.run_one_job(c["job"])
+    assert marked[-1][0][1] is False
+    assert "deadline" in marked[-1][0][2].lower()
+
+
+def test_late_worker_drains_without_marking_or_clearing_a_new_claim(runtime_case, monkeypatch):
+    c = runtime_case
+    entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+    real_wait = scheduler.concurrent.futures.wait
+    build = scheduler._build_job_prompt
+    original = scheduler._run_job
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=3)
+        return build(*args, **kwargs)
+
+    def tracked(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        finally:
+            drained.set()
+
+    def poll(futures, timeout=None, **kwargs):
+        assert entered.wait(timeout=3)
+        c["clock"][0] = 1601
+        return real_wait(futures, timeout=0.01, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_build_job_prompt", blocked)
+    monkeypatch.setattr(scheduler, "_run_job", tracked)
+    monkeypatch.setattr(scheduler.concurrent.futures, "wait", poll)
+    try:
+        success, _, final, error = scheduler.run_job(c["job"])
+        assert not success and not final and "deadline" in error.lower()
+        next_claim = {"at": "2030-01-02T12:20:00+00:00", "status": "dispatched",
+                      "runtime": {"run_id": "b" * 32}}
+        jobs.update_job(c["job"]["id"], {"dispatch_claim": next_claim})
+        release.set()
+        assert drained.wait(timeout=3)
+        assert c["agents"] == []
+        assert jobs.get_job(c["job"]["id"])["dispatch_claim"] == next_claim
+    finally:
+        release.set()
+
+
 def test_scope_is_thread_local_and_does_not_mutate_operator_config(runtime_case):
     c = runtime_case
     original = deepcopy(c["cfg"])

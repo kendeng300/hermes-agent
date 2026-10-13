@@ -2634,6 +2634,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Exact operator-selected job IDs only. Empty preserves legacy runtime.
+        # Values: max_concurrent_children, max_elapsed_seconds, leaf_only=true,
+        # publication_authority (advisory or incumbent_binding). No model overrides.
+        "job_runtime_overrides": {},
         # Active cron SCHEDULER provider (Axis B — the trigger that decides
         # WHEN a due job fires). Empty string = the built-in in-process 60s
         # ticker (default). Name an installed provider (plugins/cron_providers/<name>/ or
