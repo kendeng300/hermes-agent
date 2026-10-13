@@ -3169,16 +3169,19 @@ def _prepare_job_runtime(job, *, dispatched=True):
 
 
 def _activate_job_runtime(job, runtime):
-    """Only the accepted worker advances a scoped claimed dispatch."""
+    """Win the exact claimed dispatch once; reuse is not fresh admission."""
     from cron import jobs as store
     with store._jobs_lock():
         current = store.get_job(job["id"]) or {}
         claim = dict(current.get("dispatch_claim") or {})
         if claim.get("runtime") != dict(runtime) or claim.get("status") not in {"claimed", "dispatched"}:
             raise ValueError("Job runtime changed before accepted worker activation")
-        if claim["status"] == "claimed":
-            claim["status"] = "dispatched"
-            store.update_job(job["id"], {"dispatch_claim": claim})
+        if claim["status"] == "dispatched":
+            return False
+        claim["status"] = "dispatched"
+        if store.update_job(job["id"], {"dispatch_claim": claim}) is None:
+            raise ValueError("Job disappeared before accepted worker activation")
+        return True
 
 
 def _record_runtime_failure(job, error, *, claim):
@@ -3225,11 +3228,9 @@ def _finalize_failed_runtime(job, runtime, error, *, drain_record=None):
 
 def _run_scoped_runtime(job, operation, agents):
     """Fence the entire supplied job operation; quarantine only unproven drain."""
-    _runtime_remaining()
-    from tools.daemon_pool import DaemonThreadPoolExecutor
     from cron import jobs as store
     runtime = _current_job_runtime()
-    pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-scoped-runtime")
+    pool = future = None
 
     def execute():
         # Import readiness belongs to the accepted worker's budget, not the
@@ -3237,8 +3238,14 @@ def _run_scoped_runtime(job, operation, agents):
         _verify_runtime_completion(runtime, probe=True)
         return operation()
 
-    future = pool.submit(contextvars.copy_context().run, execute)
     try:
+        # Admission has already been won. Queue expiry or supervisor setup
+        # failure is therefore this invocation's no-work failure, not a stale
+        # refused capability, and must pass through the same exact finalizer.
+        _runtime_remaining()
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+        pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-scoped-runtime")
+        future = pool.submit(contextvars.copy_context().run, execute)
         while True:
             remaining = _runtime_remaining()
             done, _ = concurrent.futures.wait({future}, timeout=min(5.0, remaining))
@@ -3253,7 +3260,7 @@ def _run_scoped_runtime(job, operation, agents):
                 logger.debug("Could not interrupt scoped job worker", exc_info=True)
         # A short cleanup grace is not extra execution/publication authority.
         # Cooperative expiry must not pause a healthy recurring job.
-        if not future.done():
+        if future is not None and not future.done():
             try:
                 future.result(timeout=0.1)
             except BaseException:
@@ -3264,7 +3271,7 @@ def _run_scoped_runtime(job, operation, agents):
                 _record_runtime_failure(job, exc, claim=claim)
                 if isinstance(exc, CronScriptCleanupError):
                     _pause_job_for_unverified_script_cleanup(job, exc)
-                if not future.done():
+                if future is not None and not future.done():
                     # An interrupt-pending thread is not a failed process-tree
                     # cleanup proof. Keep existing running ownership, not a new
                     # durable pause policy, until this exact future settles.
@@ -3291,7 +3298,8 @@ def _run_scoped_runtime(job, operation, agents):
                     _finalize_failed_runtime(job, runtime, exc)
         raise
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
 
 
 def run_job(job: dict, *, defer_agent_teardown: Optional[list] = None,
@@ -3303,11 +3311,16 @@ def run_job(job: dict, *, defer_agent_teardown: Optional[list] = None,
             raise RuntimeError(quarantine)
         runtime = _current_job_runtime()
         if runtime is None or runtime["job_id"] != job["id"]:
-            runtime = _prepare_job_runtime(job)
+            runtime = _prepare_job_runtime(job, dispatched=False)
         with _job_runtime_scope(runtime):
             if runtime is None or _runtime_agents is not None:
                 return _run_job(job, defer_agent_teardown=defer_agent_teardown,
                                 _runtime_agents=_runtime_agents)
+            if not _activate_job_runtime(job, runtime):
+                # A direct caller reusing another dispatched capability owns
+                # neither its execution nor its failure finalization.
+                _runtime_remaining()
+                raise ValueError("Job runtime is already dispatched; reuse refused")
             agents, deferred = [], []
 
             def execute():
@@ -4301,22 +4314,30 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     """Bind one immutable runtime across execute, persistence, delivery and mark."""
     from cron.jobs import get_job
     admission_claim = (get_job(job["id"]) or {}).get("dispatch_claim")
+    admitted = False
     try:
         if _cleanup_quarantine_reason(job) is not None:
             return False
         runtime = _current_job_runtime()
         if runtime is None or runtime["job_id"] != job["id"]:
-            runtime = _prepare_job_runtime(job)
+            runtime = _prepare_job_runtime(job, dispatched=False)
         with _job_runtime_scope(runtime):
             if runtime is None:
                 return _run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
-            _activate_job_runtime(job, runtime)
+            if not _activate_job_runtime(job, runtime):
+                # No admission was won: even last_status belongs to its owner.
+                return False
+            admitted = True
             agents = []
             return _run_scoped_runtime(job, lambda: _run_one_job(
                 job, adapters=adapters, loop=loop, verbose=verbose,
                 _runtime_agents=agents), agents)
     except Exception as exc:
-        _record_runtime_failure(job, exc, claim=admission_claim)
+        # After admission the supervisor owns all failure bookkeeping. Reusing
+        # the old (possibly None) snapshot after finalization could overwrite a
+        # successor that has already completed and cleared its own claim.
+        if not admitted:
+            _record_runtime_failure(job, exc, claim=admission_claim)
         logger.error("Job runtime refused for %s: %s", job.get("id"), exc)
         return False
 
