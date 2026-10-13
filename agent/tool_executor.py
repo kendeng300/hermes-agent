@@ -668,6 +668,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
+            from tools.delegate_tool import _JOB_RUNTIME
+            # Presence, not remaining time: expired scoped work still owns its
+            # resources until the actual executor workers have drained.
+            scoped_runtime = _JOB_RUNTIME.get() is not None
             # Daemon workers: an interrupted/timed-out batch is abandoned with
             # shutdown(wait=False), but stdlib ThreadPoolExecutor workers are
             # non-daemon and registered in concurrent.futures' atexit hook,
@@ -804,15 +808,41 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
                         )
             finally:
-                # On abandon (interrupt or deadline) we intentionally do NOT
-                # join hung workers: wait=False returns immediately and
-                # cancel_futures drops queued-but-unstarted work. A wedged tool
-                # thread is left running detached — the deliberate tradeoff vs.
-                # deadlocking the whole batch. Normal completion joins (wait=True).
-                executor.shutdown(
-                    wait=not abandon_executor,
-                    cancel_futures=abandon_executor,
-                )
+                if not scoped_runtime:
+                    # Preserve ordinary interactive/unscoped abandonment.
+                    executor.shutdown(
+                        wait=not abandon_executor,
+                        cancel_futures=abandon_executor,
+                    )
+                else:
+                    # The outer job deadline returns failure independently.
+                    # Keep the conversation (and its CWD/leases/run ownership)
+                    # alive until accepted worker wrappers really exit, including
+                    # before TID registration and after TID/callback cleanup.
+                    # Cancellation still prevents queued work from starting.
+                    shutdown_error = None
+                    while True:
+                        try:
+                            executor.shutdown(wait=True, cancel_futures=abandon_executor)
+                            break
+                        except BaseException as exc:
+                            if shutdown_error is None:
+                                shutdown_error = exc
+                            # An interrupted join is not proof of worker exit.
+                            # Future completion covers the whole propagated
+                            # wrapper; retry shutdown to join the pool itself.
+                            for future in futures:
+                                while not future.done():
+                                    try:
+                                        future.result()
+                                    except BaseException:
+                                        pass
+                            try:
+                                threading.Event().wait(0.01)
+                            except BaseException:
+                                pass
+                    if shutdown_error is not None:
+                        raise shutdown_error
     finally:
         if spinner:
             # Build a summary message for the spinner stop
