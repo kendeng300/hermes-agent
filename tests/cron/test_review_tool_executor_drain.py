@@ -293,7 +293,11 @@ def test_sequential_handler_is_inline_and_keeps_ownership(tools_case, monkeypatc
     finally:
         release.set()
         thread.join(3)
-    assert not thread.is_alive() and not errors
+    assert not thread.is_alive()
+    if outcome == "interrupt":
+        assert len(errors) == 1 and isinstance(errors[0], KeyboardInterrupt)
+    else:
+        assert errors == []
 
 
 @pytest.mark.parametrize("location", ["before_registration", "after_wrapper_cleanup"])
