@@ -15,6 +15,7 @@ from tools import delegate_tool as delegate
 
 @pytest.fixture
 def runtime_case(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler, "_cleanup_unverified_jobs", {})
     policy = {"max_concurrent_children": 7, "max_elapsed_seconds": 600,
               "leaf_only": True, "publication_authority": "advisory"}
     cfg = {"model": {"default": "synthetic-model"}, "agent": {"max_turns": 40},
@@ -189,7 +190,7 @@ def test_pool_rejection_preserves_recoverable_claim_and_records_failure(runtime_
 
 
 @pytest.mark.parametrize("phase", ["agent", "save", "delivery"])
-def test_deadline_quarantines_unsettled_work_until_actual_drain(runtime_case, monkeypatch, phase):
+def test_deadline_retains_unsettled_work_until_actual_drain(runtime_case, monkeypatch, phase):
     c = runtime_case
     entered, release, drained = threading.Event(), threading.Event(), threading.Event()
     real_wait = scheduler.concurrent.futures.wait
@@ -221,12 +222,11 @@ def test_deadline_quarantines_unsettled_work_until_actual_drain(runtime_case, mo
     try:
         assert scheduler.run_one_job(c["job"]) is False
         stored = jobs.get_job(c["job"]["id"])
-        assert stored["last_status"] == "error" and stored["enabled"] is False
+        assert stored["last_status"] == "error" and stored["enabled"] is True
+        assert stored["state"] == "scheduled"
         assert scheduler._cleanup_quarantine_reason(stored)
-        # An explicit resume must not admit another worker while this one lives.
-        jobs.update_job(c["job"]["id"], {"enabled": True, "state": "scheduled",
-            "paused_at": None, "paused_reason": None})
-        assert scheduler._cleanup_quarantine_reason(jobs.get_job(c["job"]["id"]))
+        # The next invocation is refused without mutating the user's pause state.
+        assert scheduler.run_one_job(jobs.get_job(c["job"]["id"])) is False
     finally:
         release.set()
         assert drained.wait(timeout=3)

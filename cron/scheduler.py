@@ -2292,6 +2292,7 @@ def _run_script_process(
     timeout: int,
     cwd: str,
     env: dict[str, str],
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a script under the Linux subreaper containment contract."""
     if not sys.platform.startswith("linux"):
@@ -2312,6 +2313,7 @@ def _run_script_process(
     try:
         process = subprocess.Popen(
             process_argv,
+            **({"stdin": subprocess.PIPE} if input_text is not None else {}),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -2340,7 +2342,10 @@ def _run_script_process(
             min(float(timeout), _SCRIPT_SUPERVISOR_START_SECONDS),
         )
         remaining = max(0.001, float(timeout) - (time.monotonic() - started))
-        stdout, stderr = process.communicate(timeout=remaining)
+        if input_text is None:
+            stdout, stderr = process.communicate(timeout=remaining)
+        else:
+            stdout, stderr = process.communicate(input=input_text, timeout=remaining)
 
         # Even normal success crosses the same cleanup boundary.  A new
         # BaseException here is cleaned again below, then propagated.
@@ -2571,6 +2576,15 @@ def _cleanup_quarantine_reason(job: dict) -> Optional[str]:
             return None
         reason = str(record["reason"])
         pause_persisted = bool(record["pause_persisted"])
+        worker = record.get("worker")
+
+    # Explicit resume is not evidence that an interrupted worker has drained.
+    if worker is not None and not worker.done():
+        return reason
+    if record.get("runtime_draining"):
+        # Its done callback releases the marker and guard together. Do not
+        # race that callback by admitting a successor between those releases.
+        return reason
 
     if not pause_persisted:
         return reason
@@ -3050,7 +3064,51 @@ def _runtime_remaining():
     return remaining
 
 
-def _prepare_job_runtime(job):
+def _completion_verifier_config(policy):
+    hook = policy.get("completion_verifier")
+    if "completion_verifier" not in policy:
+        return None
+    if (not isinstance(hook, dict) or set(hook) != {"callable", "python_path"}
+            or not isinstance(hook["callable"], str)
+            or not re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*", hook["callable"])
+            or not isinstance(hook["python_path"], list) or not hook["python_path"]
+            or any(not isinstance(path, str) or not Path(path).is_absolute()
+                   or not Path(path).is_dir() or os.pathsep in path for path in hook["python_path"])):
+        raise ValueError("Invalid configured completion verifier")
+    return hook
+
+
+def _verify_runtime_completion(runtime, *, probe=False):
+    """Call the one operator hook in an isolated, contained Python process."""
+    hook = _completion_verifier_config(runtime)
+    if hook is None:
+        return True
+    from tools.environments.local import _sanitize_subprocess_env
+    program = (
+        "import importlib,json,sys; r=json.load(sys.stdin); "
+        "m,n=r['hook'].split(':'); f=getattr(importlib.import_module(m),n); "
+        "v=callable(f) if r['probe'] else f(**r['kwargs']); "
+        "assert type(v) is bool; print(json.dumps(v))"
+    )
+    with _job_runtime_scope(runtime):
+        remaining = _runtime_remaining()
+        env = _sanitize_subprocess_env(os.environ.copy())
+        env.update(PYTHONPATH=os.pathsep.join(hook["python_path"]),
+                   HERMES_HOME=str(_get_hermes_home()))
+        result = _run_script_process(
+            [sys.executable, "-c", program], timeout=remaining,
+            cwd=str(_get_hermes_home()), env=env,
+            input_text=json.dumps({"hook": hook["callable"], "probe": probe,
+                "kwargs": {"job_id": runtime["job_id"], "run_id": runtime["run_id"],
+                           "runtime": dict(runtime)}}),
+        )
+        _runtime_remaining()
+    if result.returncode != 0 or json.loads(result.stdout.strip()) is not True:
+        raise ValueError("Configured completion verifier did not confirm completion")
+    return True
+
+
+def _prepare_job_runtime(job, *, dispatched=True):
     """Freeze an operator-selected runtime in the existing locked dispatch claim."""
     from cron import jobs as store
     from hermes_cli.config import load_config_readonly
@@ -3060,7 +3118,7 @@ def _prepare_job_runtime(job):
         return None
     policy = overrides[job["id"]]
     fields = {"max_concurrent_children", "max_elapsed_seconds", "leaf_only", "publication_authority"}
-    if (not isinstance(policy, dict) or set(policy) != fields
+    if (not isinstance(policy, dict) or set(policy) not in (fields, fields | {"completion_verifier"})
             or type(policy["max_concurrent_children"]) is not int or policy["max_concurrent_children"] < 1
             or type(policy["max_elapsed_seconds"]) not in (int, float)
             or not math.isfinite(policy["max_elapsed_seconds"]) or policy["max_elapsed_seconds"] <= 0
@@ -3068,6 +3126,7 @@ def _prepare_job_runtime(job):
             or policy["publication_authority"] not in {"advisory", "incumbent_binding"}
             or job.get("no_agent")):
         raise ValueError("Invalid job runtime override; no default-policy fallback")
+    _completion_verifier_config(policy)
     with store._jobs_lock():
         current = store.get_job(job["id"])
         if current is None:
@@ -3077,9 +3136,9 @@ def _prepare_job_runtime(job):
         if runtime is not None:
             if (not isinstance(runtime, dict) or runtime.get("job_id") != job["id"]
                     or any(runtime.get(key) != value for key, value in policy.items())
-                    or claim.get("status") != "dispatched"):
+                    or claim.get("status") not in {"claimed", "dispatched"}):
                 raise ValueError("Job runtime claim does not match current policy")
-            expected = fields | {"job_id", "run_id", "dispatch_at", "deadline_at",
+            expected = set(policy) | {"job_id", "run_id", "dispatch_at", "deadline_at",
                                  "dispatch_monotonic", "deadline_monotonic"}
             if (set(runtime) != expected or not isinstance(runtime["run_id"], str)
                     or not re.fullmatch(r"[a-f0-9]{32}", runtime["run_id"])
@@ -3103,10 +3162,32 @@ def _prepare_job_runtime(job):
                        "deadline_at": (start + timedelta(seconds=policy["max_elapsed_seconds"])).astimezone(timezone.utc).isoformat(),
                        "dispatch_monotonic": mono - elapsed,
                        "deadline_monotonic": mono - elapsed + policy["max_elapsed_seconds"]}
-            claim.update(at=start.isoformat(), status="dispatched", runtime=runtime)
+            claim.update(at=start.isoformat(), status="dispatched" if dispatched else "claimed", runtime=runtime)
             if store.update_job(job["id"], {"dispatch_claim": claim}) is None:
                 raise ValueError("Job disappeared before runtime claim commit")
     return MappingProxyType(dict(runtime))
+
+
+def _activate_job_runtime(job, runtime):
+    """Only the accepted worker advances a scoped claimed dispatch."""
+    from cron import jobs as store
+    with store._jobs_lock():
+        current = store.get_job(job["id"]) or {}
+        claim = dict(current.get("dispatch_claim") or {})
+        if claim.get("runtime") != dict(runtime) or claim.get("status") not in {"claimed", "dispatched"}:
+            raise ValueError("Job runtime changed before accepted worker activation")
+        if claim["status"] == "claimed":
+            claim["status"] = "dispatched"
+            store.update_job(job["id"], {"dispatch_claim": claim})
+
+
+def _record_runtime_failure(job, error, *, claim):
+    """Record refusal without completing a never-admitted run or a newer claim."""
+    from cron import jobs as store
+    with store._jobs_lock():
+        current = store.get_job(job["id"])
+        if current is not None and current.get("dispatch_claim") == claim:
+            store.update_job(job["id"], {"last_status": "error", "last_error": str(error)})
 
 
 def _runtime_owns_claim(job):
@@ -3119,58 +3200,106 @@ def _runtime_owns_claim(job):
     return claim.get("status") == "dispatched" and claim.get("runtime") == dict(runtime)
 
 
-def run_job(job: dict, *, defer_agent_teardown: Optional[list] = None) -> tuple[bool, str, str, Optional[str]]:
+def _run_scoped_runtime(job, operation, agents):
+    """Fence the entire supplied job operation; quarantine only unproven drain."""
+    _runtime_remaining()
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+    from cron import jobs as store
+    runtime = _current_job_runtime()
+    pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-scoped-runtime")
+
+    def execute():
+        # Import readiness belongs to the accepted worker's budget, not the
+        # shared ticker thread. It cannot delay admission of unrelated jobs.
+        _verify_runtime_completion(runtime, probe=True)
+        return operation()
+
+    future = pool.submit(contextvars.copy_context().run, execute)
+    try:
+        while True:
+            remaining = _runtime_remaining()
+            done, _ = concurrent.futures.wait({future}, timeout=min(5.0, remaining))
+            _runtime_remaining()
+            if done:
+                return future.result()
+    except BaseException as exc:
+        for agent in list(agents):
+            try:
+                agent.interrupt("Job elapsed deadline reached; incomplete review")
+            except Exception:
+                logger.debug("Could not interrupt scoped job worker", exc_info=True)
+        # A short cleanup grace is not extra execution/publication authority.
+        # Cooperative expiry must not pause a healthy recurring job.
+        if not future.done():
+            try:
+                future.result(timeout=0.1)
+            except BaseException:
+                pass
+        with store._jobs_lock():
+            if _runtime_owns_claim(job):
+                claim = (store.get_job(job["id"]) or {}).get("dispatch_claim")
+                _record_runtime_failure(job, exc, claim=claim)
+                if isinstance(exc, CronScriptCleanupError):
+                    _pause_job_for_unverified_script_cleanup(job, exc)
+                if not future.done():
+                    # An interrupt-pending thread is not a failed process-tree
+                    # cleanup proof. Keep existing running ownership, not a new
+                    # durable pause policy, until this exact future settles.
+                    job["_runtime_drain_owned"] = runtime["run_id"]
+                    with _running_lock:
+                        record = {"reason": "Scoped deadline reached; previous worker still draining",
+                                  "pause_persisted": False, "runtime_draining": True,
+                                  "worker": future, "runtime_run_id": runtime["run_id"]}
+                        _cleanup_unverified_jobs[job["id"]] = record
+                        _running_job_ids.add(job["id"])
+                        _record_running_marker(job["id"], True)
+
+                    def drained(_):
+                        # Never clear a marker belonging to a later resumed run.
+                        with _running_lock:
+                            if _cleanup_unverified_jobs.get(job["id"]) is record:
+                                _record_running_marker(job["id"], False)
+                                _running_job_ids.discard(job["id"])
+                                _cleanup_unverified_jobs.pop(job["id"], None)
+
+                    future.add_done_callback(drained)
+        raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def run_job(job: dict, *, defer_agent_teardown: Optional[list] = None,
+            _runtime_agents=None) -> tuple[bool, str, str, Optional[str]]:
     """Execute a job, enforcing an optional dispatch-to-completion elapsed budget."""
     try:
+        quarantine = _cleanup_quarantine_reason(job)
+        if quarantine is not None:
+            raise RuntimeError(quarantine)
         runtime = _current_job_runtime()
         if runtime is None or runtime["job_id"] != job["id"]:
             runtime = _prepare_job_runtime(job)
         with _job_runtime_scope(runtime):
-            if runtime is None:
-                return _run_job(job, defer_agent_teardown=defer_agent_teardown)
-            _runtime_remaining()
-            from tools.daemon_pool import DaemonThreadPoolExecutor
+            if runtime is None or _runtime_agents is not None:
+                return _run_job(job, defer_agent_teardown=defer_agent_teardown,
+                                _runtime_agents=_runtime_agents)
             agents, deferred = [], []
-            cancelled = threading.Event()
-            cleanup_lock = threading.Lock()
-
-            def cleanup():
-                with cleanup_lock:
-                    while deferred:
-                        _teardown_cron_agent(deferred.pop(), job["id"])
 
             def execute():
                 try:
                     return _run_job(job, defer_agent_teardown=deferred, _runtime_agents=agents)
                 finally:
-                    if cancelled.is_set():
-                        cleanup()
-
-            pool = DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-scoped-runtime")
-            future = pool.submit(contextvars.copy_context().run, execute)
-            try:
-                while True:
-                    remaining = _runtime_remaining()
-                    done, _ = concurrent.futures.wait({future}, timeout=min(5.0, remaining))
-                    _runtime_remaining()
-                    if done:
-                        result = future.result()
+                    try:
+                        _runtime_remaining()
                         if defer_agent_teardown is not None:
                             defer_agent_teardown.extend(deferred)
                             deferred.clear()
-                        else:
-                            cleanup()
-                        return result
-            finally:
-                cancelled.set()
-                if not future.done():
-                    for agent in list(agents):
-                        try:
-                            agent.interrupt("Job elapsed deadline reached; incomplete review")
-                        except Exception:
-                            logger.debug("Could not interrupt scoped job worker", exc_info=True)
-                cleanup()
-                pool.shutdown(wait=False, cancel_futures=True)
+                    except TimeoutError:
+                        pass
+                    finally:
+                        while deferred:
+                            _teardown_cron_agent(deferred.pop(), job["id"])
+
+            return _run_scoped_runtime(job, execute, agents)
     except Exception as exc:
         error = str(exc)
         return False, f"# Cron job FAILED\n\n{error}\n", "", error
@@ -3958,6 +4087,7 @@ def _run_job(
             and result.get("completed") is False
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
+            and not (_current_job_runtime() or {}).get("completion_verifier")
         )
         if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
             _err_text = (
@@ -4131,13 +4261,24 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
 
 def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
     """Bind one immutable runtime across execute, persistence, delivery and mark."""
+    from cron.jobs import get_job
+    admission_claim = (get_job(job["id"]) or {}).get("dispatch_claim")
     try:
+        if _cleanup_quarantine_reason(job) is not None:
+            return False
         runtime = _current_job_runtime()
         if runtime is None or runtime["job_id"] != job["id"]:
             runtime = _prepare_job_runtime(job)
         with _job_runtime_scope(runtime):
-            return _run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            if runtime is None:
+                return _run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            _activate_job_runtime(job, runtime)
+            agents = []
+            return _run_scoped_runtime(job, lambda: _run_one_job(
+                job, adapters=adapters, loop=loop, verbose=verbose,
+                _runtime_agents=agents), agents)
     except Exception as exc:
+        _record_runtime_failure(job, exc, claim=admission_claim)
         logger.error("Job runtime refused for %s: %s", job.get("id"), exc)
         return False
 
@@ -4153,7 +4294,8 @@ def _mark_runtime_job_run(job, success, error, *, delivery_error=None):
         return mark_job_run(job["id"], success, error, delivery_error=delivery_error)
 
 
-def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False,
+                 _runtime_agents=None) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -4175,7 +4317,8 @@ def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) 
             job["id"],
             quarantine_reason,
         )
-        _clear_cleanup_fire_claim(str(job["id"]))
+        if _runtime_owns_claim(job):
+            _clear_cleanup_fire_claim(str(job["id"]))
         return False
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
@@ -4218,7 +4361,8 @@ def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) 
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                job, defer_agent_teardown=_deferred_agents,
+                **({"_runtime_agents": _runtime_agents} if _runtime_agents is not None else {}),
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4283,9 +4427,17 @@ def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) 
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
+            if should_deliver and _current_job_runtime() is not None:
+                try:
+                    _runtime_remaining()
+                except TimeoutError as exc:
+                    success, error, should_deliver = False, str(exc), False
+
             if should_deliver:
                 try:
                     delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    if delivery_error and _current_job_runtime() is not None:
+                        success, error = False, "Scoped job delivery failed: " + str(delivery_error)
                     if success:
                         try:
                             _runtime_remaining()
@@ -4293,6 +4445,8 @@ def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) 
                             success, error = False, str(exc)
                 except Exception as de:
                     delivery_error = str(de)
+                    if _current_job_runtime() is not None:
+                        success, error = False, "Scoped job delivery failed: " + str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
         finally:
             # Tear down the deferred agent(s) now that save + delivery have run
@@ -4344,18 +4498,30 @@ def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) 
                 logger.warning("SYS-666 completeness gate check error: %s", _e)
 
         with _running_lock:
-            cleanup_quarantined = str(job["id"]) in _cleanup_unverified_jobs
+            cleanup_record = _cleanup_unverified_jobs.get(str(job["id"]))
+            cleanup_quarantined = cleanup_record is not None
         if cleanup_quarantined:
             # The pause helper already persisted the exact authoritative
             # paused row and cleanup reason.  Do not let mark_job_run clear the
             # error, re-arm recurrence, complete/delete a one-shot, or advance
             # a finite repeat.  Only release a transient manual/provider claim.
-            _clear_cleanup_fire_claim(str(job["id"]))
+            if not cleanup_record.get("runtime_draining") and _runtime_owns_claim(job):
+                _clear_cleanup_fire_claim(str(job["id"]))
             return False
         if success:
             try:
                 _runtime_remaining()
-            except TimeoutError as exc:
+                runtime = _current_job_runtime()
+                if runtime is not None and runtime.get("completion_verifier"):
+                    if not _runtime_owns_claim(job):
+                        raise ValueError("Job runtime changed before completion verification")
+                    try:
+                        _verify_runtime_completion(runtime)
+                    except CronScriptCleanupError as exc:
+                        _pause_job_for_unverified_script_cleanup(job, exc)
+                        raise
+                    _runtime_remaining()
+            except (TimeoutError, ValueError) as exc:
                 success, error = False, str(exc)
         if _runtime_owns_claim(job) and not _consume_interrupted_flag(job["id"]):
             _mark_runtime_job_run(job, success, error, delivery_error=delivery_error)
@@ -4364,9 +4530,11 @@ def _run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         with _running_lock:
-            cleanup_unverified = str(job["id"]) in _cleanup_unverified_jobs
+            cleanup_record = _cleanup_unverified_jobs.get(str(job["id"]))
+            cleanup_unverified = cleanup_record is not None
         if cleanup_unverified:
-            _clear_cleanup_fire_claim(str(job["id"]))
+            if not cleanup_record.get("runtime_draining") and _runtime_owns_claim(job):
+                _clear_cleanup_fire_claim(str(job["id"]))
         if not cleanup_unverified and _runtime_owns_claim(job) and not _consume_interrupted_flag(job["id"]):
             _mark_runtime_job_run(job, False, str(e))
         return False
@@ -4519,9 +4687,12 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     return None
                 _running_job_ids.add(job_id)
             _ctx = contextvars.copy_context()
+            from cron.jobs import get_job
+            admission_claim = (get_job(job_id) or {}).get("dispatch_claim")
             try:
-                runtime = _prepare_job_runtime(job)
+                runtime = _prepare_job_runtime(job, dispatched=False)
             except Exception as exc:
+                _record_runtime_failure(job, exc, claim=admission_claim)
                 with _running_lock:
                     _running_job_ids.discard(job_id)
                 logger.error("Job '%s' runtime admission failed: %s", job_id, exc)
@@ -4535,9 +4706,11 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     _record_running_marker(j["id"], True)
                     return ctx.run(process)
                 finally:
-                    _record_running_marker(j["id"], False)
-                    with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                    if not (scoped_runtime is not None and
+                            j.get("_runtime_drain_owned") == scoped_runtime["run_id"]):
+                        with _running_lock:
+                            _record_running_marker(j["id"], False)
+                            _running_job_ids.discard(j["id"])
 
             try:
                 fut = pool.submit(_run_and_release)
@@ -4547,7 +4720,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 # "claimed" here is safer than an unrecovered silent skip.
                 try:
                     from cron.jobs import set_dispatch_claim_status
-                    set_dispatch_claim_status(job_id, "dispatched")
+                    if runtime is None:
+                        set_dispatch_claim_status(job_id, "dispatched")
                 except Exception:
                     logger.debug(
                         "SYS-770: dispatch_claim transition failed for '%s'",
@@ -4559,9 +4733,14 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                 # submit — release the in-flight claim we just took and skip.
                 # SYS-770: leave the dispatch_claim in "claimed" state — the
                 # watchdog detects it and re-arms the job.
+                if runtime is not None:
+                    current = get_job(job_id) or {}
+                    claim = current.get("dispatch_claim")
+                    if (claim or {}).get("runtime") == dict(runtime):
+                        _record_runtime_failure(job, submit_err, claim=claim)
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
                 if _interpreter_shutting_down(submit_err):
-                    with _running_lock:
-                        _running_job_ids.discard(job_id)
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),
