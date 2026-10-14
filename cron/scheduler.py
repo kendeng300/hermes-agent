@@ -62,6 +62,20 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    # _run_script supplies this envelope. Its stdout/stderr is arbitrary
+    # application data: counts such as 401/403/429 and business authorization
+    # decisions are not evidence of an inference-provider failure.
+    script_failure = re.match(
+        r"^(Script exited with code -?\d+|Script timed out(?: after [\d.]+s)?"
+        r"|Script execution failed)\b",
+        text,
+    )
+    if script_failure:
+        return (
+            f"⚠️ Cron '{job_name}' failed: {script_failure.group(1)}. "
+            "Full details saved in cron output."
+        )
+
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
         reason = "rate limit"
