@@ -6442,6 +6442,9 @@ def call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    # Vision replaces resolved_provider with its concrete backend below. Keep
+    # the caller's original discovery permission distinct from that identity.
+    requested_auto = resolved_provider in {"auto", "", None}
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -6943,7 +6946,7 @@ def call_llm(
                 # Quarantine does not authorize providers outside an explicit
                 # route. Only callers that selected auto may rediscover one.
                 fb_client, fb_model, fb_label = (None, None, "")
-                if is_auto:
+                if requested_auto:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
@@ -7054,6 +7057,7 @@ async def async_call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    requested_auto = resolved_provider in {"auto", "", None}
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -7444,7 +7448,7 @@ async def async_call_llm(
                 # Only auto callers permit discovery after quarantine; an
                 # explicit fallback is not permission to try other providers.
                 fb_client, fb_model, fb_label = (None, None, "")
-                if is_auto:
+                if requested_auto:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
