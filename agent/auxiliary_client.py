@@ -6442,6 +6442,9 @@ def call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    # Vision replaces resolved_provider with its concrete backend below. Keep
+    # the caller's original discovery permission distinct from that identity.
+    requested_auto = resolved_provider in {"auto", "", None}
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
@@ -6455,16 +6458,8 @@ def call_llm(
             api_key=resolved_api_key or api_key,
             async_mode=False,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning(
-                "Vision provider %s unavailable, falling back to auto vision backends",
-                resolved_provider,
-            )
-            effective_provider, client, final_model = resolve_vision_provider_client(
-                provider="auto",
-                model=resolved_model,
-                async_mode=False,
-            )
+        # An explicit unavailable provider must not silently become "auto".
+        # Auto callers already perform their discovery in the resolver above.
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -6948,11 +6943,12 @@ def call_llm(
                     effective_extra_body=effective_extra_body)
                 if fb_resp is not None:
                     return fb_resp
-                # The candidate had a stale/unrefreshable credential and was
-                # quarantined — walk the discovery chain once more; unhealthy
-                # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                # Quarantine does not authorize providers outside an explicit
+                # route. Only callers that selected auto may rediscover one.
+                fb_client, fb_model, fb_label = (None, None, "")
+                if requested_auto:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
@@ -7061,6 +7057,7 @@ async def async_call_llm(
     """
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    requested_auto = resolved_provider in {"auto", "", None}
     effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
@@ -7072,16 +7069,7 @@ async def async_call_llm(
             api_key=resolved_api_key or api_key,
             async_mode=True,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
-            logger.warning(
-                "Vision provider %s unavailable, falling back to auto vision backends",
-                resolved_provider,
-            )
-            effective_provider, client, final_model = resolve_vision_provider_client(
-                provider="auto",
-                model=resolved_model,
-                async_mode=True,
-            )
+        # Preserve the same explicit-provider boundary as the sync path.
         if client is None:
             raise RuntimeError(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
@@ -7457,10 +7445,12 @@ async def async_call_llm(
                     effective_extra_body=effective_extra_body)
                 if fb_resp is not None:
                     return fb_resp
-                # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                # Only auto callers permit discovery after quarantine; an
+                # explicit fallback is not permission to try other providers.
+                fb_client, fb_model, fb_label = (None, None, "")
+                if requested_auto:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")

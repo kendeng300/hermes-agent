@@ -62,6 +62,20 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     text = (error or "unknown error").strip()
     lower = text.lower()
 
+    # _run_script supplies this envelope. Its stdout/stderr is arbitrary
+    # application data: counts such as 401/403/429 and business authorization
+    # decisions are not evidence of an inference-provider failure.
+    script_failure = re.match(
+        r"^(Script exited with code -?\d+|Script timed out(?: after [\d.]+s)?"
+        r"|Script execution failed)\b",
+        text,
+    )
+    if script_failure:
+        return (
+            f"⚠️ Cron '{job_name}' failed: {script_failure.group(1)}. "
+            "Full details saved in cron output."
+        )
+
     # Provider/API failures are the common noisy path. Keep these short.
     if "429" in text or "rate limit" in lower or "usage limit" in lower:
         reason = "rate limit"
@@ -82,10 +96,17 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "Full details saved in cron output."
         )
 
-    # Match authentication/authorization wording at a word boundary and the
-    # 401/403 status codes as whole tokens, so "oauth", "4015" and similar do
-    # not trip a misleading auth message.
-    if re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text):
+    # Require failure wording, not arbitrary report metadata such as
+    # ``closure_authorized: false`` or ``authentication_checked``. These
+    # fields describe business acceptance and do not establish an API error.
+    auth_failure = re.search(
+        r"\b(?:authentication|authorization)(?:error|failure|failed)\b"
+        r"|\b(?:authentication|authorization)\s+(?:error|failure|failed|denied)\b"
+        r"|\b(?:unauthorized|unauthorised|forbidden)\b"
+        r"|\bnot\s+authori[sz]ed\b",
+        lower,
+    )
+    if auth_failure or re.search(r"\b(401|403)\b", text):
         return (
             f"⚠️ Cron '{job_name}' failed: provider authentication error. "
             "Full details saved in cron output."
