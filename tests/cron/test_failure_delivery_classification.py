@@ -53,3 +53,18 @@ def test_auth_like_word_fragments_and_long_numbers_are_not_auth_errors():
         {"name": "Acceptance"}, "OAuth callback completed; item 4015 needs review"
     )
     assert "authentication error" not in result
+
+
+@pytest.mark.parametrize("report", [
+    "closure not authorized",
+    '{"rows_reviewed": 403, "missed_items": 401, "status": "FAIL"}',
+    '{"rows_reviewed": 429, "status": "FAIL"}',
+    'The source timeout budget was unchanged; coverage remains incomplete.',
+])
+def test_script_failure_envelope_takes_precedence_over_arbitrary_stdout(report):
+    result = _summarize_cron_failure_for_delivery(
+        {"name": "Acceptance"}, "Script exited with code 1\nstdout:\n" + report
+    )
+    assert "Script exited with code 1" in result
+    assert "provider " not in result
+    assert "Full details saved in cron output" in result
