@@ -248,7 +248,8 @@ _LEGACY_TOOLSET_MAP = {
 # =============================================================================
 
 # Module-level memoization for get_tool_definitions(). Keyed on
-# (frozenset(enabled_toolsets), frozenset(disabled_toolsets), registry._generation).
+# toolset inputs, registry generation, config fingerprint, and effective
+# delegation capability (including the scheduler's context-local overrides).
 # Hot callers (gateway runner, AIAgent.__init__) invoke this on every turn
 # with quiet_mode=True; caching avoids ~7 ms of registry walking + schema
 # filtering + check_fn probing per call. Only active when quiet_mode=True
@@ -309,6 +310,20 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     if quiet_mode:
+        from tools.delegate_tool import (
+            _get_max_concurrent_children,
+            _get_max_spawn_depth,
+            _get_orchestrator_enabled,
+        )
+
+        # The same config/toolsets can serve ordinary sessions and scoped cron
+        # reviews concurrently. Key the resolved description inputs, not a run
+        # identity or deadline, and leave existing agent snapshots untouched.
+        delegation_capability = (
+            _get_max_concurrent_children(),
+            _get_max_spawn_depth(),
+            _get_orchestrator_enabled(),
+        )
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -323,6 +338,7 @@ def get_tool_definitions(
             cfg_fp,
             bool(os.environ.get("HERMES_KANBAN_TASK")),
             bool(skip_tool_search_assembly),
+            delegation_capability,
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
