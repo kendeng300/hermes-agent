@@ -89,8 +89,10 @@ def test_unavailable_explicit_vision_provider_does_not_fall_into_auto_discovery(
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
-def test_quarantined_configured_fallback_does_not_authorize_unconfigured_provider(async_mode, explicit_config):
-    task = "web_extract"
+@pytest.mark.parametrize("task", ["vision", "web_extract"])
+@pytest.mark.parametrize("requested", ["openai-codex", "auto"])
+def test_quarantine_preserves_original_provider_discovery_intent(async_mode, task, requested, explicit_config):
+    explicit_config["auxiliary"][task]["provider"] = requested
     fallback_spec = {"provider": "configured-secondary", "model": "secondary-model"}
     explicit_config["auxiliary"][task]["fallback_chain"] = [fallback_spec]
     primary_error = RuntimeError("primary capacity unavailable")
@@ -100,13 +102,53 @@ def test_quarantined_configured_fallback_does_not_authorize_unconfigured_provide
     client = fake_client(primary_error, async_mode)
     fallback = fake_client(fallback_error, async_mode)
     fallback.base_url = "https://secondary.example/v1"
+    healthy = fake_client(None, async_mode)
+    healthy.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))]
+    )
     with (
         patch.object(auxiliary, "_build_codex_client", return_value=(client, MODEL)),
         patch.object(auxiliary, "_resolve_fallback_entry", return_value=(fallback, "secondary-model")) as resolve_fallback,
-        patch.object(auxiliary, "_get_provider_chain", side_effect=AssertionError("unexpected provider discovery")) as discovery,
+        patch.object(auxiliary, "_main_model_supports_vision", return_value=True),
+        patch.object(auxiliary, "_get_provider_chain", return_value=[("discovered-test", lambda: (healthy, "discovered-model"))]) as discovery,
     ):
-        with pytest.raises(RuntimeError, match="primary capacity unavailable"):
-            invoke(task, async_mode)
+        if requested == "auto":
+            assert invoke(task, async_mode).choices[0].message.content == "recovered"
+        else:
+            with pytest.raises(RuntimeError, match="primary capacity unavailable"):
+                invoke(task, async_mode)
     resolve_fallback.assert_called_once_with(fallback_spec)
-    discovery.assert_not_called()
+    if requested == "auto":
+        discovery.assert_called_once()
+        healthy.chat.completions.create.assert_called_once()
+    else:
+        discovery.assert_not_called()
+        healthy.chat.completions.create.assert_not_called()
     fallback.chat.completions.create.assert_called_once()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("task", ["vision", "web_extract"])
+@pytest.mark.parametrize("requested", ["openai-codex", "auto"])
+def test_initial_client_discovery_respects_configured_intent(async_mode, task, requested, explicit_config):
+    explicit_config["auxiliary"][task]["provider"] = requested
+    healthy = fake_client(None, async_mode)
+    healthy.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))]
+    )
+    with (
+        patch.object(auxiliary, "_build_codex_client", return_value=(None, None)),
+        patch.object(auxiliary, "_main_model_supports_vision", return_value=True),
+        patch.object(auxiliary, "_get_provider_chain", return_value=[("discovered-test", lambda: (healthy, MODEL))]) as discovery,
+        patch.object(auxiliary, "_try_openrouter", return_value=(healthy, MODEL)) as vision_discovery,
+    ):
+        if requested == "auto":
+            assert invoke(task, async_mode).choices[0].message.content == "recovered"
+        else:
+            with pytest.raises(RuntimeError):
+                invoke(task, async_mode)
+    if requested == "openai-codex":
+        discovery.assert_not_called()
+        vision_discovery.assert_not_called()
+    else:
+        assert discovery.called or vision_discovery.called
