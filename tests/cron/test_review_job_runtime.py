@@ -256,6 +256,92 @@ def test_scoped_schema_and_execution_cap_with_legacy_default_unchanged(runtime_c
                agent.kwargs["max_iterations"] == 40 for agent in c["agents"])
 
 
+@pytest.fixture
+def cached_delegation_schema(runtime_case, monkeypatch):
+    """Use the public memoized schema path and real registry overrides."""
+    import model_tools
+
+    c = runtime_case
+    c["cfg"]["delegation"].update(max_spawn_depth=3, orchestrator_enabled=True)
+    monkeypatch.setattr(model_tools, "_tool_defs_cache", {})
+    monkeypatch.setattr(model_tools, "_last_resolved_tool_names", [])
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: c["home"] / "config.yaml")
+    runtime = scheduler._prepare_job_runtime(c["job"])
+
+    def snapshot(*, raw_catalog=False):
+        definitions = model_tools.get_tool_definitions(
+            enabled_toolsets=["delegation"], quiet_mode=True,
+            skip_tool_search_assembly=raw_catalog,
+        )
+        return next(row["function"] for row in definitions
+                    if row["function"]["name"] == "delegate_task")
+
+    return runtime, snapshot
+
+
+def _assert_delegation_schema_matches_runtime(schema):
+    limit = delegate._get_max_concurrent_children()
+    depth = delegate._get_max_spawn_depth()
+    assert f"up to {limit} " in schema["description"]
+    assert f"up to {limit} " in schema["parameters"]["properties"]["tasks"]["description"]
+    assert f"max_spawn_depth={depth}" in schema["description"]
+    assert f"max_spawn_depth={depth}" in schema["parameters"]["properties"]["role"]["description"]
+
+
+@pytest.mark.parametrize("scoped_first", [False, True])
+@pytest.mark.parametrize("raw_catalog", [False, True])
+@pytest.mark.parametrize("scoped_limit", [3, 7])
+def test_public_schema_cache_isolates_scoped_delegation_capability(
+        cached_delegation_schema, scoped_first, raw_catalog, scoped_limit):
+    runtime, snapshot = cached_delegation_schema
+    runtime = {**runtime, "max_concurrent_children": scoped_limit}
+    scopes = (runtime, None) if scoped_first else (None, runtime)
+    retained = []
+    for scope in scopes:
+        with delegate.job_runtime_scope(scope):
+            schema = snapshot(raw_catalog=raw_catalog)
+            _assert_delegation_schema_matches_runtime(schema)
+            retained.append((schema, deepcopy(schema)))
+    # New agent snapshots must not rewrite any already-created conversation.
+    assert all(schema == original for schema, original in retained)
+    assert delegate._get_max_concurrent_children() == 3
+    assert delegate._get_max_spawn_depth() == 3
+
+
+def test_public_schema_cache_reuses_equal_effective_capability(cached_delegation_schema):
+    runtime, snapshot = cached_delegation_schema
+    with delegate.job_runtime_scope(runtime):
+        first = snapshot()
+        _assert_delegation_schema_matches_runtime(first)
+    # Run identity, authority and clock changes do not change delegation text.
+    another_run = {**runtime, "job_id": "another-synthetic-review", "run_id": "b" * 32,
+                   "deadline_monotonic": runtime["deadline_monotonic"] + 100,
+                   "publication_authority": "incumbent_binding"}
+    with delegate.job_runtime_scope(another_run):
+        assert snapshot() is first
+        _assert_delegation_schema_matches_runtime(first)
+
+
+def test_public_schema_cache_keeps_parallel_runtime_scopes_separate(cached_delegation_schema):
+    runtime, snapshot = cached_delegation_schema
+    # Warm the shared key as an ordinary session before the two threads enter.
+    ordinary = snapshot()
+    ordinary_original = deepcopy(ordinary)
+    barrier = threading.Barrier(2)
+
+    def inspect(scope):
+        with delegate.job_runtime_scope(scope):
+            barrier.wait(timeout=5)
+            for _ in range(3):
+                _assert_delegation_schema_matches_runtime(snapshot())
+            return delegate._get_max_concurrent_children()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(inspect, scope) for scope in (runtime, None)]
+        assert [future.result(timeout=5) for future in futures] == [7, 3]
+    assert ordinary == ordinary_original
+
+
 def test_seven_real_executor_workers_leaf_only_and_unchanged_child_budget(runtime_case, monkeypatch):
     c = runtime_case
     barrier = threading.Barrier(7)
