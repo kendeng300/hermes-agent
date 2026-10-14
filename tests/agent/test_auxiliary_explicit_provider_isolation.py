@@ -152,3 +152,31 @@ def test_initial_client_discovery_respects_configured_intent(async_mode, task, r
         vision_discovery.assert_not_called()
     else:
         assert discovery.called or vision_discovery.called
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("task", ["vision", "web_extract"])
+def test_original_auto_request_fallback_semantics_are_not_broadened(async_mode, task, explicit_config):
+    explicit_config["auxiliary"][task]["provider"] = "auto"
+    error = RuntimeError("primary capacity unavailable")
+    error.status_code = 402
+    client = fake_client(error, async_mode)
+    healthy = fake_client(None, async_mode)
+    healthy.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="recovered"))]
+    )
+    with (
+        patch.object(auxiliary, "_build_codex_client", return_value=(client, MODEL)),
+        patch.object(auxiliary, "_main_model_supports_vision", return_value=True),
+        patch.object(auxiliary, "_get_provider_chain", return_value=[("discovered-test", lambda: (healthy, MODEL))]) as discovery,
+    ):
+        if task == "vision":
+            # Before this fix, vision's concrete backend already constrained
+            # first-request fallback. Preserve that policy; original intent
+            # is used only for the new post-quarantine discovery guard.
+            with pytest.raises(RuntimeError, match="primary capacity unavailable"):
+                invoke(task, async_mode)
+            discovery.assert_not_called()
+        else:
+            assert invoke(task, async_mode).choices[0].message.content == "recovered"
+            discovery.assert_called_once()
