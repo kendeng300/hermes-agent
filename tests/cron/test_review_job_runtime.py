@@ -265,6 +265,8 @@ def cached_delegation_schema(runtime_case, monkeypatch):
     c["cfg"]["delegation"].update(max_spawn_depth=3, orchestrator_enabled=True)
     monkeypatch.setattr(model_tools, "_tool_defs_cache", {})
     monkeypatch.setattr(model_tools, "_last_resolved_tool_names", [])
+    # Tool-search assembly is real; context metadata needs no provider lookup.
+    monkeypatch.setattr(model_tools, "_resolve_active_context_length", lambda: 100_000)
     monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: c["home"] / "config.yaml")
     runtime = scheduler._prepare_job_runtime(c["job"])
 
