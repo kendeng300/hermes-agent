@@ -16,7 +16,7 @@ from cron import jobs, scheduler
 from tools import delegate_tool as delegate
 
 
-@pytest.mark.parametrize("value", [0, -1, 601, True, "270", float("nan"), float("inf")])
+@pytest.mark.parametrize("value", [0, -1, 601, 10**500, True, "270", float("nan"), float("inf")])
 def test_delegation_phase_rejects_invalid_caps_before_constructing_children(runtime_case, monkeypatch, value):
     runtime = scheduler._prepare_job_runtime(runtime_case["job"])
     monkeypatch.setattr(delegate, "_build_child_agent", lambda **k: pytest.fail("invalid cap constructed a child"))
@@ -40,6 +40,53 @@ def test_delegation_phase_needs_existing_runtime_and_cannot_reset_at_launch(runt
         assert delegate.job_runtime_remaining() == 330
     assert "error" in result and "deadline" in result["error"].lower()
     assert runtime == original
+
+
+def test_nested_phase_cap_cannot_extend_parent_or_leak_into_another_runtime(runtime_case, monkeypatch):
+    c = runtime_case
+    runtime = scheduler._prepare_job_runtime(c["job"])
+    c["clock"][0] += 80
+    entered = []
+    def invoke(**kwargs):
+        entered.append(delegate.job_runtime_remaining())
+        if len(entered) == 1:
+            delegate.delegate_task(goal="nested", parent_agent=SimpleNamespace(), deadline_elapsed_seconds=495)
+            assert delegate.job_runtime_remaining() == 190
+            other = dict(runtime, job_id="unrelated", run_id="other-run")
+            with delegate.job_runtime_scope(other):
+                assert delegate.job_runtime_remaining() == 520
+        return "{}"
+    monkeypatch.setattr(delegate, "_delegate_task", invoke)
+    with delegate.job_runtime_scope(runtime):
+        delegate.delegate_task(goal="initial", parent_agent=SimpleNamespace(), deadline_elapsed_seconds=270)
+        assert delegate.job_runtime_remaining() == 520
+    assert entered == [190, 190]
+
+
+def test_phase_expiring_during_construction_closes_only_unstarted_children(runtime_case, monkeypatch):
+    c = runtime_case
+    runtime = scheduler._prepare_job_runtime(c["job"])
+    parent = SimpleNamespace(_active_children=[], _active_children_lock=threading.Lock(), _delegate_depth=0)
+    closed = []
+    monkeypatch.setattr(delegate, "is_spawn_paused", lambda: False)
+    monkeypatch.setattr(delegate, "_resolve_delegation_credentials", lambda cfg, parent: {
+        "model": None, "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "request_overrides": None, "max_output_tokens": None,
+        "command": None, "args": None})
+    monkeypatch.setattr(delegate, "_resolve_effective_delegation_model", lambda **k: (None, None))
+    def build(**kwargs):
+        child = SimpleNamespace(close=lambda: closed.append(True))
+        parent._active_children.append(child)
+        c["clock"][0] += 270
+        return child
+    monkeypatch.setattr(delegate, "_build_child_agent", build)
+    monkeypatch.setattr(delegate, "_run_single_child", lambda *a, **k: pytest.fail("expired phase started inference"))
+    with delegate.job_runtime_scope(runtime):
+        result = json.loads(delegate.delegate_task(tasks=[{"goal": str(i)} for i in range(7)],
+                                                   parent_agent=parent, deadline_elapsed_seconds=270))
+        assert delegate.job_runtime_remaining() == 330
+    assert "deadline" in result["error"].lower()
+    assert closed == [True] and parent._active_children == []
 
 
 def test_delegation_phase_keeps_seven_workers_and_restores_original_budget(runtime_case, monkeypatch):
