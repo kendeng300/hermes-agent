@@ -2676,9 +2676,13 @@ def delegate_task(
                 deadline = min(deadline, inherited[2])
             token = _DELEGATION_DEADLINE.set((*identity, deadline))
             job_runtime_remaining()
-        return _delegate_task(goal=goal, context=context, tasks=tasks, max_iterations=max_iterations,
-                              role=role, reasoning_required=reasoning_required, background=background,
-                              parent_agent=parent_agent)
+        result = _delegate_task(goal=goal, context=context, tasks=tasks, max_iterations=max_iterations,
+                                role=role, reasoning_required=reasoning_required, background=background,
+                                parent_agent=parent_agent)
+        # This final boundary includes child cleanup, summary spill, parent
+        # aggregation hooks and serialization while the call cap is still active.
+        job_runtime_remaining()
+        return result
     except TimeoutError as exc:
         return tool_error(str(exc))
     finally:
