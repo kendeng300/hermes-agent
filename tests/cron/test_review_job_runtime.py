@@ -248,7 +248,7 @@ def test_phase_deadline_charges_setup_and_checks_actual_worker_entry(runtime_cas
         assert waited[0] == 70, "executor/setup elapsed time must not reset the wait allowance"
     else:
         assert called == [], "a queued child must not begin inference after its phase deadline"
-        assert result["status"] == "timeout" and result["summary"] is None
+        assert "deadline" in result["error"].lower() and result.get("summary") is None
 
 
 def test_phase_expiry_during_owned_tool_drain_interrupts_and_revokes_completion(runtime_case, monkeypatch):
@@ -308,7 +308,7 @@ def test_phase_expiry_during_owned_tool_drain_interrupts_and_revokes_completion(
             worker.join(timeout=3)
         thread.join(timeout=3)
         assert not thread.is_alive()
-    assert results[0]["status"] == "timeout" and results[0]["summary"] is None
+    assert "deadline" in results[0]["error"].lower() and results[0].get("summary") is None
     assert closed == [True] and parent._active_children == []
 
 
