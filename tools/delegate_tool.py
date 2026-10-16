@@ -22,6 +22,7 @@ from contextlib import contextmanager
 from types import MappingProxyType
 import json
 import logging
+import math
 
 logger = logging.getLogger(__name__)
 import os
@@ -120,6 +121,7 @@ def _get_subagent_approval_callback():
 
 _DEFAULT_MAX_CONCURRENT_CHILDREN = 3
 _JOB_RUNTIME = contextvars.ContextVar("delegation_job_runtime", default=None)
+_DELEGATION_DEADLINE = contextvars.ContextVar("delegation_call_deadline", default=None)
 
 
 def _runtime_read_only(*args, **kwargs):
@@ -172,10 +174,28 @@ def drain_job_agent(agent, future):
     """
     if _JOB_RUNTIME.get() is None:
         return
+    interrupted = False
+
+    def check_deadline():
+        nonlocal interrupted
+        try:
+            job_runtime_remaining()
+        except TimeoutError:
+            if not interrupted:
+                interrupted = True
+                try:
+                    if hasattr(agent, "interrupt"):
+                        agent.interrupt()
+                    elif hasattr(agent, "_interrupt_requested"):
+                        agent._interrupt_requested = True
+                except Exception:
+                    pass
+
     if future is not None:
         while not future.done():
+            check_deadline()
             try:
-                future.result()
+                future.result(timeout=0.05)
             except BaseException:
                 # An actual completed exception is drained too; never mistake
                 # an interrupted waiter for completion of the worker itself.
@@ -183,6 +203,7 @@ def drain_job_agent(agent, future):
     lock = getattr(agent, "_tool_worker_threads_lock", None)
     if lock is not None:
         while True:
+            check_deadline()
             with lock:
                 active = set(agent._tool_worker_threads)
             if not active:
@@ -200,9 +221,14 @@ def job_runtime_remaining():
     if runtime is None:
         return None
     now = time.monotonic()
-    remaining = runtime["deadline_monotonic"] - now
+    deadline = runtime["deadline_monotonic"]
+    phase = _DELEGATION_DEADLINE.get()
+    if phase is not None and phase[:2] == (runtime["job_id"], runtime["run_id"]):
+        deadline = min(deadline, phase[2])
+    remaining = deadline - now
     if now < runtime["dispatch_monotonic"] or remaining <= 0:
-        raise TimeoutError("Job elapsed deadline reached; completion is not established")
+        reason = "Delegation phase" if deadline < runtime["deadline_monotonic"] else "Job elapsed"
+        raise TimeoutError(reason + " deadline reached; completion is not established")
     return remaining
 
 
@@ -2139,6 +2165,9 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            # Executor/initializer queues consume the original dispatch cap;
+            # never start inference after admission has expired.
+            job_runtime_remaining()
             return child.run_conversation(
                 user_message=goal,
                 task_id=child_task_id,
@@ -2150,7 +2179,14 @@ def _run_single_child(
         else:
             _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
+            remaining = job_runtime_remaining()
+            if remaining is not None:
+                child_timeout = min(child_timeout, remaining) if child_timeout is not None else remaining
             result = _child_future.result(timeout=child_timeout)
+            # Conversation completion does not establish tool completion.
+            # Keep ownership while draining, signal expiry, then reject a late
+            # result before emitting any successful completion event.
+            drain_job_agent(child, _child_future)
             job_runtime_remaining()
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
@@ -2615,6 +2651,54 @@ def delegate_task(
     reasoning_required: Optional[bool] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    deadline_elapsed_seconds: Optional[float] = None,
+) -> str:
+    """Delegate with an optional shorter, original-dispatch-relative deadline.
+
+    A call cap never replaces the trusted job capability. Context propagation
+    carries it to the existing child timeout/drain path, then restores it for
+    the parent's next phase. Ordinary unscoped calls retain existing behavior.
+    """
+    token = None
+    try:
+        if deadline_elapsed_seconds is not None:
+            runtime = _JOB_RUNTIME.get()
+            if runtime is None:
+                return tool_error("A delegation phase deadline requires an active trusted job runtime.")
+            value = deadline_elapsed_seconds
+            if (type(value) not in (int, float) or not 0 < value <= runtime["max_elapsed_seconds"]
+                    or not math.isfinite(value)):
+                return tool_error("Delegation phase deadline must be finite, positive and within the original job budget.")
+            deadline = min(runtime["deadline_monotonic"], runtime["dispatch_monotonic"] + value)
+            identity = (runtime["job_id"], runtime["run_id"])
+            inherited = _DELEGATION_DEADLINE.get()
+            if inherited is not None and inherited[:2] == identity:
+                deadline = min(deadline, inherited[2])
+            token = _DELEGATION_DEADLINE.set((*identity, deadline))
+            job_runtime_remaining()
+        result = _delegate_task(goal=goal, context=context, tasks=tasks, max_iterations=max_iterations,
+                                role=role, reasoning_required=reasoning_required, background=background,
+                                parent_agent=parent_agent)
+        # This final boundary includes child cleanup, summary spill, parent
+        # aggregation hooks and serialization while the call cap is still active.
+        job_runtime_remaining()
+        return result
+    except TimeoutError as exc:
+        return tool_error(str(exc))
+    finally:
+        if token is not None:
+            _DELEGATION_DEADLINE.reset(token)
+
+
+def _delegate_task(
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+    tasks: Optional[List[Dict[str, Any]]] = None,
+    max_iterations: Optional[int] = None,
+    role: Optional[str] = None,
+    reasoning_required: Optional[bool] = None,
+    background: Optional[bool] = None,
+    parent_agent=None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2810,6 +2894,26 @@ def delegate_task(
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
             children.append((i, t, child))
+            job_runtime_remaining()
+    except TimeoutError:
+        # No child has started yet. A dispatch-relative phase can expire while
+        # constructing the batch; release only these unstarted instances.
+        for _, _, child in children:
+            if hasattr(parent_agent, "_active_children"):
+                lock = getattr(parent_agent, "_active_children_lock", None)
+                try:
+                    if lock is not None:
+                        with lock:
+                            parent_agent._active_children.remove(child)
+                    else:
+                        parent_agent._active_children.remove(child)
+                except ValueError:
+                    pass
+            try:
+                child.close()
+            except Exception:
+                logger.debug("Failed to close unstarted deadline-limited child", exc_info=True)
+        raise
     finally:
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
@@ -3837,6 +3941,14 @@ DELEGATE_TASK_SCHEMA = {
                     "compatibility."
                 ),
             },
+            "deadline_elapsed_seconds": {
+                "type": "number",
+                "description": (
+                    "Optional shorter batch deadline in elapsed seconds from the active trusted job's "
+                    "original dispatch, not from this call. Requires a job runtime; cannot extend its "
+                    "deadline. Unfinished work remains incomplete and retains existing worker-drain safeguards."
+                ),
+            },
         },
         "required": [],
     },
@@ -3894,6 +4006,7 @@ registry.register(
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
+        deadline_elapsed_seconds=args.get("deadline_elapsed_seconds"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),

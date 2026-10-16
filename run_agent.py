@@ -5725,6 +5725,7 @@ class AIAgent:
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
+            deadline_elapsed_seconds=function_args.get("deadline_elapsed_seconds"),
             role=function_args.get("role"),
             reasoning_required=function_args.get("reasoning_required"),
             background=(not _is_subagent),
