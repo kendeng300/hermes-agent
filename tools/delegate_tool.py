@@ -174,10 +174,28 @@ def drain_job_agent(agent, future):
     """
     if _JOB_RUNTIME.get() is None:
         return
+    interrupted = False
+
+    def check_deadline():
+        nonlocal interrupted
+        try:
+            job_runtime_remaining()
+        except TimeoutError:
+            if not interrupted:
+                interrupted = True
+                try:
+                    if hasattr(agent, "interrupt"):
+                        agent.interrupt()
+                    elif hasattr(agent, "_interrupt_requested"):
+                        agent._interrupt_requested = True
+                except Exception:
+                    pass
+
     if future is not None:
         while not future.done():
+            check_deadline()
             try:
-                future.result()
+                future.result(timeout=0.05)
             except BaseException:
                 # An actual completed exception is drained too; never mistake
                 # an interrupted waiter for completion of the worker itself.
@@ -185,6 +203,7 @@ def drain_job_agent(agent, future):
     lock = getattr(agent, "_tool_worker_threads_lock", None)
     if lock is not None:
         while True:
+            check_deadline()
             with lock:
                 active = set(agent._tool_worker_threads)
             if not active:
@@ -2146,6 +2165,9 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            # Executor/initializer queues consume the original dispatch cap;
+            # never start inference after admission has expired.
+            job_runtime_remaining()
             return child.run_conversation(
                 user_message=goal,
                 task_id=child_task_id,
@@ -2157,7 +2179,14 @@ def _run_single_child(
         else:
             _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
+            remaining = job_runtime_remaining()
+            if remaining is not None:
+                child_timeout = min(child_timeout, remaining) if child_timeout is not None else remaining
             result = _child_future.result(timeout=child_timeout)
+            # Conversation completion does not establish tool completion.
+            # Keep ownership while draining, signal expiry, then reject a late
+            # result before emitting any successful completion event.
+            drain_job_agent(child, _child_future)
             job_runtime_remaining()
         except Exception as _timeout_exc:
             # Signal the child to stop so its thread can exit cleanly.
