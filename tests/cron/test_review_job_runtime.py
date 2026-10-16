@@ -63,6 +63,23 @@ def test_nested_phase_cap_cannot_extend_parent_or_leak_into_another_runtime(runt
     assert entered == [190, 190]
 
 
+def test_phase_expiry_during_final_aggregation_cannot_return_completed(runtime_case, monkeypatch):
+    c = runtime_case
+    partial = c["home"] / "synthetic-retained-initial.json"
+    def aggregate(**kwargs):
+        partial.write_text('{"synthetic":true,"status":"retained"}')
+        c["clock"][0] += 270
+        return json.dumps({"results": [{"status": "completed", "summary": "synthetic result"}]})
+    monkeypatch.setattr(delegate, "_delegate_task", aggregate)
+    runtime = scheduler._prepare_job_runtime(c["job"])
+    with delegate.job_runtime_scope(runtime):
+        result = json.loads(delegate.delegate_task(goal="synthetic", parent_agent=SimpleNamespace(),
+                                                   deadline_elapsed_seconds=270))
+        assert delegate.job_runtime_remaining() == 330
+    assert "error" in result and "deadline" in result["error"].lower()
+    assert "results" not in result and partial.exists()
+
+
 def test_phase_expiring_during_construction_closes_only_unstarted_children(runtime_case, monkeypatch):
     c = runtime_case
     runtime = scheduler._prepare_job_runtime(c["job"])
