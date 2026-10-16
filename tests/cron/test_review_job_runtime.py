@@ -4,6 +4,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import contextvars
 import json
+import inspect
 import os
 import threading
 from types import SimpleNamespace
@@ -13,6 +14,131 @@ import pytest
 
 from cron import jobs, scheduler
 from tools import delegate_tool as delegate
+
+
+@pytest.mark.parametrize("value", [0, -1, 601, True, "270", float("nan"), float("inf")])
+def test_delegation_phase_rejects_invalid_caps_before_constructing_children(runtime_case, monkeypatch, value):
+    runtime = scheduler._prepare_job_runtime(runtime_case["job"])
+    monkeypatch.setattr(delegate, "_build_child_agent", lambda **k: pytest.fail("invalid cap constructed a child"))
+    with delegate.job_runtime_scope(runtime):
+        result = json.loads(delegate.delegate_task(goal="synthetic", parent_agent=SimpleNamespace(),
+                                                  deadline_elapsed_seconds=value))
+    assert "error" in result and "deadline" in result["error"].lower()
+
+
+def test_delegation_phase_needs_existing_runtime_and_cannot_reset_at_launch(runtime_case, monkeypatch):
+    monkeypatch.setattr(delegate, "_build_child_agent", lambda **k: pytest.fail("expired/unscoped cap constructed a child"))
+    result = json.loads(delegate.delegate_task(goal="synthetic", parent_agent=SimpleNamespace(),
+                                              deadline_elapsed_seconds=270))
+    assert "error" in result and "runtime" in result["error"].lower()
+    runtime = scheduler._prepare_job_runtime(runtime_case["job"])
+    original = deepcopy(runtime)
+    runtime_case["clock"][0] += 270
+    with delegate.job_runtime_scope(runtime):
+        result = json.loads(delegate.delegate_task(goal="synthetic", parent_agent=SimpleNamespace(),
+                                                  deadline_elapsed_seconds=270))
+        assert delegate.job_runtime_remaining() == 330
+    assert "error" in result and "deadline" in result["error"].lower()
+    assert runtime == original
+
+
+def test_delegation_phase_keeps_seven_workers_and_restores_original_budget(runtime_case, monkeypatch):
+    c = runtime_case
+    builds, observations = [], []
+    barrier = threading.Barrier(7)
+    monkeypatch.setattr(delegate, "is_spawn_paused", lambda: False)
+    monkeypatch.setattr(delegate, "_resolve_delegation_credentials", lambda cfg, parent: {
+        "model": None, "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "request_overrides": None, "max_output_tokens": None,
+        "command": None, "args": None})
+    monkeypatch.setattr(delegate, "_resolve_effective_delegation_model", lambda **k: (None, None))
+    def build(**kwargs):
+        builds.append(kwargs)
+        return SimpleNamespace(_delegate_role=kwargs["role"], _delegate_depth=1,
+                               _interrupt_requested=False, session_id="synthetic-child")
+    def child(task_index, goal, child, parent_agent):
+        observations.append((delegate.job_runtime_remaining(), delegate._get_max_concurrent_children(),
+                             delegate._JOB_RUNTIME.get()["deadline_monotonic"]))
+        barrier.wait(timeout=3)
+        return {"task_index": task_index, "status": "completed", "summary": goal,
+                "api_calls": 1, "duration_seconds": 0, "_child_role": child._delegate_role}
+    monkeypatch.setattr(delegate, "_build_child_agent", build)
+    monkeypatch.setattr(delegate, "_run_single_child", child)
+    results = []
+    def dispatch(agent, prompt):
+        c["clock"][0] += 80  # Preparation is already charged to original dispatch.
+        tasks = [{"goal": f"Independent synthetic seat {i}"} for i in range(7)]
+        results.append(json.loads(delegate.delegate_task(tasks=tasks, parent_agent=agent,
+                                                        deadline_elapsed_seconds=270)))
+        assert delegate.job_runtime_remaining() == 520
+        c["clock"][0] += 270
+        results.append(json.loads(delegate.delegate_task(tasks=tasks, parent_agent=agent,
+                                                        deadline_elapsed_seconds=495)))
+        assert delegate.job_runtime_remaining() == 250
+        return {"final_response": "synthetic complete"}
+    c["callback"] = dispatch
+    assert scheduler.run_job(c["job"])[0]
+    assert len(builds) == 14 and all(row["role"] == "leaf" and row["max_iterations"] == 20 for row in builds)
+    assert observations == [(190, 7, 1600)] * 7 + [(145, 7, 1600)] * 7
+    assert all(len(result["results"]) == 7 for result in results)
+
+
+def test_delegation_phase_timeout_retains_workers_and_partial_artifacts_until_drained(runtime_case, monkeypatch):
+    c = runtime_case
+    entered, interrupted, release, returned = (threading.Event() for _ in range(4))
+    closed, results = [], []
+    partial = c["home"] / "synthetic-initial.json"
+    def actual(**kwargs):
+        partial.write_text('{"status":"incomplete","synthetic":true}')
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"final_response": "late child", "completed": False, "api_calls": 1}
+    child = SimpleNamespace(_subagent_id=None, _delegate_depth=1, _delegate_role="leaf",
+        run_conversation=actual, interrupt=lambda: interrupted.set(), close=lambda: closed.append(True),
+        get_activity_summary=lambda: {"api_call_count": 1})
+    parent = SimpleNamespace(_active_children=[child], _active_children_lock=threading.Lock())
+    runtime = scheduler._prepare_job_runtime(c["job"])
+    monkeypatch.setattr(delegate, "_get_child_timeout", lambda: None)
+    # Exercise public admission and real child timeout/drain, without a provider.
+    monkeypatch.setattr(delegate, "_delegate_task", lambda **kwargs:
+                        json.dumps(delegate._run_single_child(0, "synthetic", child, parent)))
+    def invoke():
+        try:
+            with delegate.job_runtime_scope(runtime):
+                results.append(json.loads(delegate.delegate_task(goal="synthetic", parent_agent=parent,
+                                                                  deadline_elapsed_seconds=0.01)))
+                assert delegate.job_runtime_remaining() == 600
+        finally:
+            returned.set()
+    thread = threading.Thread(target=invoke, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(timeout=3) and interrupted.wait(timeout=3)
+        assert not returned.wait(timeout=0.05)
+        assert closed == [] and child in parent._active_children
+        assert json.loads(partial.read_text())["status"] == "incomplete"
+        assert runtime["deadline_monotonic"] - runtime["dispatch_monotonic"] == 600
+    finally:
+        release.set()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+    assert results[0]["status"] == "timeout" and results[0]["summary"] is None
+    assert closed == [True] and partial.exists()
+
+
+def test_delegation_phase_argument_reaches_both_existing_dispatch_paths(monkeypatch):
+    from run_agent import AIAgent
+    from tools.registry import registry
+    assert "deadline_elapsed_seconds" in inspect.signature(delegate.delegate_task).parameters
+    received = []
+    monkeypatch.setattr(delegate, "delegate_task", lambda **kwargs: received.append(kwargs) or "{}")
+    parent = SimpleNamespace(_delegate_depth=0)
+    args = {"tasks": [{"goal": "synthetic"}], "deadline_elapsed_seconds": 270}
+    AIAgent._dispatch_delegate_task(parent, args)
+    registry.get_entry("delegate_task").handler(args, parent_agent=parent)
+    assert len(received) == 2 and all(row["deadline_elapsed_seconds"] == 270 for row in received)
+    schema = registry.get_schema("delegate_task")
+    assert schema["parameters"]["properties"]["deadline_elapsed_seconds"]["type"] == "number"
 
 
 @pytest.fixture
