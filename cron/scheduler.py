@@ -51,6 +51,102 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _echo_script_failure_summary(job: dict, text: str) -> str | None:
+    """Render a bounded machine receipt from the configured no-agent wrappers.
+
+    This is not a general transcript-marker parser. Only the exact wrapper
+    scripts may supply one standalone stderr record; source prose and stdout
+    never authorize delivery facts. Invalid records retain the generic error.
+    """
+    if job.get("no_agent") is not True or not isinstance(job.get("script"), str):
+        return None
+    try:
+        scripts = (_get_hermes_home() / "scripts").resolve()
+        raw = Path(job["script"]).expanduser()
+        path = (raw if raw.is_absolute() else scripts / raw).resolve()
+        if path.relative_to(scripts).as_posix() not in {
+            "echo/run_echo_poll.py", "echo/run_scheduled_echo_poll.py",
+            "echo/run_scheduled_echo_poll_extra.py",
+        }:
+            return None
+        header, separator, rest = text.partition("\nstderr:\n")
+        match = re.fullmatch(r"Script exited with code (-?\d+)", header)
+        if not separator or match is None or int(match[1]) == 0:
+            return None
+        stderr = rest.partition("\nstdout:\n")[0]
+        # A protocol-size bound, not a job/provider allowance. Reject extra
+        # lines, duplicate records and oversized input before JSON decoding.
+        prefix = "ECHO_FAILURE_V1="
+        if (len(stderr) > 32768 or not stderr.startswith(prefix)
+                or "\n" in stderr or "\r" in stderr):
+            return None
+
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate receipt key")
+                result[key] = value
+            return result
+
+        def count(value):
+            return type(value) is int and 0 <= value < 10 ** 20
+
+        received = ("received_rows", "unique_received", "completed_new", "completed_reused", "unprocessed")
+        fields = received + ("pending", "failed", "backlog")
+        reasons = {"invalid_input", "model_pending", "extraction_failed", "business_review_pending",
+                   "queue_not_persisted", "queue_capped", "raw_not_persisted", "catalyst_pending",
+                   "missing_result", "invalid_completed_proof"}
+        sources = {"fmp_news", "fmp_articles", "cnbc", "yahoo", "gdelt", "sina", "cnbc_rss",
+                   "yahoo_rss", "gdelt_geopolitical", "sina_finance", "retained_evidence"}
+
+        def partition_valid(value):
+            return (isinstance(value, dict) and all(count(value.get(key)) for key in received)
+                    and value["unique_received"] == value["completed_new"] + value["completed_reused"] + value["unprocessed"]
+                    and value["unique_received"] <= value["received_rows"]
+                    and (value["unique_received"] > 0 or value["received_rows"] == 0))
+
+        receipt = json.loads(stderr[len(prefix):], object_pairs_hook=unique_object)
+        if (not isinstance(receipt, dict) or set(receipt) != {
+                "schema", "status", "stage", "result_status", "exit_code", "counts", "reasons", "sources",
+                "oldest_unprocessed_age_seconds", "unresolved_article_ids"}
+                or receipt["schema"] != "echo_poll_failure_v1" or receipt["status"] != "ERROR"
+                or receipt["stage"] not in {"child_exit", "poll_result", "timeout"}
+                or receipt["result_status"] not in {"VERIFIED", "UNKNOWN"}
+                or type(receipt["exit_code"]) is not int or not -10 ** 20 < receipt["exit_code"] < 10 ** 20
+                or receipt["exit_code"] != int(match[1])
+                or not isinstance(receipt["counts"], dict) or set(receipt["counts"]) != set(fields)):
+            return None
+        values, why, origins = receipt["counts"], receipt["reasons"], receipt["sources"]
+        age, ids = receipt["oldest_unprocessed_age_seconds"], receipt["unresolved_article_ids"]
+        if receipt["stage"] == "timeout" and (receipt["exit_code"] != 124 or receipt["result_status"] != "UNKNOWN"):
+            return None
+        if receipt["result_status"] == "UNKNOWN":
+            if any(value is not None for value in values.values()) or why != {} or origins != {} or age is not None or ids != []:
+                return None
+            detail = "completion=UNKNOWN"
+        else:
+            if (not all(count(value) for value in values.values()) or not partition_valid(values)
+                    or not isinstance(why, dict) or set(why) - reasons
+                    or not all(count(value) for value in why.values()) or sum(why.values()) != values["unprocessed"]
+                    or not isinstance(origins, dict) or set(origins) - sources
+                    or any(not partition_valid(value) or set(value) != set(received) for value in origins.values())
+                    or any(sum(value[key] for value in origins.values()) != values[key] for key in received)
+                    or age is not None and (type(age) not in (int, float) or not 0 <= age < 10 ** 20 or not math.isfinite(age))
+                    or not isinstance(ids, list) or len(ids) > 8
+                    or any(not isinstance(value, str) or re.fullmatch(r"[a-f0-9]{64}", value) is None for value in ids)
+                    or len(ids) != len(set(ids))
+                    or not values["unprocessed"] and (age is not None or ids)):
+                return None
+            labels = {"received_rows": "received", "unique_received": "unique"}
+            detail = "accounting=VERIFIED; " + ", ".join(f"{labels.get(key, key)}={values[key]}" for key in fields)
+            if why:
+                detail += "; reasons=" + ",".join(f"{key}={why[key]}" for key in sorted(why))
+        return f"Echo processing error; stage={receipt['stage']}; exit={receipt['exit_code']}; {detail}"
+    except (OSError, RuntimeError, TypeError, ValueError, KeyError, RecursionError):
+        return None
+
+
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     """Return a compact one-line failure message for chat delivery.
 
@@ -71,6 +167,9 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
         text,
     )
     if script_failure:
+        echo_summary = _echo_script_failure_summary(job, text)
+        if echo_summary is not None:
+            return f"⚠️ Cron '{job_name}' failed: {echo_summary}. Full details saved in cron output."
         return (
             f"⚠️ Cron '{job_name}' failed: {script_failure.group(1)}. "
             "Full details saved in cron output."
