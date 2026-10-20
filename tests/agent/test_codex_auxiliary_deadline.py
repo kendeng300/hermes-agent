@@ -80,7 +80,8 @@ def scenario(monkeypatch):
                              responses=SimpleNamespace(create=create), close=close_client)
     state.adapter = auxiliary._CodexCompletionsAdapter(client, "configured-model")
     monkeypatch.setattr(auxiliary, "time", SimpleNamespace(monotonic=lambda: state.now))
-    monkeypatch.setattr(auxiliary, "threading", SimpleNamespace(Event=threading.Event, Timer=Timer))
+    monkeypatch.setattr(auxiliary, "threading", SimpleNamespace(
+        Event=threading.Event, Lock=threading.Lock, Timer=Timer))
     monkeypatch.setattr(auxiliary, "_evict_cached_client_instance", state.evicted.append)
     monkeypatch.setattr(conversion, "_chat_messages_to_responses_input", convert)
     monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
@@ -197,3 +198,20 @@ def test_eof_with_usable_content_keeps_existing_completion_policy(scenario):
     result = invoke(scenario)
     assert result.choices[0].message.content == "synthetic result"
     assert assert_safe_timing(result)["terminal_event"] == "none"
+
+
+def test_timer_callback_already_scheduled_before_cancel_cannot_close_successful_client(scenario):
+    invoke(scenario)
+    timer = scenario.timers[0]
+    assert timer.cancelled
+    scenario.now = 111.0
+    timer.callback()  # Callback delivery after cancel; no real thread or sleep.
+    assert scenario.client_closes == 0 and not scenario.evicted
+
+
+def test_timeout_callback_owns_close_and_eviction_once(scenario):
+    scenario.stream = 11.0
+    with pytest.raises(TimeoutError):
+        invoke(scenario)
+    scenario.timers[0].callback()  # Second contender after the timeout owner.
+    assert scenario.client_closes == len(scenario.evicted) == 1
