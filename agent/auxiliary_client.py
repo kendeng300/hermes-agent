@@ -1123,22 +1123,21 @@ class _CodexCompletionsAdapter:
                 if timing.finished or timed_out.is_set():
                     return
                 timed_out.set()
+            # The cached auxiliary client wraps this same ``self._client``
+            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
+            # this instance). Evict its identity before close can block, so
+            # another caller cannot select a transport already being retired.
+            # Neither potentially blocking operation holds the ownership lock.
+            try:
+                _evict_cached_client_instance(self._client)
+            except Exception:
+                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
             close = getattr(self._client, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
-            # The cached auxiliary client wraps this same ``self._client``
-            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
-            # this instance).  After we close the httpx transport above, the
-            # cache must drop that entry — otherwise the next auxiliary call
-            # (compression retry, memory flush, etc.) reuses the dead client
-            # and fails fast with a connection error.  See issue #23432.
-            try:
-                _evict_cached_client_instance(self._client)
-            except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
             timing.check()
@@ -1201,8 +1200,11 @@ class _CodexCompletionsAdapter:
                 timing.check()
             timing.enter("request")
             event_stream = self._client.responses.create(**stream_kwargs)
-            timing.enter("stream")
             try:
+                # A late SDK return must not start another blocking iterator
+                # read. The returned stream still belongs to this cleanup.
+                timing.check()
+                timing.enter("stream")
                 final = _consume_codex_event_stream(
                     event_stream,
                     model=resp_kwargs.get("model"),
@@ -1264,7 +1266,8 @@ class _CodexCompletionsAdapter:
         except Exception as exc:
             timing.original_error = exc
             timing.failure_phase = timing.failure_phase or timing.phase
-            if timed_out.is_set():
+            if timing.expired():
+                _close_client_on_timeout()
                 raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
