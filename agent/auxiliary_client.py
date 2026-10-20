@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import contextlib
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -846,6 +847,82 @@ def _nous_min_key_ttl_seconds() -> int:
 # calls to the Codex Responses API so callers don't need any changes.
 
 
+class _CodexCallTiming:
+    """One adapter call's original allowance and content-free diagnostics."""
+
+    def __init__(self, timeout: Any):
+        self.started = self.phase_started = time.monotonic()
+        self.timeout = None
+        try:
+            if isinstance(timeout, (int, float)) and timeout > 0 and math.isfinite(timeout):
+                self.timeout = float(timeout)
+        except (OverflowError, ValueError):
+            pass  # Non-scalar timeout interpretation remains the SDK's contract.
+        self.deadline = self.started + self.timeout if self.timeout is not None else None
+        self.phase = "preparation"
+        self.durations = dict.fromkeys(("preparation", "request", "stream", "cleanup", "decode"), 0.0)
+        self.first_event = None
+        self.terminal_event = "none"
+        self.failure_phase = None
+        self.original_error = None
+        self.timed_out = threading.Event()
+        self.lock = threading.Lock()
+        self.finished = False
+        self.expire = None
+
+    def enter(self, phase: str) -> None:
+        now = time.monotonic()
+        if self.phase in self.durations:
+            self.durations[self.phase] += max(0.0, now - self.phase_started)
+        self.phase, self.phase_started = phase, now
+
+    def message(self) -> str:
+        return f"Codex auxiliary Responses stream exceeded {self.timeout:.1f}s total timeout"
+
+    def expired(self) -> bool:
+        return self.timed_out.is_set() or self.deadline is not None and time.monotonic() >= self.deadline
+
+    def check(self) -> None:
+        if self.expired():
+            if self.expire is not None:
+                self.expire()
+            raise TimeoutError(self.message())
+
+    def finish(self) -> None:
+        # Claim completion atomically against the existing timer. Never close a
+        # transport or wait for a running callback while holding this lock.
+        with self.lock:
+            expired = self.expired()
+            if not expired:
+                self.finished = True
+        if expired:
+            self.check()
+
+    def snapshot(self, error: Exception | None = None) -> dict:
+        now = time.monotonic()
+
+        def milliseconds(seconds):
+            return round(min(2_147_483.647, max(0.0, seconds)) * 1000) if math.isfinite(seconds) else 0
+
+        durations = dict(self.durations)
+        if self.phase in durations:
+            durations[self.phase] += max(0.0, now - self.phase_started)
+        cause = self.original_error if self.original_error is not None else error
+        kind = type(cause).__name__ if cause is not None else "none"
+        allowed = {"none", "TimeoutError", "APITimeoutError", "APIConnectionError", "ReadTimeout",
+                   "ReadError", "RuntimeError", "InterruptedError"}
+        result = {"schema_version": 1, "phase": self.failure_phase or self.phase,
+                  "outcome": ("returned" if error is None else "deadline_exhausted" if self.expired()
+                              else "interrupted" if isinstance(error, InterruptedError) else "failed"),
+                  "elapsed_ms": milliseconds(now - self.started),
+                  **{phase + "_ms": milliseconds(value) for phase, value in durations.items()},
+                  "terminal_event": self.terminal_event, "timeout_fired": self.timed_out.is_set(),
+                  "cause_type": kind if kind in allowed else "OtherError"}
+        if self.first_event is not None:
+            result["first_event_ms"] = milliseconds(self.first_event - self.started)
+        return result
+
+
 class _CodexCompletionsAdapter:
     """Drop-in shim that accepts chat.completions.create() kwargs and
     routes them through the Codex Responses streaming API."""
@@ -855,6 +932,21 @@ class _CodexCompletionsAdapter:
         self._model = model
 
     def create(self, **kwargs) -> Any:
+        timing = _CodexCallTiming(kwargs.get("timeout"))
+        try:
+            response = self._create_with_timing(timing, **kwargs)
+            timing.finish()
+            timing.enter("complete")
+            response.codex_call_timing = timing.snapshot()
+            return response
+        except Exception as exc:
+            exc.codex_call_timing = timing.snapshot(exc)
+            raise
+        finally:
+            with timing.lock:
+                timing.finished = True
+
+    def _create_with_timing(self, timing: _CodexCallTiming, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
 
@@ -1018,38 +1110,37 @@ class _CodexCompletionsAdapter:
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []
         usage = None
-        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
-        timed_out = threading.Event()
+        timing.check()  # Conversion and request preparation spend the original allowance.
+        total_timeout = timing.timeout
+        timed_out = timing.timed_out
         timeout_timer: Optional[threading.Timer] = None
 
         def _timeout_message() -> str:
-            return f"Codex auxiliary Responses stream exceeded {float(total_timeout):.1f}s total timeout"
+            return timing.message()
 
         def _close_client_on_timeout() -> None:
-            timed_out.set()
+            with timing.lock:
+                if timing.finished or timed_out.is_set():
+                    return
+                timed_out.set()
+            # The cached auxiliary client wraps this same ``self._client``
+            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
+            # this instance). Evict its identity before close can block, so
+            # another caller cannot select a transport already being retired.
+            # Neither potentially blocking operation holds the ownership lock.
+            try:
+                _evict_cached_client_instance(self._client)
+            except Exception:
+                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
             close = getattr(self._client, "close", None)
             if callable(close):
                 try:
                     close()
                 except Exception:
                     logger.debug("Codex auxiliary: client close during timeout failed", exc_info=True)
-            # The cached auxiliary client wraps this same ``self._client``
-            # (or *is* a ``CodexAuxiliaryClient`` whose ``_real_client`` is
-            # this instance).  After we close the httpx transport above, the
-            # cache must drop that entry — otherwise the next auxiliary call
-            # (compression retry, memory flush, etc.) reuses the dead client
-            # and fails fast with a connection error.  See issue #23432.
-            try:
-                _evict_cached_client_instance(self._client)
-            except Exception:
-                logger.debug("Codex auxiliary: cache eviction on timeout failed", exc_info=True)
 
         def _check_cancelled() -> None:
-            if deadline is not None and time.monotonic() >= deadline:
-                if not timed_out.is_set():
-                    _close_client_on_timeout()
-                raise TimeoutError(_timeout_message())
+            timing.check()
             try:
                 from tools.interrupt import is_interrupted
                 # Honor interrupt protection for atomic aux tasks (compression):
@@ -1066,8 +1157,11 @@ class _CodexCompletionsAdapter:
                 pass
 
         try:
+            timing.expire = _close_client_on_timeout
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                remaining = timing.deadline - time.monotonic()
+                timing.check()
+                timeout_timer = threading.Timer(remaining, _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
@@ -1088,18 +1182,39 @@ class _CodexCompletionsAdapter:
             stream_kwargs["stream"] = True
 
             def _on_each_event(_event: Any) -> None:
+                if timing.first_event is None:
+                    timing.first_event = time.monotonic()
+                event_type = getattr(_event, "type", None)
+                if event_type is None and isinstance(_event, dict):
+                    event_type = _event.get("type")
+                for terminal in ("completed", "incomplete", "failed"):
+                    if event_type == "response." + terminal:
+                        timing.terminal_event = terminal
                 # Re-check timeout/cancellation per event, matching the
                 # cadence the old in-line ``_check_cancelled()`` used.
                 _check_cancelled()
 
+            timing.check()
+            if total_timeout:
+                stream_kwargs["timeout"] = timing.deadline - time.monotonic()
+                timing.check()
+            timing.enter("request")
             event_stream = self._client.responses.create(**stream_kwargs)
             try:
+                # A late SDK return must not start another blocking iterator
+                # read. The returned stream still belongs to this cleanup.
+                timing.check()
+                timing.enter("stream")
                 final = _consume_codex_event_stream(
                     event_stream,
                     model=resp_kwargs.get("model"),
                     on_event=_on_each_event,
                 )
+            except Exception:
+                timing.failure_phase = timing.phase
+                raise
             finally:
+                timing.enter("cleanup")
                 close_fn = getattr(event_stream, "close", None)
                 if callable(close_fn):
                     try:
@@ -1107,6 +1222,8 @@ class _CodexCompletionsAdapter:
                     except Exception:
                         pass
 
+            _check_cancelled()
+            timing.enter("decode")
             if final is None:
                 raise RuntimeError("Codex auxiliary Responses stream did not return a final response")
 
@@ -1147,7 +1264,10 @@ class _CodexCompletionsAdapter:
                         or (resp_usage.get("total_tokens", 0) if isinstance(resp_usage, dict) else 0),
                 )
         except Exception as exc:
-            if timed_out.is_set():
+            timing.original_error = exc
+            timing.failure_phase = timing.failure_phase or timing.phase
+            if timing.expired():
+                _close_client_on_timeout()
                 raise TimeoutError(_timeout_message()) from exc
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise

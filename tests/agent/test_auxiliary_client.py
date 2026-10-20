@@ -4245,7 +4245,10 @@ class TestVisionAutoSkipsKimiCoding:
 
 
 class TestCodexAuxiliaryAdapterTimeout:
-    def test_forwards_timeout_to_responses_create(self):
+    def test_forwards_timeout_to_responses_create(self, monkeypatch):
+        # No preparation cost: the original allowance is also its remainder.
+        # Bind only this module, not process-global time used by timer threads.
+        monkeypatch.setattr("agent.auxiliary_client.time", SimpleNamespace(monotonic=lambda: 100.0))
         message_item = SimpleNamespace(
             type="message",
             content=[SimpleNamespace(type="output_text", text="summary")],
