@@ -15,12 +15,14 @@ def scenario(monkeypatch):
     state = SimpleNamespace(now=100.0, preparation=0.0, request=0.0, stream=0.0,
                             cleanup=0.0, decode=0.0, error=None, terminal="completed",
                             calls=[], timers=[], evicted=[], client_closes=0,
-                            stream_closes=0, after_terminal=False)
+                            stream_closes=0, stream_started=0, after_terminal=False,
+                            fire_timers=True, close_entered=None, close_release=None)
 
     def advance(seconds):
         state.now += seconds
         for timer in state.timers:
-            if timer.started and not timer.cancelled and not timer.fired and state.now >= timer.at:
+            if (state.fire_timers and timer.started and not timer.cancelled
+                    and not timer.fired and state.now >= timer.at):
                 timer.fired = True
                 timer.callback()
 
@@ -53,6 +55,7 @@ def scenario(monkeypatch):
 
     class Stream:
         def __iter__(self):
+            state.stream_started += 1
             advance(state.stream)
             yield SimpleNamespace(type="response.output_item.done", item=SimpleNamespace(
                 type="message", content=[Part()]))
@@ -75,9 +78,13 @@ def scenario(monkeypatch):
 
     def close_client():
         state.client_closes += 1
+        if state.close_entered is not None:
+            state.close_entered.set()
+            assert state.close_release.wait(2.0), "synthetic close must be released"
 
     client = SimpleNamespace(base_url="https://fixture.invalid/codex",
                              responses=SimpleNamespace(create=create), close=close_client)
+    state.client = client
     state.adapter = auxiliary._CodexCompletionsAdapter(client, "configured-model")
     monkeypatch.setattr(auxiliary, "time", SimpleNamespace(monotonic=lambda: state.now))
     monkeypatch.setattr(auxiliary, "threading", SimpleNamespace(
@@ -215,3 +222,51 @@ def test_timeout_callback_owns_close_and_eviction_once(scenario):
         invoke(scenario)
     scenario.timers[0].callback()  # Second contender after the timeout owner.
     assert scenario.client_closes == len(scenario.evicted) == 1
+
+
+@pytest.mark.parametrize("duration", [10.0, 11.0])
+def test_late_create_return_is_closed_without_starting_stream_iteration(scenario, duration):
+    scenario.request, scenario.cleanup = duration, 2.0
+    with pytest.raises(TimeoutError) as caught:
+        invoke(scenario)
+    assert scenario.stream_started == 0 and scenario.stream_closes == 1
+    timing = assert_safe_timing(caught.value)
+    assert timing["phase"] == "request" and timing["stream_ms"] == 0
+    assert timing["request_ms"] == int(duration * 1000) and timing["cleanup_ms"] == 2000
+    assert "first_event_ms" not in timing and timing["terminal_event"] == "none"
+
+
+def test_original_deadline_classifies_error_even_when_timer_callback_is_delayed(scenario):
+    scenario.fire_timers = False
+    scenario.request, scenario.error = 11.0, RuntimeError("private lower-level response")
+    with pytest.raises(TimeoutError) as caught:
+        invoke(scenario)
+    assert caught.value.__cause__ is scenario.error
+    timing = assert_safe_timing(caught.value)
+    assert timing["phase"] == "request" and timing["outcome"] == "deadline_exhausted"
+    assert timing["cause_type"] == "RuntimeError"
+    assert scenario.client_closes == len(scenario.evicted) == 1
+
+
+def test_timeout_identity_is_evicted_before_a_blocking_close(scenario):
+    scenario.stream = 11.0
+    scenario.close_entered, scenario.close_release = threading.Event(), threading.Event()
+    errors = []
+
+    def run():
+        try:
+            invoke(scenario)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert scenario.close_entered.wait(2.0), "timeout must enter the synthetic close"
+        evicted_before_release = list(scenario.evicted)
+    finally:
+        scenario.close_release.set()
+        worker.join(2.0)
+    assert not worker.is_alive()
+    assert evicted_before_release == [scenario.client]
+    assert scenario.client_closes == 1 and len(errors) == 1 and isinstance(errors[0], TimeoutError)
