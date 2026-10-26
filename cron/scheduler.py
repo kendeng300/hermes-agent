@@ -154,7 +154,8 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
                 "source_significance_uncertain", "delivery_not_verified",
                 "delivery_evidence_or_deadline_unavailable", "informational_review_failed"}
             if (not isinstance(alerts, dict) or set(alerts) != set(alert_fields) | {"status", "reasons"}
-                    or alerts["status"] not in {"VERIFIED", "UNKNOWN"}):
+                    or alerts["status"] not in {"VERIFIED", "UNKNOWN"}
+                    or receipt["stage"] == "timeout" and alerts["status"] != "UNKNOWN"):
                 return None
             if alerts["status"] == "UNKNOWN":
                 if any(alerts[key] is not None for key in alert_fields) or alerts["reasons"] != {}:
