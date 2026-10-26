@@ -148,6 +148,16 @@ def test_actual_failed_delivery_preserves_general_and_unresolved_business(echo_j
     assert '"general_processing"' in save.call_args.args[1]
 
 
+def test_canonical_unknown_general_preserves_verified_governed_and_delivery_counts(echo_job):
+    value = envelope()
+    value["general_processing"] = general_accounting(unknown=True)
+    value["market_event_alerts"] = alert_accounting()
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "governed-processing accounting=VERIFIED" in text and "unprocessed=401" in text
+    assert "source-assessment accounting=UNKNOWN" in text
+    assert "market-event accounting=VERIFIED" in text and "delivery_not_verified=1" in text
+
+
 @pytest.fixture
 def echo_job(tmp_path, monkeypatch):
     home = tmp_path / "profile"
