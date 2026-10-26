@@ -256,7 +256,8 @@ def test_timeout_cannot_certify_alert_completion(echo_job, alert_unknown):
     value = envelope(unknown=True)
     value.update(stage="timeout", exit_code=124)
     value["market_event_alerts"] = alert_accounting(unknown=alert_unknown)
-    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    text = scheduler._summarize_cron_failure_for_delivery(
+        echo_job, failure(value).replace("code 1\n", "code 124\n"))
     assert "market-event accounting=VERIFIED" not in text
     if alert_unknown:
         assert "stage=timeout" in text and "market-event completion=UNKNOWN" in text
