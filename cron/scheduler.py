@@ -109,8 +109,8 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
         receipt = json.loads(stderr[len(prefix):], object_pairs_hook=unique_object)
         receipt_fields = {"schema", "status", "stage", "result_status", "exit_code", "counts", "reasons", "sources",
                           "oldest_unprocessed_age_seconds", "unresolved_article_ids"}
-        if (not isinstance(receipt, dict) or set(receipt) not in (
-                receipt_fields, receipt_fields | {"market_event_alerts"})
+        if (not isinstance(receipt, dict) or not receipt_fields.issubset(receipt)
+                or set(receipt) - receipt_fields - {"market_event_alerts", "general_processing"}
                 or receipt["schema"] != "echo_poll_failure_v1" or receipt["status"] != "ERROR"
                 or receipt["stage"] not in {"child_exit", "poll_result", "timeout"}
                 or receipt["result_status"] not in {"VERIFIED", "UNKNOWN"}
@@ -125,7 +125,7 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
         if receipt["result_status"] == "UNKNOWN":
             if any(value is not None for value in values.values()) or why != {} or origins != {} or age is not None or ids != []:
                 return None
-            detail = "completion=UNKNOWN"
+            detail = "governed-processing completion=UNKNOWN"
         else:
             if (not all(count(value) for value in values.values()) or not partition_valid(values)
                     or not isinstance(why, dict) or set(why) - reasons
@@ -140,9 +140,58 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
                     or not values["unprocessed"] and (age is not None or ids)):
                 return None
             labels = {"received_rows": "received", "unique_received": "unique"}
-            detail = "accounting=VERIFIED; " + ", ".join(f"{labels.get(key, key)}={values[key]}" for key in fields)
+            detail = "governed-processing accounting=VERIFIED; " + ", ".join(f"{labels.get(key, key)}={values[key]}" for key in fields)
             if why:
                 detail += "; reasons=" + ",".join(f"{key}={why[key]}" for key in sorted(why))
+        if "general_processing" in receipt:
+            # Source analysis is independent of current governed completion.
+            # These are already computed counts, never new-arrival or SLA proof.
+            general = receipt["general_processing"]
+            general_fields = ("received_rows", "unique_received", "general_assessed_new",
+                              "general_assessed_reused", "general_pending", "context_pending")
+            general_reasons = {"invalid_input", "raw_not_persisted", "general_result_pending",
+                               "queue_not_persisted", "queue_capped"}
+
+            def general_partition(row):
+                return (isinstance(row, dict) and all(count(row.get(key)) for key in general_fields)
+                    and row["unique_received"] == row["general_assessed_new"]
+                        + row["general_assessed_reused"] + row["general_pending"]
+                    and row["context_pending"] <= row["general_assessed_new"] + row["general_assessed_reused"]
+                    and row["unique_received"] <= row["received_rows"]
+                    and (row["unique_received"] > 0 or row["received_rows"] == 0))
+
+            if (not isinstance(general, dict)
+                    or set(general) != set(general_fields) | {"schema", "status", "sources", "reasons"}
+                    or general["schema"] != "echo_general_processing_v1"
+                    or general["status"] not in {"complete", "incomplete", "unknown"}
+                    or receipt["stage"] == "timeout" and general["status"] != "unknown"):
+                return None
+            if general["status"] == "unknown":
+                if (any(general[key] is not None for key in general_fields)
+                        or general["sources"] != {} or general["reasons"] != {}):
+                    return None
+                detail += "; source-assessment accounting=UNKNOWN"
+            else:
+                rows, why = general["sources"], general["reasons"]
+                if (not general_partition(general)
+                        or general["status"] != ("incomplete" if general["general_pending"] else "complete")
+                        or not isinstance(rows, dict) or set(rows) - sources
+                        or any(not general_partition(row) or set(row) != set(general_fields) for row in rows.values())
+                        or any(sum(row[key] for row in rows.values()) != general[key] for key in general_fields)
+                        or not isinstance(why, dict) or set(why) - general_reasons
+                        or not all(count(value) for value in why.values())
+                        or sum(why.values()) != general["general_pending"]):
+                    return None
+                if receipt["result_status"] == "VERIFIED" and (set(rows) != set(origins)
+                        or any(general[key] != values[key] for key in ("received_rows", "unique_received"))
+                        or any(row[key] != origins[name][key] for name, row in rows.items()
+                               for key in ("received_rows", "unique_received"))):
+                    return None
+                detail += "; source-assessment accounting=VERIFIED; " + ", ".join(
+                    f"{key}={general[key]}" for key in general_fields)
+                if why:
+                    detail += "; source-assessment reasons=" + ",".join(
+                        f"{key}={why[key]}" for key in sorted(why))
         if "market_event_alerts" in receipt:
             # Optional independent accounting: successful source processing does
             # not establish that informational delivery/readback also succeeded.

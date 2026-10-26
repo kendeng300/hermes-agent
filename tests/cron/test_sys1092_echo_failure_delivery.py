@@ -14,6 +14,8 @@ from cron import scheduler
 COUNTS = ("received_rows", "unique_received", "completed_new", "completed_reused",
           "unprocessed", "pending", "failed", "backlog")
 RECEIVED = COUNTS[:5]
+GENERAL_COUNTS = ("received_rows", "unique_received", "general_assessed_new",
+                  "general_assessed_reused", "general_pending", "context_pending")
 
 
 def envelope(*, unknown=False):
@@ -32,6 +34,128 @@ def envelope(*, unknown=False):
 def failure(value, *, encoded=None):
     raw = encoded if encoded is not None else json.dumps(value, separators=(",", ":"))
     return "Script exited with code 1\nstderr:\nECHO_FAILURE_V1=" + raw
+
+
+def general_accounting(*, unknown=False):
+    counts = dict(zip(GENERAL_COUNTS, (405, 404, 3, 2, 399, 5)))
+    return {"schema": "echo_general_processing_v1", "status": "unknown" if unknown else "incomplete",
+            **(dict.fromkeys(GENERAL_COUNTS) if unknown else counts),
+            "sources": {} if unknown else {"cnbc_rss": copy.deepcopy(counts)},
+            "reasons": {} if unknown else {"general_result_pending": 399}}
+
+
+@pytest.mark.parametrize("strict_unknown,general_unknown", [(False, False), (True, False), (False, True)])
+def test_general_assessments_and_governed_completion_have_separate_labels(echo_job, strict_unknown, general_unknown):
+    value = envelope(unknown=strict_unknown)
+    value["general_processing"] = general_accounting(unknown=general_unknown)
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert ("governed-processing completion=UNKNOWN" if strict_unknown
+            else "governed-processing accounting=VERIFIED") in text
+    if general_unknown:
+        assert "source-assessment accounting=UNKNOWN" in text
+        assert "general_assessed_new=0" not in text
+    else:
+        assert "source-assessment accounting=VERIFIED" in text
+        for fragment in ("general_assessed_new=3", "general_assessed_reused=2", "general_pending=399", "context_pending=5"):
+            assert fragment in text
+    assert "new news" not in text.lower() and "catch up" not in text.lower()
+
+
+@pytest.mark.parametrize("general_present,market_present", [(False, False), (True, False), (False, True), (True, True)])
+def test_general_extension_preserves_all_legacy_optional_combinations(echo_job, general_present, market_present):
+    value = envelope()
+    if general_present:
+        value["general_processing"] = general_accounting()
+    if market_present:
+        value["market_event_alerts"] = alert_accounting()
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "unprocessed=401" in text
+    assert ("source-assessment accounting=" in text) is general_present
+    assert ("market-event accounting=" in text) is market_present
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda v: v.pop("schema"),
+    lambda v: v.update(schema="other"),
+    lambda v: v.update(extra="PRIVATE SOURCE PROSE"),
+    lambda v: v.update(status="complete"),
+    lambda v: v.update(status="unknown"),
+    lambda v: v.update(received_rows=True),
+    lambda v: v.update(unique_received=-1),
+    lambda v: v.update(general_assessed_new=10 ** 20),
+    lambda v: v.update(general_assessed_reused=2.0),
+    lambda v: v.update(general_pending="399"),
+    lambda v: v.update(context_pending=6),
+    lambda v: v.update(general_assessed_new=4),
+    lambda v: v["sources"]["cnbc_rss"].update(context_pending=6),
+    lambda v: v["sources"]["cnbc_rss"].update(extra=0),
+    lambda v: v["sources"]["cnbc_rss"].pop("context_pending"),
+    lambda v: v.update(sources={}),
+    lambda v: v["sources"].update(PRIVATE_SOURCE_PROSE=v["sources"].pop("cnbc_rss")),
+    lambda v: v["reasons"].update(general_result_pending=400),
+    lambda v: v["reasons"].update(PRIVATE_SOURCE_PROSE=0),
+])
+def test_invalid_general_extension_cannot_be_delivered_as_verified(echo_job, mutation):
+    value = envelope()
+    value["general_processing"] = general_accounting()
+    mutation(value["general_processing"])
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "source-assessment accounting=VERIFIED" not in text
+    assert "PRIVATE" not in text
+
+
+def test_same_general_totals_with_different_sources_cannot_match_strict_population(echo_job):
+    value = envelope()
+    value["general_processing"] = general_accounting()
+    block = value["general_processing"]
+    block["sources"]["fmp_news"] = block["sources"].pop("cnbc_rss")
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "source-assessment accounting=VERIFIED" not in text
+
+
+@pytest.mark.parametrize("fault", ["counts", "sources", "reasons", "timeout"])
+def test_general_unknown_and_timeout_are_canonical(echo_job, fault):
+    value = envelope(unknown=True)
+    value["general_processing"] = general_accounting(unknown=fault != "timeout")
+    if fault == "counts":
+        value["general_processing"]["general_pending"] = 0
+    elif fault == "sources":
+        value["general_processing"]["sources"] = {"cnbc_rss": dict.fromkeys(GENERAL_COUNTS)}
+    elif fault == "reasons":
+        value["general_processing"]["reasons"] = {"general_result_pending": 0}
+    else:
+        value.update(stage="timeout", exit_code=124)
+    error = failure(value).replace("code 1\n", f"code {value['exit_code']}\n")
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, error)
+    assert "source-assessment accounting=" not in text
+
+
+def test_actual_failed_delivery_preserves_general_and_unresolved_business(echo_job, monkeypatch):
+    value = envelope()
+    value["general_processing"] = general_accounting()
+    monkeypatch.setattr(scheduler, "_run_script_process", Mock(return_value=SimpleNamespace(
+        returncode=1, stdout="PRIVATE SOURCE PROSE", stderr="ECHO_FAILURE_V1=" + json.dumps(value))))
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _: True)
+    save, deliver, mark = Mock(), Mock(return_value=None), Mock()
+    monkeypatch.setattr(scheduler, "save_job_output", save)
+    monkeypatch.setattr(scheduler, "_deliver_result", deliver)
+    monkeypatch.setattr(scheduler, "mark_job_run", mark)
+    assert scheduler._run_one_job(echo_job)
+    text = deliver.call_args.args[1]
+    assert "general_assessed_new=3" in text and "unprocessed=401" in text
+    assert "PRIVATE SOURCE PROSE" not in text
+    assert mark.call_args.args[1] is False
+    assert '"general_processing"' in save.call_args.args[1]
+
+
+def test_canonical_unknown_general_preserves_verified_governed_and_delivery_counts(echo_job):
+    value = envelope()
+    value["general_processing"] = general_accounting(unknown=True)
+    value["market_event_alerts"] = alert_accounting()
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "governed-processing accounting=VERIFIED" in text and "unprocessed=401" in text
+    assert "source-assessment accounting=UNKNOWN" in text
+    assert "market-event accounting=VERIFIED" in text and "delivery_not_verified=1" in text
 
 
 @pytest.fixture
