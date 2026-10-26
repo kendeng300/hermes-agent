@@ -286,3 +286,60 @@ def test_actual_failed_script_delivers_alert_failure_with_completed_source_work(
     assert "unprocessed=0" in text and "delivery_not_verified=1" in text
     assert "PRIVATE SOURCE PROSE" not in text and "[SILENT]" not in text
     assert marked.call_args.args[1] is False
+
+
+def test_completed_uncertainty_is_distinct_from_routine_and_delivery(echo_job):
+    value = envelope()
+    value["market_event_alerts"] = {
+        "status": "VERIFIED", "considered": 1, "verified": 0, "routine": 0,
+        "assessed_review_required": 1, "pending": 0, "unscanned_rows": 0, "reasons": {},
+    }
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "market-event accounting=VERIFIED" in text
+    assert "verified=0, routine=0" in text and "assessed_review_required=1" in text
+    assert "pending=0, unscanned_rows=0" in text
+    assert "received=405" in text
+
+
+def test_uncertain_assessment_cannot_hide_independent_delivery_failure(echo_job):
+    value = envelope()
+    value["market_event_alerts"] = {
+        **alert_accounting(), "considered": 4, "assessed_review_required": 1,
+    }
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "market-event accounting=VERIFIED" in text
+    assert "assessed_review_required=1" in text and "delivery_not_verified=1" in text
+    assert "pending=1, unscanned_rows=0" in text
+
+
+@pytest.mark.parametrize("bad", [True, -1, 10**20, "1", None, 4])
+def test_review_required_count_is_typed_bounded_and_partitioned(echo_job, bad):
+    value = envelope()
+    value["market_event_alerts"] = {**alert_accounting(), "assessed_review_required": bad}
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "Script exited with code 1" in text
+    assert "market-event accounting=VERIFIED" not in text
+    assert "received=405" not in text
+
+
+@pytest.mark.parametrize("unknown_count,accepted", [(None, True), (0, False), (True, False)])
+def test_unknown_assessment_count_is_never_coerced_to_zero(echo_job, unknown_count, accepted):
+    value = envelope()
+    value["market_event_alerts"] = {
+        **alert_accounting(unknown=True), "assessed_review_required": unknown_count,
+    }
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert ("market-event completion=UNKNOWN" in text) is accepted
+    assert "assessed_review_required=0" not in text
+
+
+def test_timeout_preserves_unknown_review_required_counter(echo_job):
+    value = envelope(unknown=True)
+    value.update(stage="timeout", exit_code=124)
+    value["market_event_alerts"] = {
+        **alert_accounting(unknown=True), "assessed_review_required": None,
+    }
+    text = scheduler._summarize_cron_failure_for_delivery(
+        echo_job, failure(value).replace("code 1\n", "code 124\n"))
+    assert "stage=timeout" in text and "market-event completion=UNKNOWN" in text
+    assert "market-event accounting=VERIFIED" not in text
