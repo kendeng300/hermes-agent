@@ -251,6 +251,20 @@ def test_global_scan_failure_does_not_invent_received_sources(echo_job):
     assert "unscanned_rows=17" in text
 
 
+@pytest.mark.parametrize("alert_unknown", [False, True])
+def test_timeout_cannot_certify_alert_completion(echo_job, alert_unknown):
+    value = envelope(unknown=True)
+    value.update(stage="timeout", exit_code=124)
+    value["market_event_alerts"] = alert_accounting(unknown=alert_unknown)
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "market-event accounting=VERIFIED" not in text
+    if alert_unknown:
+        assert "stage=timeout" in text and "market-event completion=UNKNOWN" in text
+    else:
+        assert "Script exited with code 124" in text
+        assert "Echo processing error" not in text
+
+
 def test_actual_failed_script_delivers_alert_failure_with_completed_source_work(echo_job, monkeypatch):
     value = envelope()
     counts = dict(zip(COUNTS, (3, 3, 3, 0, 0, 0, 0, 0)))
