@@ -149,6 +149,11 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
             # Never repurpose the received-source partition to describe this.
             alerts = receipt["market_event_alerts"]
             alert_fields = ("considered", "verified", "routine", "pending", "unscanned_rows")
+            # Completed but uncertain analysis is neither routine clearance nor
+            # verified delivery. Older envelopes omit this distinct outcome.
+            if isinstance(alerts, dict) and "assessed_review_required" in alerts:
+                alert_fields = ("considered", "verified", "routine", "assessed_review_required",
+                                "pending", "unscanned_rows")
             alert_reasons = {"queue_unavailable", "source_scan_deadline_exhausted",
                 "source_observations_unavailable", "source_assessment_or_clock_unverified",
                 "source_significance_uncertain", "delivery_not_verified",
@@ -167,9 +172,10 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
                         or not isinstance(why, dict) or set(why) - alert_reasons
                         or not all(count(value) for value in why.values())
                         or sum(why.values()) != alerts["pending"]
-                        or alerts["verified"] + alerts["routine"] > alerts["considered"]
+                        or alerts["verified"] + alerts["routine"] + alerts.get("assessed_review_required", 0) > alerts["considered"]
                         or not alerts["pending"] and (alerts["unscanned_rows"]
-                            or alerts["considered"] != alerts["verified"] + alerts["routine"])):
+                            or alerts["considered"] != alerts["verified"] + alerts["routine"]
+                                + alerts.get("assessed_review_required", 0))):
                     return None
                 detail += "; market-event accounting=VERIFIED; " + ", ".join(
                     f"{key}={alerts[key]}" for key in alert_fields)
