@@ -194,3 +194,95 @@ def test_successful_silent_script_is_still_silent(echo_job, monkeypatch):
 def test_unrelated_provider_auth_error_contract_is_unchanged():
     text = scheduler._summarize_cron_failure_for_delivery({"name": "Other agent"}, "HTTP 401 unauthorized")
     assert "provider authentication error" in text
+
+
+def alert_accounting(*, unknown=False):
+    values = {"considered": 3, "verified": 1, "routine": 1, "pending": 1, "unscanned_rows": 0}
+    return {"status": "UNKNOWN" if unknown else "VERIFIED",
+            **({key: None for key in values} if unknown else values),
+            "reasons": {} if unknown else {"delivery_not_verified": 1}}
+
+
+@pytest.mark.parametrize("received_unknown,alert_unknown", [(False, False), (True, False), (False, True)])
+def test_alert_accounting_is_independent_of_received_processing(echo_job, received_unknown, alert_unknown):
+    value = envelope(unknown=received_unknown)
+    value["market_event_alerts"] = alert_accounting(unknown=alert_unknown)
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    if alert_unknown:
+        assert "market-event completion=UNKNOWN" in text
+        assert "market-event pending=0" not in text
+    else:
+        assert "market-event accounting=VERIFIED" in text
+        assert "considered=3, verified=1, routine=1, pending=1, unscanned_rows=0" in text
+        assert "delivery_not_verified=1" in text
+    assert ("completion=UNKNOWN" if received_unknown else "received=405") in text
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda v: v.update(extra="PRIVATE SOURCE PROSE"),
+    lambda v: v.update(status="COMPLETE"),
+    lambda v: v.update(verified=True),
+    lambda v: v.update(pending=-1),
+    lambda v: v.update(pending=10**20),
+    lambda v: v.update(considered=0),
+    lambda v: v["reasons"].update(secret_headline=0),
+    lambda v: v["reasons"].update(delivery_not_verified=2),
+    lambda v: v.update(status="UNKNOWN"),
+    lambda v: v.update(pending=0, reasons={}, unscanned_rows=1),
+])
+def test_invalid_alert_accounting_cannot_inject_delivery_text(echo_job, mutation):
+    value = envelope()
+    value["market_event_alerts"] = alert_accounting()
+    mutation(value["market_event_alerts"])
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "Script exited with code 1" in text
+    assert "market-event accounting=VERIFIED" not in text
+    assert "received=405" not in text
+    assert "PRIVATE SOURCE PROSE" not in text and "secret_headline" not in text
+
+
+def test_global_scan_failure_does_not_invent_received_sources(echo_job):
+    value = envelope()
+    value["market_event_alerts"] = {"status": "VERIFIED", "considered": 0,
+        "verified": 0, "routine": 0, "pending": 1, "unscanned_rows": 17,
+        "reasons": {"source_scan_deadline_exhausted": 1}}
+    text = scheduler._summarize_cron_failure_for_delivery(echo_job, failure(value))
+    assert "received=405" in text and "source_scan_deadline_exhausted=1" in text
+    assert "unscanned_rows=17" in text
+
+
+@pytest.mark.parametrize("alert_unknown", [False, True])
+def test_timeout_cannot_certify_alert_completion(echo_job, alert_unknown):
+    value = envelope(unknown=True)
+    value.update(stage="timeout", exit_code=124)
+    value["market_event_alerts"] = alert_accounting(unknown=alert_unknown)
+    text = scheduler._summarize_cron_failure_for_delivery(
+        echo_job, failure(value).replace("code 1\n", "code 124\n"))
+    assert "market-event accounting=VERIFIED" not in text
+    if alert_unknown:
+        assert "stage=timeout" in text and "market-event completion=UNKNOWN" in text
+    else:
+        assert "Script exited with code 124" in text
+        assert "Echo processing error" not in text
+
+
+def test_actual_failed_script_delivers_alert_failure_with_completed_source_work(echo_job, monkeypatch):
+    value = envelope()
+    counts = dict(zip(COUNTS, (3, 3, 3, 0, 0, 0, 0, 0)))
+    value.update(counts=counts, reasons={},
+        sources={"cnbc_rss": {key: counts[key] for key in RECEIVED}},
+        oldest_unprocessed_age_seconds=None, unresolved_article_ids=[],
+        market_event_alerts=alert_accounting())
+    monkeypatch.setattr(scheduler, "_run_script_process", Mock(return_value=SimpleNamespace(
+        returncode=1, stdout="[SILENT]\nPRIVATE SOURCE PROSE", stderr="ECHO_FAILURE_V1=" + json.dumps(value))))
+    monkeypatch.setattr(scheduler, "claim_dispatch", lambda _: True)
+    monkeypatch.setattr(scheduler, "save_job_output", Mock())
+    delivered, marked = Mock(return_value=None), Mock()
+    monkeypatch.setattr(scheduler, "_deliver_result", delivered)
+    monkeypatch.setattr(scheduler, "mark_job_run", marked)
+    assert scheduler._run_one_job(echo_job)
+    delivered.assert_called_once()
+    text = delivered.call_args.args[1]
+    assert "unprocessed=0" in text and "delivery_not_verified=1" in text
+    assert "PRIVATE SOURCE PROSE" not in text and "[SILENT]" not in text
+    assert marked.call_args.args[1] is False

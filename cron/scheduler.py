@@ -107,9 +107,10 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
                     and (value["unique_received"] > 0 or value["received_rows"] == 0))
 
         receipt = json.loads(stderr[len(prefix):], object_pairs_hook=unique_object)
-        if (not isinstance(receipt, dict) or set(receipt) != {
-                "schema", "status", "stage", "result_status", "exit_code", "counts", "reasons", "sources",
-                "oldest_unprocessed_age_seconds", "unresolved_article_ids"}
+        receipt_fields = {"schema", "status", "stage", "result_status", "exit_code", "counts", "reasons", "sources",
+                          "oldest_unprocessed_age_seconds", "unresolved_article_ids"}
+        if (not isinstance(receipt, dict) or set(receipt) not in (
+                receipt_fields, receipt_fields | {"market_event_alerts"})
                 or receipt["schema"] != "echo_poll_failure_v1" or receipt["status"] != "ERROR"
                 or receipt["stage"] not in {"child_exit", "poll_result", "timeout"}
                 or receipt["result_status"] not in {"VERIFIED", "UNKNOWN"}
@@ -142,6 +143,38 @@ def _echo_script_failure_summary(job: dict, text: str) -> str | None:
             detail = "accounting=VERIFIED; " + ", ".join(f"{labels.get(key, key)}={values[key]}" for key in fields)
             if why:
                 detail += "; reasons=" + ",".join(f"{key}={why[key]}" for key in sorted(why))
+        if "market_event_alerts" in receipt:
+            # Optional independent accounting: successful source processing does
+            # not establish that informational delivery/readback also succeeded.
+            # Never repurpose the received-source partition to describe this.
+            alerts = receipt["market_event_alerts"]
+            alert_fields = ("considered", "verified", "routine", "pending", "unscanned_rows")
+            alert_reasons = {"queue_unavailable", "source_scan_deadline_exhausted",
+                "source_observations_unavailable", "source_assessment_or_clock_unverified",
+                "source_significance_uncertain", "delivery_not_verified",
+                "delivery_evidence_or_deadline_unavailable", "informational_review_failed"}
+            if (not isinstance(alerts, dict) or set(alerts) != set(alert_fields) | {"status", "reasons"}
+                    or alerts["status"] not in {"VERIFIED", "UNKNOWN"}
+                    or receipt["stage"] == "timeout" and alerts["status"] != "UNKNOWN"):
+                return None
+            if alerts["status"] == "UNKNOWN":
+                if any(alerts[key] is not None for key in alert_fields) or alerts["reasons"] != {}:
+                    return None
+                detail += "; market-event completion=UNKNOWN"
+            else:
+                why = alerts["reasons"]
+                if (not all(count(alerts[key]) for key in alert_fields)
+                        or not isinstance(why, dict) or set(why) - alert_reasons
+                        or not all(count(value) for value in why.values())
+                        or sum(why.values()) != alerts["pending"]
+                        or alerts["verified"] + alerts["routine"] > alerts["considered"]
+                        or not alerts["pending"] and (alerts["unscanned_rows"]
+                            or alerts["considered"] != alerts["verified"] + alerts["routine"])):
+                    return None
+                detail += "; market-event accounting=VERIFIED; " + ", ".join(
+                    f"{key}={alerts[key]}" for key in alert_fields)
+                if why:
+                    detail += "; market-event reasons=" + ",".join(f"{key}={why[key]}" for key in sorted(why))
         return f"Echo processing error; stage={receipt['stage']}; exit={receipt['exit_code']}; {detail}"
     except (OSError, RuntimeError, TypeError, ValueError, KeyError, RecursionError):
         return None
