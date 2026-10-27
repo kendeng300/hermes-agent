@@ -2746,7 +2746,7 @@ def _read_prepared_reference(reference, *, max_bytes, task_id):
         if hashlib.sha256(raw).hexdigest() != expected_digest:
             raise ValueError
         text = raw.decode("utf-8", errors="strict")
-        if "\0" in text or redact_sensitive_text(text, file_read=True) != text:
+        if "\0" in text or redact_sensitive_text(text, file_read=True, force=True) != text:
             raise ValueError
         job_runtime_remaining()
         return text
@@ -2781,7 +2781,10 @@ def _prepare_referenced_tasks(goal, context, tasks, tasks_reference, prepared_in
     if isinstance(tasks, str):
         # Inspection only: legacy parse errors retain their original ordering
         # after credential resolution when no prepared reference is present.
-        candidate, _ = _recover_tasks_from_json_string(tasks)
+        try:
+            candidate, _ = _recover_tasks_from_json_string(tasks)
+        except (ValueError, RecursionError):
+            candidate = None
     member_refs = isinstance(candidate, list) and any(
         isinstance(task, dict) and "prepared_input_reference" in task for task in candidate)
     if tasks_reference is None and prepared_input_reference is None and not member_refs:
