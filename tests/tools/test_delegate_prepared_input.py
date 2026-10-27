@@ -439,10 +439,25 @@ def test_original_phase_expiry_during_input_or_construction_is_not_renewed(tmp_p
     else: assert len(case.builds) == 1 and case.closed == [0] and not case.parent._active_children
 
 
-def test_no_reference_keeps_credential_error_before_old_task_validation(native_path, monkeypatch):
+@pytest.mark.parametrize("tasks", [
+    pytest.param([{"goal": ""}], id="missing-goal"),
+    pytest.param("[" * 1500 + "]" * 1500, id="deep-json"),
+])
+def test_no_reference_keeps_credential_error_before_old_task_validation(native_path, monkeypatch, tasks):
     def unavailable(*args):
         raise ValueError("Synthetic credential resolver unavailable")
     monkeypatch.setattr(delegate, "_resolve_delegation_credentials", unavailable)
-    result = json.loads(delegate.delegate_task(tasks=[{"goal": ""}], parent_agent=native_path.parent))
+    result = json.loads(delegate.delegate_task(tasks=tasks, parent_agent=native_path.parent))
     assert "Synthetic credential resolver unavailable" in result["error"]
     assert not native_path.builds
+
+
+def test_secret_screening_cannot_be_disabled_by_logging_preference(tmp_path, native_path, monkeypatch):
+    import agent.redact
+    monkeypatch.setattr(agent.redact, "_REDACT_ENABLED", False)
+    # Public synthetic fixture, not an actual credential.
+    ref = reference(tmp_path / "input.txt", "Synthetic token sk-proj-abc123def456ghi789jkl012")
+    result = json.loads(delegate.delegate_task(goal="Review", prepared_input_reference=ref,
+                                             parent_agent=native_path.parent))
+    assert result.get("error") and not native_path.credential_calls
+    assert not native_path.builds and not native_path.requests
