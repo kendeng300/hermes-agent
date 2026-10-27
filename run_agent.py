@@ -5724,6 +5724,8 @@ class AIAgent:
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
+            tasks_reference=function_args.get("tasks_reference"),
+            prepared_input_reference=function_args.get("prepared_input_reference"),
             max_iterations=function_args.get("max_iterations"),
             deadline_elapsed_seconds=function_args.get("deadline_elapsed_seconds"),
             role=function_args.get("role"),

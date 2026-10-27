@@ -17,6 +17,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import hashlib
 import contextvars
 from contextlib import contextmanager
 from types import MappingProxyType
@@ -26,6 +27,8 @@ import math
 
 logger = logging.getLogger(__name__)
 import os
+from pathlib import Path
+import stat
 import threading
 import time
 from concurrent.futures import (
@@ -2168,8 +2171,14 @@ def _run_single_child(
             # Executor/initializer queues consume the original dispatch cap;
             # never start inference after admission has expired.
             job_runtime_remaining()
+            user_message = goal
+            prepared_input = getattr(child, "_delegate_prepared_input", None)
+            if isinstance(prepared_input, tuple) and len(prepared_input) == 2:
+                digest, text = prepared_input
+                user_message = f"{goal}\n\nPrepared task input (SHA-256: {digest}):\n{text}"
+                job_runtime_remaining()
             return child.run_conversation(
-                user_message=goal,
+                user_message=user_message,
                 task_id=child_task_id,
                 stream_callback=_relay_child_text,
             )
@@ -2642,6 +2651,193 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+_PREPARED_INPUT_MAX_BYTES = 2 * 1024 * 1024
+_PREPARED_TASKS_MAX_BYTES = 64 * 1024
+_PREPARED_BATCH_MAX_BYTES = 16 * 1024 * 1024
+
+
+def _prepared_reference_fields(reference, max_bytes):
+    if not isinstance(reference, dict) or set(reference) != {"path", "sha256", "bytes"}:
+        raise ValueError("Prepared reference must contain exactly path, sha256 and bytes.")
+    path, digest, size = reference["path"], reference["sha256"], reference["bytes"]
+    if (not isinstance(path, str) or not path or "\0" in path
+            or not Path(path).is_absolute() or ".." in Path(path).parts
+            or not isinstance(digest, str) or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or type(size) is not int or not 0 < size <= max_bytes):
+        raise ValueError("Prepared reference has invalid fields or exceeds its byte limit.")
+    return Path(path), digest, size
+
+
+def _read_prepared_reference(reference, *, max_bytes, task_id):
+    """Read one exact local snapshot; never paginate, redact or reopen it in a worker."""
+    job_runtime_remaining()
+    path, expected_digest, expected_size = _prepared_reference_fields(reference, max_bytes)
+    # Best-effort file-tool backend detection defaults to local on errors, which
+    # is not sufficient authority for reading a model-supplied host path.
+    try:
+        from tools import terminal_tool
+        config = terminal_tool._get_env_config()
+        overrides = terminal_tool.resolve_task_overrides(task_id)
+        backend = overrides.get("env_type", config["env_type"])
+        key = terminal_tool._resolve_container_task_id(task_id)
+        with terminal_tool._env_lock:
+            environment = terminal_tool._active_environments.get(key)
+            if environment is None:
+                environment = terminal_tool._active_environments.get(task_id)
+        if backend != "local" or (environment is not None
+                and not isinstance(environment, terminal_tool._LocalEnvironment)):
+            raise ValueError
+    except Exception:
+        raise ValueError("Prepared references require a verified local terminal backend.") from None
+    if (not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd):
+        raise ValueError("Prepared references require local no-follow descriptor support.")
+    opened, chain = [], []
+    def signature(value):
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+                value.st_mtime_ns, value.st_ctime_ns)
+    try:
+        from agent.context_references import _ensure_reference_path_allowed
+        from agent.redact import redact_sensitive_text
+        _ensure_reference_path_allowed(path)
+        job_runtime_remaining()
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        parent = os.open(path.anchor, flags | os.O_DIRECTORY)
+        opened.append(parent)
+        for index, name in enumerate(path.parts[1:]):
+            final = index == len(path.parts) - 2
+            before = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if final:
+                if not stat.S_ISREG(before.st_mode) or before.st_size != expected_size:
+                    raise ValueError
+            elif not stat.S_ISDIR(before.st_mode):
+                raise ValueError
+            current = os.open(name, flags | (os.O_NONBLOCK if final else os.O_DIRECTORY), dir_fd=parent)
+            opened.append(current)
+            actual = os.fstat(current)
+            if signature(actual) != signature(before):
+                raise ValueError
+            chain.append((parent, name, actual, final))
+            parent = current
+        if not chain or not chain[-1][3]:
+            raise ValueError
+        chunks, count = [], 0
+        while True:
+            job_runtime_remaining()
+            chunk = os.read(parent, min(65536, expected_size + 1 - count))
+            job_runtime_remaining()
+            if not chunk:
+                break
+            count += len(chunk)
+            if count > expected_size:
+                raise ValueError
+            chunks.append(chunk)
+        if count != expected_size or signature(os.fstat(parent)) != signature(chain[-1][2]):
+            raise ValueError
+        for directory, name, before, final in chain:
+            after = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if final:
+                if signature(after) != signature(before):
+                    raise ValueError
+            elif (after.st_dev, after.st_ino, after.st_mode) != (before.st_dev, before.st_ino, before.st_mode):
+                raise ValueError
+        raw = b"".join(chunks)
+        if hashlib.sha256(raw).hexdigest() != expected_digest:
+            raise ValueError
+        text = raw.decode("utf-8", errors="strict")
+        if "\0" in text or redact_sensitive_text(text, file_read=True) != text:
+            raise ValueError
+        job_runtime_remaining()
+        return text
+    except TimeoutError:
+        raise
+    except Exception:
+        raise ValueError("Prepared reference could not be verified completely.") from None
+    finally:
+        for descriptor in reversed(opened):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _strict_prepared_json(text):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("Prepared task JSON contains duplicate keys.")
+            result[key] = value
+        return result
+    def invalid_constant(value):
+        raise ValueError("Prepared task JSON contains a non-finite constant.")
+    return json.loads(text, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+
+
+def _prepare_referenced_tasks(goal, context, tasks, tasks_reference, prepared_input_reference, task_id):
+    """Return validated tasks + resident inputs, or None for the unchanged legacy path."""
+    candidate = tasks
+    if isinstance(tasks, str):
+        # Inspection only: legacy parse errors retain their original ordering
+        # after credential resolution when no prepared reference is present.
+        candidate, _ = _recover_tasks_from_json_string(tasks)
+    member_refs = isinstance(candidate, list) and any(
+        isinstance(task, dict) and "prepared_input_reference" in task for task in candidate)
+    if tasks_reference is None and prepared_input_reference is None and not member_refs:
+        return None
+    job_runtime_remaining()
+    total = 0
+    if tasks_reference is not None:
+        if any(value is not None for value in (goal, context, tasks, prepared_input_reference)):
+            raise ValueError("tasks_reference cannot be combined with inline task inputs.")
+        _, _, total = _prepared_reference_fields(tasks_reference, _PREPARED_TASKS_MAX_BYTES)
+        document = _strict_prepared_json(_read_prepared_reference(
+            tasks_reference, max_bytes=_PREPARED_TASKS_MAX_BYTES, task_id=task_id))
+        if not isinstance(document, dict) or set(document) != {"tasks"}:
+            raise ValueError("Prepared task bundle must contain exactly tasks.")
+        candidate = document["tasks"]
+    elif prepared_input_reference is not None:
+        if tasks is not None:
+            raise ValueError("A top-level prepared input requires a single goal, not tasks.")
+        candidate = [{"goal": goal, "context": context, "prepared_input_reference": prepared_input_reference}]
+    else:
+        if goal is not None or context is not None:
+            raise ValueError("Prepared batch members cannot be combined with a top-level goal or context.")
+        if isinstance(tasks, str):
+            candidate = _strict_prepared_json(tasks)
+    if not isinstance(candidate, list) or not candidate or len(candidate) > _get_max_concurrent_children():
+        raise ValueError("Prepared task count must fit the existing concurrent-child limit.")
+    allowed = {"goal", "context", "role", "reasoning_required", "prepared_input_reference"}
+    copied = []
+    for task in candidate:
+        if (not isinstance(task, dict) or set(task) - allowed
+                or not isinstance(task.get("goal"), str) or not task["goal"].strip()
+                or (task.get("context") is not None and not isinstance(task["context"], str))
+                or ("role" in task and task["role"] not in ("leaf", "orchestrator"))
+                or ("reasoning_required" in task and type(task["reasoning_required"]) is not bool)):
+            raise ValueError("Prepared task has unsupported fields or invalid values.")
+        task = dict(task)
+        if "prepared_input_reference" in task:
+            reference = dict(task["prepared_input_reference"]) if isinstance(task["prepared_input_reference"], dict) else task["prepared_input_reference"]
+            _, _, size = _prepared_reference_fields(reference, _PREPARED_INPUT_MAX_BYTES)
+            total += size
+            task["prepared_input_reference"] = reference
+        copied.append(task)
+    if total > _PREPARED_BATCH_MAX_BYTES:
+        raise ValueError("Prepared inputs exceed the aggregate byte limit.")
+    inputs = []
+    for task in copied:
+        reference = task.pop("prepared_input_reference", None)
+        if reference is None:
+            inputs.append(None)
+        else:
+            text = _read_prepared_reference(reference, max_bytes=_PREPARED_INPUT_MAX_BYTES, task_id=task_id)
+            inputs.append((hashlib.sha256(text.encode("utf-8")).hexdigest(), text))
+    job_runtime_remaining()
+    return copied, inputs
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2652,6 +2848,8 @@ def delegate_task(
     background: Optional[bool] = None,
     parent_agent=None,
     deadline_elapsed_seconds: Optional[float] = None,
+    tasks_reference: Optional[dict] = None,
+    prepared_input_reference: Optional[dict] = None,
 ) -> str:
     """Delegate with an optional shorter, original-dispatch-relative deadline.
 
@@ -2678,7 +2876,8 @@ def delegate_task(
             job_runtime_remaining()
         result = _delegate_task(goal=goal, context=context, tasks=tasks, max_iterations=max_iterations,
                                 role=role, reasoning_required=reasoning_required, background=background,
-                                parent_agent=parent_agent)
+                                parent_agent=parent_agent, tasks_reference=tasks_reference,
+                                prepared_input_reference=prepared_input_reference)
         # This final boundary includes child cleanup, summary spill, parent
         # aggregation hooks and serialization while the call cap is still active.
         job_runtime_remaining()
@@ -2699,6 +2898,8 @@ def _delegate_task(
     reasoning_required: Optional[bool] = None,
     background: Optional[bool] = None,
     parent_agent=None,
+    tasks_reference: Optional[dict] = None,
+    prepared_input_reference: Optional[dict] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2772,6 +2973,19 @@ def _delegate_task(
             max_iterations, default_max_iter,
         )
     effective_max_iter = default_max_iter
+
+    # Optional transport only. Verify the entire batch before credentials or
+    # child construction; workers consume these resident strings, not paths.
+    prepared_inputs = None
+    try:
+        prepared = _prepare_referenced_tasks(
+            goal, context, tasks, tasks_reference, prepared_input_reference,
+            getattr(parent_agent, "_current_task_id", None) or "default",
+        )
+        if prepared is not None:
+            tasks, prepared_inputs = prepared
+    except (ValueError, TypeError, RecursionError):
+        return tool_error("Prepared delegation inputs are invalid, unavailable or exceed their bounds.")
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -2893,6 +3107,8 @@ def _delegate_task(
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
+            if prepared_inputs is not None and prepared_inputs[i] is not None:
+                child._delegate_prepared_input = prepared_inputs[i]
             children.append((i, t, child))
             job_runtime_remaining()
     except TimeoutError:
@@ -3852,6 +4068,18 @@ def _build_dynamic_schema_overrides() -> dict:
     }
 
 
+_PREPARED_REFERENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "description": "Absolute local regular-file path; no symlinks."},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "bytes": {"type": "integer", "minimum": 1},
+    },
+    "required": ["path", "sha256", "bytes"],
+    "additionalProperties": False,
+}
+
+
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     # NOTE: description / tasks.description / role.description are placeholder
@@ -3905,6 +4133,10 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "boolean",
                             "description": "Per-task reasoning requirement override. See top-level 'reasoning_required' for semantics.",
                         },
+                        "prepared_input_reference": {
+                            **_PREPARED_REFERENCE_SCHEMA,
+                            "description": "Optional complete UTF-8 input (at most 2 MiB), verified before any child starts and included in its first user message.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3912,6 +4144,14 @@ DELEGATE_TASK_SCHEMA = {
                 # delegation.max_concurrent_children (default 3) and
                 # enforced with a clear error in delegate_task().
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "tasks_reference": {
+                **_PREPARED_REFERENCE_SCHEMA,
+                "description": "Optional at-most-64-KiB UTF-8 JSON file containing exactly {tasks:[...]}, with the same task fields and existing child-count limit. Mutually exclusive with goal, context, tasks and top-level prepared_input_reference. All references must verify before any child is built; aggregate file bytes are capped at 16 MiB.",
+            },
+            "prepared_input_reference": {
+                **_PREPARED_REFERENCE_SCHEMA,
+                "description": "Optional complete UTF-8 input for a single goal (at most 2 MiB). Kept separate from system/goal/context and included in the first user message; no truncation or new runtime/model allowance.",
             },
             "role": {
                 "type": "string",
@@ -4005,6 +4245,8 @@ registry.register(
         goal=args.get("goal"),
         context=args.get("context"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
+        tasks_reference=args.get("tasks_reference"),
+        prepared_input_reference=args.get("prepared_input_reference"),
         max_iterations=args.get("max_iterations"),
         deadline_elapsed_seconds=args.get("deadline_elapsed_seconds"),
         role=args.get("role"),
