@@ -32,8 +32,33 @@ delegate_task(tasks=[
 
 ## How Subagent Context Works
 
+### Hash-bound prepared inputs
+
+On a verified local terminal backend, a task may supply `prepared_input_reference`
+with exactly `path` (absolute regular file, without symlinks), `sha256` (lowercase
+SHA-256), and `bytes` (positive exact byte count). The complete UTF-8 text is
+verified and included in the child's first **user** message, separately from the
+unchanged goal, context, and system instructions. Files blocked by normal read
+protections, redacted content, changed files, and invalid references are rejected.
+
+Alternatively, `tasks_reference` uses the same reference shape for a JSON file
+containing exactly `{"tasks": [...]}`. Its members support `goal`, `context`,
+`role`, `reasoning_required`, and `prepared_input_reference`; they cannot override
+providers, tools, credentials, or trusted runtime settings. Do not combine this
+bundle with inline `goal`, `context`, `tasks`, or a top-level prepared input.
+All references are verified before credentials are resolved or children built,
+and workers use the verified in-memory text without reopening mutable paths.
+
+The transport bounds are 64 KiB for task JSON, 2 MiB per prepared input, and
+16 MiB in aggregate, allowing complete instruction and review documents rather
+than truncated excerpts. These bounds do not enlarge the existing model context,
+token, iteration, task-count, or original job/phase time limits. Oversized or
+incomplete inputs fail; a bundle exceeding the configured concurrent-child count
+must still be split into separate calls. Remote backends and platforms without
+no-follow descriptor-relative file operations do not support this optional path.
+
 :::warning Critical: Subagents Know Nothing
-Subagents start with a **completely fresh conversation**. They have zero knowledge of the parent's conversation history, prior tool calls, or anything discussed before delegation. The subagent's only context comes from the `goal` and `context` fields the parent agent populates when it calls `delegate_task`.
+Subagents start with a **completely fresh conversation**. They have zero knowledge of the parent's conversation history, prior tool calls, or anything discussed before delegation. Supply their task context through `goal`, `context`, and, optionally, an explicitly verified prepared input.
 :::
 
 This means the parent agent must pass **everything** the subagent needs in the call:
