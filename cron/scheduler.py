@@ -12,6 +12,8 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+from contextlib import contextmanager
+import errno
 import json
 import logging
 import math
@@ -19,14 +21,17 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
+msvcrt = None
 try:
     import fcntl
 except ImportError:
@@ -509,6 +514,10 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+# Identity refinement of the existing running guard: a queued reservation is
+# transferred to the exact admitted runtime, never removed by a stale wrapper.
+_running_job_owners: dict[str, str] = {}
+_marker_process_owner = uuid.uuid4().hex
 # Process-local fail-closed guard used only when a script cleanup could not be
 # proven.  The durable paused job remains authoritative when persistence
 # succeeds.  When it fails, this minimal record preserves the critical reason
@@ -516,32 +525,176 @@ _running_lock = threading.Lock()
 _cleanup_unverified_jobs: dict[str, dict[str, object]] = {}
 
 
-def _record_running_marker(job_id: str, running: bool) -> None:
-    """SYS-770 (P0): maintain the cross-process running-marker file.
+class _RunningMarkerRollbackError(RuntimeError):
+    """Admission did not start work, but its exact marker rollback is unproved."""
 
-    The standalone watchdog (enforcement/calibration_cron_watchdog.py) reads
-    data/cron_running_ids.json to distinguish "job is genuinely in flight"
-    from "job was claimed but never dispatched". Written best-effort here so
-    the marker is scheduler-maintained (not watchdog-fabricated).
+
+@contextmanager
+def _running_marker_lock(marker):
+    """Strict exclusion for the existing marker; never degrade to unlocked I/O.
+
+    Reuse the store's existing lock-wait bound, not its fail-open lock helper.
+    No jobs/running lock is acquired here, so callers keep jobs -> running ->
+    marker order. The lock is never held while executing or draining work.
     """
+    from cron.jobs import _JOBS_LOCK_TIMEOUT_SECONDS
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = marker.with_suffix(".lock")
+    if marker.is_symlink() or lock_path.is_symlink():
+        raise ValueError("Running marker and lock must not be symlinks")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    acquired = False
     try:
-        marker = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "data" / "cron_running_ids.json"
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        data = {}
-        if marker.exists():
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("Running marker lock must be a regular file")
+        # Lock exclusion has its own real elapsed clock; it cannot inherit a
+        # caller's simulated/frozen dispatch clock and wait forever.
+        deadline = time.perf_counter() + _JOBS_LOCK_TIMEOUT_SECONDS
+        while True:
             try:
-                data = json.loads(marker.read_text())
-            except (OSError, ValueError, json.JSONDecodeError):
-                data = {}
-        running_ids = set(data.get("running", []))
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                elif msvcrt is not None:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    raise RuntimeError("Running marker requires cross-process exclusion")
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in {errno.EACCES, errno.EAGAIN}:
+                    raise
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("Running marker lock acquisition timed out") from exc
+                time.sleep(0.01)
+        yield
+    finally:
+        try:
+            if acquired:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        finally:
+            os.close(fd)
+
+
+def _write_running_marker(marker, text):
+    """Strict same-directory replace: no symlink following or copy fallback."""
+    if marker.is_symlink():
+        raise ValueError("Running marker must not be a symlink")
+    fd, temporary = tempfile.mkstemp(dir=marker.parent, prefix=".cron-running-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        if marker.is_symlink():
+            raise ValueError("Running marker changed to a symlink")
+        os.replace(temporary, marker)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+def _record_running_marker(job_id: str, running: bool, owner=None, commit=None) -> bool:
+    """Atomically compare/update one owned entry, retaining the old projection.
+
+    Job-only legacy entries and corrupt files are evidence, not permission to
+    adopt an owner or reset the file. Unknown entries remain readable by the
+    watchdog through the unchanged ``running`` array.
+    """
+    runtime = _current_job_runtime()
+    owner = owner or (runtime["run_id"] if runtime is not None and runtime["job_id"] == job_id
+                      else f"{os.getpid()}:{_marker_process_owner}")
+    marker = _get_hermes_home() / "data" / "cron_running_ids.json"
+    with _running_marker_lock(marker):
+        if marker.is_symlink():
+            raise ValueError("Running marker changed to a symlink")
+        if marker.exists() and not stat.S_ISREG(marker.stat().st_mode):
+            raise ValueError("Running marker must be a regular file")
+        original = marker.read_text() if marker.exists() else None
+        data = json.loads(original) if original is not None else {}
+        if not isinstance(data, dict):
+            raise ValueError("Running marker is not a JSON object")
+        entries, owners = data.get("running", []), data.get("owners", {})
+        if (not isinstance(entries, list) or any(not isinstance(value, str) or not value for value in entries)
+                or len(set(entries)) != len(entries) or not isinstance(owners, dict)
+                or any(key not in entries or not isinstance(value, str) or not value
+                       for key, value in owners.items())):
+            raise ValueError("Running marker has malformed ownership; preserving original bytes")
+        running_ids = set(entries)
         if running:
+            # Acquisition is single-use, even for the SAME run token. The
+            # jobs lock can degrade across processes; it is not our exclusion.
+            if job_id in running_ids:
+                raise ValueError("Job already has running marker ownership; reuse refused")
             running_ids.add(job_id)
+            owners[job_id] = owner
         else:
-            running_ids.discard(job_id)
-        data["running"] = sorted(running_ids)
-        marker.write_text(json.dumps(data, indent=2))
-    except OSError:
-        pass  # best-effort — watchdog falls back to last_run comparison
+            if job_id not in running_ids:
+                return True
+            if owners.get(job_id) != owner:
+                return False
+            running_ids.remove(job_id)
+            owners.pop(job_id)
+        data.update(running=sorted(running_ids), owners=owners)
+        _write_running_marker(marker, json.dumps(data, indent=2))
+        if commit is not None:
+            try:
+                # Activation re-reads and transitions the exact claimed run
+                # while this strict lock still excludes competing admissions.
+                commit()
+            except BaseException:
+                try:
+                    if original is None:
+                        if marker.is_symlink():
+                            raise ValueError("Running marker changed to a symlink during rollback")
+                        marker.unlink()
+                    else:
+                        _write_running_marker(marker, original)
+                except (OSError, ValueError) as rollback_error:
+                    raise _RunningMarkerRollbackError(
+                        f"Running marker admission rollback unverified: {rollback_error}"
+                    ) from rollback_error
+                raise
+    return True
+
+
+def _release_running_owner_locked(job, owner):
+    """Release only this owner. Caller holds jobs lock then running lock."""
+    from cron import jobs as store
+    job_id = job["id"]
+    if _running_job_owners.get(job_id) != owner:
+        return True  # A newer reservation/runtime owns the local projection.
+    current = store.get_job(job_id) or {}
+    claim_runtime = (current.get("dispatch_claim") or {}).get("runtime")
+    successor = claim_runtime is not None and (
+        not isinstance(claim_runtime, dict) or claim_runtime.get("run_id") != owner)
+    try:
+        # The durable claim and marker are distinct. CAS an exact old marker
+        # even after claim replacement; preserve unknown/new markers verbatim.
+        _record_running_marker(job_id, False, owner)
+    except (OSError, ValueError, RuntimeError) as exc:
+        reason = f"Running marker release unverified: {exc}"
+        record = _cleanup_unverified_jobs.setdefault(job_id, {"pause_persisted": False})
+        record.update(reason=reason, marker_unverified=True)
+        logger.error("Job %s: %s", job_id, reason)
+        if not successor and claim_runtime is not None:
+            store.update_job(job_id, {"last_status": "error", "last_error": reason})
+        return False
+    _running_job_owners.pop(job_id, None)
+    _running_job_ids.discard(job_id)
+    return True
+
+
+def _release_running_owner(job, owner):
+    from cron import jobs as store
+    with store._jobs_lock(), _running_lock:
+        record = _cleanup_unverified_jobs.get(job["id"])
+        if record is not None:
+            return False  # Only its exact drain callback may release quarantine.
+        return _release_running_owner_locked(job, owner)
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -2740,6 +2893,8 @@ def _pause_job_for_unverified_script_cleanup(
         _cleanup_unverified_jobs[job_id] = {
             "reason": reason,
             "pause_persisted": False,
+            "hard_cleanup": True,
+            "running_owner": _running_job_owners.get(job_id),
         }
     job.update(updates)
     try:
@@ -2812,10 +2967,14 @@ def _cleanup_quarantine_reason(job: dict) -> Optional[str]:
     if not intentionally_resumed:
         return reason
 
-    with _running_lock:
+    from cron import jobs as store
+    with store._jobs_lock(), _running_lock:
         current = _cleanup_unverified_jobs.get(job_id)
-        if current != record:
+        if current is not record:
             return str(current["reason"]) if current is not None else None
+        owner = record.get("running_owner")
+        if owner is not None and not _release_running_owner_locked(job, owner):
+            return str(record["reason"])
         _cleanup_unverified_jobs.pop(job_id, None)
     job.clear()
     job.update(durable)
@@ -3386,10 +3545,39 @@ def _activate_job_runtime(job, runtime):
             raise ValueError("Job runtime changed before accepted worker activation")
         if claim["status"] == "dispatched":
             return False
-        claim["status"] = "dispatched"
-        if store.update_job(job["id"], {"dispatch_claim": claim}) is None:
-            raise ValueError("Job disappeared before accepted worker activation")
-        return True
+        with _running_lock:
+            reserved = job.get("_running_reservation")
+            if (job["id"] in _running_job_ids
+                    and (reserved is None or _running_job_owners.get(job["id"]) != reserved)):
+                return False
+            # Register before work/admission, never overwrite unknown legacy
+            # ownership. Both manual and scheduled entry use this exact path.
+            def commit():
+                # The jobs lock may explicitly degrade to unlocked operation.
+                # Revalidate inside marker exclusion, including after a prior
+                # owner has completed and removed its marker.
+                fresh = (store.get_job(job["id"]) or {}).get("dispatch_claim")
+                if fresh != claim or fresh.get("status") != "claimed":
+                    raise ValueError("Job runtime changed during accepted worker activation")
+                dispatched = dict(claim, status="dispatched")
+                if store.update_job(job["id"], {"dispatch_claim": dispatched}) is None:
+                    raise ValueError("Job disappeared before accepted worker activation")
+
+            try:
+                _record_running_marker(job["id"], True, runtime["run_id"], commit)
+            except _RunningMarkerRollbackError as exc:
+                # No worker was started, but rollback failure cannot be
+                # advertised as idle or erased by an outer queue wrapper.
+                _running_job_owners[job["id"]] = runtime["run_id"]
+                _running_job_ids.add(job["id"])
+                _cleanup_unverified_jobs[job["id"]] = {
+                    "reason": str(exc), "pause_persisted": False,
+                    "marker_unverified": True, "runtime_run_id": runtime["run_id"],
+                }
+                raise
+            _running_job_owners[job["id"]] = runtime["run_id"]
+            _running_job_ids.add(job["id"])
+            return True
 
 
 def _record_runtime_failure(job, error, *, claim):
@@ -3421,17 +3609,20 @@ def _finalize_failed_runtime(job, runtime, error, *, drain_record=None):
     with store._jobs_lock(), _running_lock:
         if _cleanup_unverified_jobs.get(job["id"]) is not drain_record:
             return
+        if drain_record is not None and drain_record.get("hard_cleanup"):
+            # Thread completion cannot attest a failed process-tree cleanup.
+            # Keep the explicit durable-pause/resume contract and its owner.
+            drain_record["runtime_draining"] = False
+            drain_record.pop("worker", None)
+            return
         current = store.get_job(job["id"]) or {}
         claim = current.get("dispatch_claim") or {}
         if (claim.get("status") == "dispatched"
                 and claim.get("runtime") == dict(runtime)):
             store.mark_job_run(job["id"], False, str(error))
         if drain_record is not None:
-            # This exact record owns the process-local marker even if an
-            # operator replaced the durable claim. Do not mutate that successor.
-            _record_running_marker(job["id"], False)
-            _running_job_ids.discard(job["id"])
-            _cleanup_unverified_jobs.pop(job["id"], None)
+            if _release_running_owner_locked(job, runtime["run_id"]):
+                _cleanup_unverified_jobs.pop(job["id"], None)
 
 
 def _run_scoped_runtime(job, operation, agents):
@@ -3479,35 +3670,34 @@ def _run_scoped_runtime(job, operation, agents):
                 _record_runtime_failure(job, exc, claim=claim)
                 if isinstance(exc, CronScriptCleanupError):
                     _pause_job_for_unverified_script_cleanup(job, exc)
-                if future is not None and not future.done():
-                    # An interrupt-pending thread is not a failed process-tree
-                    # cleanup proof. Keep existing running ownership, not a new
-                    # durable pause policy, until this exact future settles.
-                    job["_runtime_drain_owned"] = runtime["run_id"]
-                    with _running_lock:
+            # Claim replacement is not drain evidence. Register the actual
+            # outstanding future even when it no longer owns the durable row.
+            if future is not None and not future.done():
+                job["_runtime_drain_owned"] = runtime["run_id"]
+                with _running_lock:
+                    record = _cleanup_unverified_jobs.get(job["id"])
+                    if record is None:
                         record = {"reason": "Scoped deadline reached; previous worker still draining",
-                                  "pause_persisted": False, "runtime_draining": True,
-                                  "worker": future, "runtime_run_id": runtime["run_id"]}
+                                  "pause_persisted": False}
                         _cleanup_unverified_jobs[job["id"]] = record
-                        _running_job_ids.add(job["id"])
-                        _record_running_marker(job["id"], True)
+                    record.update(runtime_draining=True, worker=future,
+                                  runtime_run_id=runtime["run_id"])
 
-                    failure = str(exc)
-                    drain_context = contextvars.copy_context()
+                failure = str(exc)
+                drain_context = contextvars.copy_context()
 
-                    def drained(_):
-                        # The future callback runs after its execution context
-                        # unwinds. Preserve the original store and finalize only
-                        # this exact failed claim before admitting manual retry.
-                        _finalize_failed_runtime(job, runtime, failure, drain_record=record)
+                def drained(_):
+                    _finalize_failed_runtime(job, runtime, failure, drain_record=record)
 
-                    future.add_done_callback(lambda done: drain_context.run(drained, done))
-                else:
-                    _finalize_failed_runtime(job, runtime, exc)
+                future.add_done_callback(lambda done: drain_context.run(drained, done))
+            else:
+                _finalize_failed_runtime(job, runtime, exc)
         raise
     finally:
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
+        if job.get("_runtime_drain_owned") != runtime["run_id"]:
+            _release_running_owner(job, runtime["run_id"])
 
 
 def run_job(job: dict, *, defer_agent_teardown: Optional[list] = None,
@@ -4953,34 +5143,55 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
                 _running_job_ids.add(job_id)
+                reservation = uuid.uuid4().hex
+                _running_job_owners[job_id] = reservation
+                job["_running_reservation"] = reservation
+
+            def release_reservation():
+                # A scoped admission transfers the reservation to its run ID;
+                # an older queued/outer wrapper cannot release that owner.
+                with _running_lock:
+                    if _running_job_owners.get(job_id) == reservation:
+                        _running_job_owners.pop(job_id, None)
+                        _running_job_ids.discard(job_id)
+
             _ctx = contextvars.copy_context()
             from cron.jobs import get_job
             admission_claim = (get_job(job_id) or {}).get("dispatch_claim")
             try:
                 runtime = _prepare_job_runtime(job, dispatched=False)
-            except Exception as exc:
+            except BaseException as exc:
+                release_reservation()
+                if not isinstance(exc, Exception):
+                    raise
                 _record_runtime_failure(job, exc, claim=admission_claim)
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
                 logger.error("Job '%s' runtime admission failed: %s", job_id, exc)
                 return None
 
             def _run_and_release(j=job, ctx=_ctx, scoped_runtime=runtime):
+                marker_started = False
                 def process():
+                    nonlocal marker_started
                     with _job_runtime_scope(scoped_runtime):
+                        if scoped_runtime is None:
+                            _record_running_marker(j["id"], True, reservation)
+                            marker_started = True
                         return _process_job(j)
                 try:
-                    _record_running_marker(j["id"], True)
                     return ctx.run(process)
                 finally:
-                    if not (scoped_runtime is not None and
-                            j.get("_runtime_drain_owned") == scoped_runtime["run_id"]):
-                        with _running_lock:
-                            _record_running_marker(j["id"], False)
-                            _running_job_ids.discard(j["id"])
+                    if scoped_runtime is None and marker_started:
+                        # Legacy scheduled/script jobs keep their existing
+                        # outer owner; release is still exact, never job-only.
+                        ctx.run(_release_running_owner, j, reservation)
+                    else:
+                        release_reservation()
 
             try:
                 fut = pool.submit(_run_and_release)
+                # An accepted but never-started future has no worker finally.
+                # Its callback may release only its own queued reservation.
+                fut.add_done_callback(lambda done: release_reservation() if done.cancelled() else None)
                 # SYS-770 (P0): the future was accepted — transition the claim
                 # from "claimed" to "dispatched". If this write fails the claim
                 # stays "claimed" and the watchdog re-arms the job; a stale
@@ -4995,7 +5206,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                         job.get("name", job_id),
                     )
                 return fut
-            except RuntimeError as submit_err:
+            except BaseException as submit_err:
                 # Interpreter began finalizing between the guard above and the
                 # submit — release the in-flight claim we just took and skip.
                 # SYS-770: leave the dispatch_claim in "claimed" state — the
@@ -5005,9 +5216,8 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
                     claim = current.get("dispatch_claim")
                     if (claim or {}).get("runtime") == dict(runtime):
                         _record_runtime_failure(job, submit_err, claim=claim)
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
-                if _interpreter_shutting_down(submit_err):
+                release_reservation()
+                if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
                     logger.warning(
                         "Job '%s' not dispatched — interpreter is shutting down",
                         job.get("name", job_id),
