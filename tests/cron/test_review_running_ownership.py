@@ -45,6 +45,18 @@ def _running(marker):
     return set(json.loads(marker.read_text())["running"])
 
 
+@pytest.fixture
+def marker_process_case(tmp_path, monkeypatch):
+    """Real-clock process IPC must not inherit runtime_case's frozen clock."""
+    private_home = tmp_path.resolve()
+    monkeypatch.setenv("HERMES_HOME", str(private_home))
+    monkeypatch.setattr(scheduler, "_hermes_home", private_home)
+    marker = private_home / "data" / "cron_running_ids.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    with jobs.use_cron_store(private_home):
+        yield {"home": private_home, "marker": marker}
+
+
 @pytest.mark.parametrize("entry", ["manual", "scheduled"])
 @pytest.mark.parametrize("outcome", ["complete", "business_failure"])
 def test_active_and_terminal_ownership_is_shared_by_manual_and_scheduled(
@@ -134,9 +146,9 @@ def _marker_writer(home, name, first_read, release_first, calling, completed, er
 
 
 @pytest.mark.skipif("fork" not in multiprocessing.get_all_start_methods(), reason="POSIX process race")
-def test_concurrent_process_marker_additions_do_not_lose_an_active_job(owner_case):
+def test_concurrent_process_marker_additions_do_not_lose_an_active_job(marker_process_case):
     """A reads, B attempts/commits, A commits: serialized code keeps both."""
-    case = owner_case
+    case = marker_process_case
     case["marker"].write_text(json.dumps({"running": ["retained-unknown"]}))
     context = multiprocessing.get_context("fork")
     first_read, release_first = context.Event(), context.Event()
