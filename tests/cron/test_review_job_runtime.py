@@ -315,6 +315,8 @@ def test_phase_expiry_during_owned_tool_drain_interrupts_and_revokes_completion(
 @pytest.fixture
 def runtime_case(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler, "_cleanup_unverified_jobs", {})
+    monkeypatch.setattr(scheduler, "_running_job_ids", set())
+    monkeypatch.setattr(scheduler, "_running_job_owners", {})
     policy = {"max_concurrent_children": 7, "max_elapsed_seconds": 600,
               "leaf_only": True, "publication_authority": "advisory"}
     cfg = {"model": {"default": "synthetic-model"}, "agent": {"max_turns": 40},
